@@ -1,0 +1,8 @@
+.git
+.github
+target
+logs
+*.sqlite3
+*.db
+*.log
+config.json
