@@ -165,14 +165,15 @@ impl Store {
     ) -> Result<RawResponsePlan> {
         let segment = self.segment_for_channel_day(channel_id, year, month, day)?;
         let hot_events = self.read_hot_channel_events(channel_id, year, month, day)?;
-        if let Some(segment) = segment
-            && hot_events.is_empty()
-            && segment.passthrough_raw
-        {
-            return Ok(RawResponsePlan {
-                segment_path: Some(self.root_dir.join(segment.path)),
-                events: Vec::new(),
-            });
+        if hot_events.is_empty() {
+            if let Some(segment) = segment {
+                if segment.passthrough_raw {
+                    return Ok(RawResponsePlan {
+                        segment_path: Some(self.root_dir.join(segment.path)),
+                        events: Vec::new(),
+                    });
+                }
+            }
         }
         let mut events = self.read_channel_logs(channel_id, year, month, day)?;
         events.sort_by_key(|event| (event.timestamp.timestamp(), event.seq));

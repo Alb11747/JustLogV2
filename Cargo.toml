@@ -1,6 +1,6 @@
 [package]
 name = "justlog"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A Twitch chat logger and HTTP API."
 repository = "https://github.com/Alb11747/JustLogV2"

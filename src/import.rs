@@ -26,8 +26,10 @@ pub fn import_legacy_logs(store: &Store, source: &Path) -> Result<usize> {
             load_lines_from_text_file(path)?
         };
         for line in lines {
-            if let Some(event) = CanonicalEvent::from_raw(&line)? && store.insert_event(&event)? {
-                imported += 1;
+            if let Some(event) = CanonicalEvent::from_raw(&line)? {
+                if store.insert_event(&event)? {
+                    imported += 1;
+                }
             }
         }
     }
