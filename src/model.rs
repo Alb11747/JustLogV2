@@ -163,7 +163,8 @@ pub struct OutboundMessage {
 
 impl CanonicalEvent {
     pub fn from_raw(raw: &str) -> Result<Option<Self>> {
-        let irc = IRCMessage::parse(raw).with_context(|| format!("failed to parse IRC line: {raw}"))?;
+        let irc =
+            IRCMessage::parse(raw).with_context(|| format!("failed to parse IRC line: {raw}"))?;
         let server_message = ServerMessage::try_from(irc).map_err(|error| anyhow!(error))?;
         Ok(Self::from_server_message(raw, server_message))
     }

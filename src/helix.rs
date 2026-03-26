@@ -95,8 +95,14 @@ impl HelixClient {
             .collect())
     }
 
-    pub async fn get_users_by_logins(&self, logins: &[String]) -> Result<HashMap<String, UserData>> {
-        let normalized = logins.iter().map(|login| login.to_lowercase()).collect::<Vec<_>>();
+    pub async fn get_users_by_logins(
+        &self,
+        logins: &[String],
+    ) -> Result<HashMap<String, UserData>> {
+        let normalized = logins
+            .iter()
+            .map(|login| login.to_lowercase())
+            .collect::<Vec<_>>();
         let mut missing = Vec::new();
         {
             let cache = self.cache_by_login.lock().await;
@@ -154,7 +160,9 @@ impl HelixClient {
             .send()
             .await
             .with_context(|| format!("failed to request token from {}", self.token_url))?;
-        let response = response.error_for_status().map_err(|error| anyhow!(error))?;
+        let response = response
+            .error_for_status()
+            .map_err(|error| anyhow!(error))?;
         let token = response.json::<TokenResponse>().await?.access_token;
         *self.access_token.write().await = Some(token.clone());
         Ok(token)

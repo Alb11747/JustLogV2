@@ -79,7 +79,10 @@ pub struct HttpConfig {
 pub struct IngestConfig {
     #[serde(default = "default_redundancy_factor", rename = "redundancyFactor")]
     pub redundancy_factor: usize,
-    #[serde(default = "default_max_channels_per_connection", rename = "maxChannelsPerConnection")]
+    #[serde(
+        default = "default_max_channels_per_connection",
+        rename = "maxChannelsPerConnection"
+    )]
     pub max_channels_per_connection: usize,
     #[serde(default = "default_connect_timeout_ms", rename = "connectTimeoutMs")]
     pub connect_timeout_ms: u64,
@@ -105,11 +108,20 @@ pub struct IrcConfig {
 pub struct StorageConfig {
     #[serde(default, rename = "sqlitePath")]
     pub sqlite_path: PathBuf,
-    #[serde(default = "default_compact_interval_seconds", rename = "compactIntervalSeconds")]
+    #[serde(
+        default = "default_compact_interval_seconds",
+        rename = "compactIntervalSeconds"
+    )]
     pub compact_interval_seconds: u64,
-    #[serde(default = "default_compact_after_channel_days", rename = "compactAfterChannelDays")]
+    #[serde(
+        default = "default_compact_after_channel_days",
+        rename = "compactAfterChannelDays"
+    )]
     pub compact_after_channel_days: i64,
-    #[serde(default = "default_compact_after_user_months", rename = "compactAfterUserMonths")]
+    #[serde(
+        default = "default_compact_after_user_months",
+        rename = "compactAfterUserMonths"
+    )]
     pub compact_after_user_months: i64,
 }
 
@@ -212,6 +224,7 @@ impl Config {
         if self.storage.sqlite_path.as_os_str().is_empty() {
             self.storage.sqlite_path = self.logs_directory.join("justlog.sqlite3");
         }
+        self.storage.sqlite_path = normalize_path(&self.storage.sqlite_path);
         self.oauth = self.oauth.trim_start_matches("oauth:").to_string();
         self.log_level = self.log_level.to_lowercase();
         self.admins = self
@@ -219,7 +232,12 @@ impl Config {
             .iter()
             .map(|value| value.to_lowercase())
             .collect::<Vec<_>>();
-        self.channels = dedupe(self.channels.iter().map(|value| value.to_string()).collect());
+        self.channels = dedupe(
+            self.channels
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        );
         if self.client_id.is_empty() {
             bail!("No clientID specified");
         }

@@ -44,7 +44,11 @@ At runtime:
 - `Cargo.toml`: crate metadata and dependencies.
 - `README.md`: short usage guide for local and Docker runs.
 - `Dockerfile`: container image build for the service.
+- `tests/smoke.rs`: fast deterministic smoke tests for config, API basics, and archived reads.
 - `tests/integration.rs`: end-to-end style tests using mock Helix and IRC servers.
+- `tests/network.rs`: loopback HTTP/TCP coverage using real local sockets.
+- `tests/live_network.rs`: explicitly gated live network smoke checks.
+- `tests/common/mod.rs`: shared test harness for mock Helix, mock IRC, seeded state, and HTTP server setup.
 - `target/`: Cargo build output.
 
 ### Source Modules
@@ -327,17 +331,57 @@ It:
 
 ## Testing Strategy
 
-`tests/integration.rs` provides end-to-end coverage for the core behavior using local mocks.
+The repository uses a small test pyramid instead of a single all-purpose suite.
 
-Current tests cover:
+### Smoke tests
+
+`tests/smoke.rs` stays fast and deterministic. It focuses on:
+
+- root, health, and readiness routes
+- `/channels` output with mocked Helix resolution
+- lowercase redirect behavior
+- one representative archived raw log read path
+- config load, normalization, and persistence defaults
+
+These are the tests intended for normal push and pull request CI.
+
+### Integration tests
+
+`tests/integration.rs` keeps broad end-to-end coverage using local mock Helix and IRC servers.
+
+Current integration coverage includes:
 
 - redundant ingest deduplication and reconnect recovery
 - `/channels` output and lowercase redirects
 - admin channel management plus chat-based join/part commands
 - opt-out flow and blocked queries
 - raw route Brotli passthrough and fallback compression behavior
+- an auth failure case for admin channel mutation
 
-The tests construct a full `AppState`, `Store`, `HelixClient`, `IngestManager`, and Axum router, so they validate behavior close to production wiring.
+The integration harness constructs a full `AppState`, `Store`, `HelixClient`, `IngestManager`, and Axum router, so it validates behavior close to production wiring.
+
+### Local network tests
+
+`tests/network.rs` exercises the same behavior over real loopback sockets instead of only in-process service calls.
+
+It covers:
+
+- localhost HTTP round-trips against a bound Axum server
+- direct reachability of the local mock Helix HTTP server
+- IRC connect/join/reconnect behavior over TCP
+
+These deterministic network checks run on tagged releases and manual release workflow dispatches.
+
+### Live network tests
+
+`tests/live_network.rs` is intentionally narrow and opt-in.
+
+It includes:
+
+- a basic outbound HTTPS smoke check
+- an optional Twitch Helix auth and user lookup smoke check when credentials are available
+
+This suite skips unless `JUSTLOG_RUN_LIVE_NETWORK_TESTS=1` is set. In CI it is reserved for the dedicated live-network workflow so release tags do not depend on public network stability or secret availability.
 
 ## Operational Notes
 

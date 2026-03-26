@@ -1,0 +1,26 @@
+name: Live Network Tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
+
+jobs:
+  live-network:
+    runs-on: ubuntu-latest
+    env:
+      JUSTLOG_RUN_LIVE_NETWORK_TESTS: "1"
+      TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+      TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run opt-in live network tests
+        run: cargo test --locked --test live_network -- --nocapture

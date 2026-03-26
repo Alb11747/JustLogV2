@@ -92,9 +92,15 @@ async fn serve(app: Router, listen_address: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn resolve_channel_logins(helix: &HelixClient, channel_ids: &[String]) -> Result<Vec<String>> {
+pub async fn resolve_channel_logins(
+    helix: &HelixClient,
+    channel_ids: &[String],
+) -> Result<Vec<String>> {
     let users = helix.get_users_by_ids(channel_ids).await?;
-    let mut logins = users.into_values().map(|user| user.login).collect::<Vec<_>>();
+    let mut logins = users
+        .into_values()
+        .map(|user| user.login)
+        .collect::<Vec<_>>();
     logins.sort();
     Ok(logins)
 }
@@ -141,7 +147,11 @@ impl ChatCommandService for CommandService {
                     return Ok(());
                 }
                 let uptime = format_duration(self.state.start_time.elapsed());
-                self.say(&event.channel_login, &format!("{}, uptime: {}", event.display_name, uptime)).await;
+                self.say(
+                    &event.channel_login,
+                    &format!("{}, uptime: {}", event.display_name, uptime),
+                )
+                .await;
             }
             "join" => {
                 if !self.is_admin(&event.username).await {
@@ -187,7 +197,12 @@ impl CommandService {
         }
     }
 
-    async fn handle_join_part(&self, event: &CanonicalEvent, args: &[String], join: bool) -> Result<()> {
+    async fn handle_join_part(
+        &self,
+        event: &CanonicalEvent,
+        args: &[String],
+        join: bool,
+    ) -> Result<()> {
         if args.is_empty() {
             self.say(&event.channel_login, &format!("{}, at least 1 username has to be provided. multiple usernames have to be separated with a space", event.display_name)).await;
             return Ok(());
@@ -216,7 +231,11 @@ impl CommandService {
             }
         }
         let action = if join { "added" } else { "removed" };
-        self.say(&event.channel_login, &format!("{}, {action} channels: {:?}", event.display_name, ids)).await;
+        self.say(
+            &event.channel_login,
+            &format!("{}, {action} channels: {:?}", event.display_name, ids),
+        )
+        .await;
         Ok(())
     }
 
@@ -232,7 +251,11 @@ impl CommandService {
                     let mut config = self.state.config.write().await;
                     config.opt_out_users(&[user_id]);
                     config.persist()?;
-                    self.say(&event.channel_login, &format!("{}, opted you out", event.display_name)).await;
+                    self.say(
+                        &event.channel_login,
+                        &format!("{}, opted you out", event.display_name),
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -245,7 +268,11 @@ impl CommandService {
         let mut config = self.state.config.write().await;
         config.opt_out_users(&ids);
         config.persist()?;
-        self.say(&event.channel_login, &format!("{}, opted out channels: {:?}", event.display_name, ids)).await;
+        self.say(
+            &event.channel_login,
+            &format!("{}, opted out channels: {:?}", event.display_name, ids),
+        )
+        .await;
         Ok(())
     }
 
@@ -259,7 +286,11 @@ impl CommandService {
         let mut config = self.state.config.write().await;
         config.remove_opt_out(&ids);
         config.persist()?;
-        self.say(&event.channel_login, &format!("{}, opted in channels: {:?}", event.display_name, ids)).await;
+        self.say(
+            &event.channel_login,
+            &format!("{}, opted in channels: {:?}", event.display_name, ids),
+        )
+        .await;
         Ok(())
     }
 }

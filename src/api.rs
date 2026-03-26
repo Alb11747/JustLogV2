@@ -54,7 +54,10 @@ struct ChannelsPayload {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new().route("/{*path}", any(dispatch)).with_state(state)
+    Router::new()
+        .route("/", any(dispatch))
+        .route("/{*path}", any(dispatch))
+        .with_state(state)
 }
 
 async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
@@ -86,14 +89,18 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
             Ok(response) => response,
             Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
         },
-        (Method::POST, "/admin/channels") => match admin_channels_handler(state, request, true).await {
-            Ok(response) => response,
-            Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
-        },
-        (Method::DELETE, "/admin/channels") => match admin_channels_handler(state, request, false).await {
-            Ok(response) => response,
-            Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
-        },
+        (Method::POST, "/admin/channels") => {
+            match admin_channels_handler(state, request, true).await {
+                Ok(response) => response,
+                Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+            }
+        }
+        (Method::DELETE, "/admin/channels") => {
+            match admin_channels_handler(state, request, false).await {
+                Ok(response) => response,
+                Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+            }
+        }
         _ => match log_handler(state, request).await {
             Ok(response) => response,
             Err(error) => {
@@ -127,19 +134,40 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
     let user_id = resolve_optional_user_id(&state, &query).await?;
     {
         let config = state.config.read().await;
-        if config.is_opted_out(&channel_id) || user_id.as_deref().is_some_and(|user_id| config.is_opted_out(user_id)) {
-            return Ok(error_response(StatusCode::FORBIDDEN, "User or channel has opted out"));
+        if config.is_opted_out(&channel_id)
+            || user_id
+                .as_deref()
+                .is_some_and(|user_id| config.is_opted_out(user_id))
+        {
+            return Ok(error_response(
+                StatusCode::FORBIDDEN,
+                "User or channel has opted out",
+            ));
         }
     }
     if let Some(user_id) = user_id {
-        let logs = state.store.get_available_logs_for_user(&channel_id, &user_id)?;
-        let mut response = Json(UserLogList { available_logs: logs }).into_response();
-        response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+        let logs = state
+            .store
+            .get_available_logs_for_user(&channel_id, &user_id)?;
+        let mut response = Json(UserLogList {
+            available_logs: logs,
+        })
+        .into_response();
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=3600"),
+        );
         Ok(response)
     } else {
         let logs = state.store.get_available_logs_for_channel(&channel_id)?;
-        let mut response = Json(ChannelLogList { available_logs: logs }).into_response();
-        response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+        let mut response = Json(ChannelLogList {
+            available_logs: logs,
+        })
+        .into_response();
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=3600"),
+        );
         Ok(response)
     }
 }
@@ -147,7 +175,11 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
 async fn optout_handler(state: AppState) -> Result<Response> {
     let code = random_string(6);
     {
-        state.optout_codes.lock().await.insert(code.clone(), Instant::now() + Duration::from_secs(60));
+        state
+            .optout_codes
+            .lock()
+            .await
+            .insert(code.clone(), Instant::now() + Duration::from_secs(60));
     }
     let state_clone = state.clone();
     let code_clone = code.clone();
@@ -167,13 +199,19 @@ async fn admin_channels_handler(state: AppState, request: Request, join: bool) -
         .to_string();
     let expected = state.config.read().await.admin_api_key.clone();
     if api_key.is_empty() || api_key != expected {
-        return Ok(error_response(StatusCode::FORBIDDEN, "No I don't think so."));
+        return Ok(error_response(
+            StatusCode::FORBIDDEN,
+            "No I don't think so.",
+        ));
     }
 
     let body = axum::body::to_bytes(request.into_body(), usize::MAX).await?;
     let payload: ChannelsPayload = serde_json::from_slice(&body)?;
     let users = state.helix.get_users_by_ids(&payload.channels).await?;
-    let logins = users.values().map(|user| user.login.clone()).collect::<Vec<_>>();
+    let logins = users
+        .values()
+        .map(|user| user.login.clone())
+        .collect::<Vec<_>>();
     {
         let mut config = state.config.write().await;
         if join {
@@ -191,7 +229,10 @@ async fn admin_channels_handler(state: AppState, request: Request, join: bool) -
         }
     }
     let text = if join {
-        format!("Doubters? Joined channels or already in: {:?}", payload.channels)
+        format!(
+            "Doubters? Joined channels or already in: {:?}",
+            payload.channels
+        )
     } else {
         format!("Doubters? Removed channels {:?}", payload.channels)
     };
@@ -199,11 +240,22 @@ async fn admin_channels_handler(state: AppState, request: Request, join: bool) -
 }
 
 async fn log_handler(state: AppState, request: Request) -> Result<Response> {
-    let log_request = parse_log_request(&state, request.uri(), request.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or_default()).await?;
+    let log_request = parse_log_request(
+        &state,
+        request.uri(),
+        request
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    )
+    .await?;
     if let Some(redirect_path) = log_request.redirect_path {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::FOUND;
-        response.headers_mut().insert(LOCATION, HeaderValue::from_str(&redirect_path)?);
+        response
+            .headers_mut()
+            .insert(LOCATION, HeaderValue::from_str(&redirect_path)?);
         return Ok(response);
     }
 
@@ -215,7 +267,10 @@ async fn log_handler(state: AppState, request: Request) -> Result<Response> {
                 .as_deref()
                 .is_some_and(|user_id| config.is_opted_out(user_id))
         {
-            return Ok(error_response(StatusCode::FORBIDDEN, "User or channel has opted out"));
+            return Ok(error_response(
+                StatusCode::FORBIDDEN,
+                "User or channel has opted out",
+            ));
         }
     }
 
@@ -224,15 +279,35 @@ async fn log_handler(state: AppState, request: Request) -> Result<Response> {
     }
 
     if log_request.time.from.is_some() || log_request.time.to.is_some() {
-        return range_response(state, log_request, request.headers().get("accept-encoding").and_then(|value| value.to_str().ok()).unwrap_or_default()).await;
+        return range_response(
+            state,
+            log_request,
+            request
+                .headers()
+                .get("accept-encoding")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+        )
+        .await;
     }
 
-    dated_response(state, log_request, request.headers().get("accept-encoding").and_then(|value| value.to_str().ok()).unwrap_or_default()).await
+    dated_response(
+        state,
+        log_request,
+        request
+            .headers()
+            .get("accept-encoding")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    )
+    .await
 }
 
 async fn random_response(state: AppState, request: LogRequest) -> Result<Response> {
     let event = if let Some(user_id) = request.user_id.as_deref() {
-        state.store.random_user_message(&request.channel_id, user_id)?
+        state
+            .store
+            .random_user_message(&request.channel_id, user_id)?
     } else {
         state.store.random_channel_message(&request.channel_id)?
     };
@@ -242,41 +317,76 @@ async fn random_response(state: AppState, request: LogRequest) -> Result<Respons
     respond_with_events(vec![event.into()], request.response_type, false)
 }
 
-async fn range_response(state: AppState, request: LogRequest, accept_encoding: &str) -> Result<Response> {
-    let from = request.time.from.unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
+async fn range_response(
+    state: AppState,
+    request: LogRequest,
+    accept_encoding: &str,
+) -> Result<Response> {
+    let from = request
+        .time
+        .from
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
     let to = request.time.to.unwrap_or_else(Utc::now);
     let mut events = if let Some(user_id) = request.user_id.as_deref() {
-        state.store.read_user_range(&request.channel_id, user_id, from, to)?
+        state
+            .store
+            .read_user_range(&request.channel_id, user_id, from, to)?
     } else {
-        state.store.read_channel_range(&request.channel_id, from, to)?
+        state
+            .store
+            .read_channel_range(&request.channel_id, from, to)?
     };
     if request.reverse {
         events.reverse();
     }
-    let messages = events.into_iter().map(ChatMessage::from).collect::<Vec<_>>();
-    respond_with_events(messages, request.response_type, accept_encoding.contains("br"))
+    let messages = events
+        .into_iter()
+        .map(ChatMessage::from)
+        .collect::<Vec<_>>();
+    respond_with_events(
+        messages,
+        request.response_type,
+        accept_encoding.contains("br"),
+    )
 }
 
-async fn dated_response(state: AppState, request: LogRequest, accept_encoding: &str) -> Result<Response> {
+async fn dated_response(
+    state: AppState,
+    request: LogRequest,
+    accept_encoding: &str,
+) -> Result<Response> {
     let year = request.time.year.ok_or_else(|| anyhow!("invalid year"))?;
     let month = request.time.month.ok_or_else(|| anyhow!("invalid month"))?;
     let mut events = if let Some(user_id) = request.user_id.as_deref() {
-        state.store.read_user_logs(&request.channel_id, user_id, year, month)?
+        state
+            .store
+            .read_user_logs(&request.channel_id, user_id, year, month)?
     } else {
         let day = request.time.day.ok_or_else(|| anyhow!("invalid day"))?;
         if request.response_type == ResponseType::Raw && accept_encoding.contains("br") {
-            let plan = state.store.channel_raw_plan(&request.channel_id, year, month, day)?;
+            let plan = state
+                .store
+                .channel_raw_plan(&request.channel_id, year, month, day)?;
             if let Some(path) = plan.segment_path {
                 return direct_brotli_response(path);
             }
         }
-        state.store.read_channel_logs(&request.channel_id, year, month, day)?
+        state
+            .store
+            .read_channel_logs(&request.channel_id, year, month, day)?
     };
     if request.reverse {
         events.reverse();
     }
-    let messages = events.into_iter().map(ChatMessage::from).collect::<Vec<_>>();
-    respond_with_events(messages, request.response_type, accept_encoding.contains("br"))
+    let messages = events
+        .into_iter()
+        .map(ChatMessage::from)
+        .collect::<Vec<_>>();
+    respond_with_events(
+        messages,
+        request.response_type,
+        accept_encoding.contains("br"),
+    )
 }
 
 async fn parse_log_request(state: &AppState, uri: &Uri, content_type: &str) -> Result<LogRequest> {
@@ -299,10 +409,17 @@ async fn parse_log_request(state: &AppState, uri: &Uri, content_type: &str) -> R
     if !path.starts_with("/channel") {
         return Err(anyhow!("route not found"));
     }
-    let regex = Regex::new(r"^/(channel|channelid)/([^/]+)(?:/(user|userid)/([^/]+))?(?:/(\d{4})/(\d{1,2})(?:/(\d{1,2}))?|/(random))?$")?;
-    let captures = regex.captures(path.trim_end_matches('/')).ok_or_else(|| anyhow!("route not found"))?;
+    let regex = Regex::new(
+        r"^/(channel|channelid)/([^/]+)(?:/(user|userid)/([^/]+))?(?:/(\d{4})/(\d{1,2})(?:/(\d{1,2}))?|/(random))?$",
+    )?;
+    let captures = regex
+        .captures(path.trim_end_matches('/'))
+        .ok_or_else(|| anyhow!("route not found"))?;
     let query = query_map(uri);
-    let response_type = if query.contains_key("json") || query.get("type").is_some_and(|value| value == "json") || content_type == "application/json" {
+    let response_type = if query.contains_key("json")
+        || query.get("type").is_some_and(|value| value == "json")
+        || content_type == "application/json"
+    {
         ResponseType::Json
     } else if query.contains_key("raw") || query.get("type").is_some_and(|value| value == "raw") {
         ResponseType::Raw
@@ -330,7 +447,10 @@ async fn parse_log_request(state: &AppState, uri: &Uri, content_type: &str) -> R
     } else if let Some(year) = captures.get(5) {
         time.year = Some(i32::from_str(year.as_str())?);
         time.month = Some(u32::from_str(captures.get(6).unwrap().as_str())?);
-        time.day = captures.get(7).map(|capture| u32::from_str(capture.as_str())).transpose()?;
+        time.day = captures
+            .get(7)
+            .map(|capture| u32::from_str(capture.as_str()))
+            .transpose()?;
     } else {
         let now = Utc::now();
         time.year = Some(now.year());
@@ -349,7 +469,9 @@ async fn parse_log_request(state: &AppState, uri: &Uri, content_type: &str) -> R
                 path.trim_end_matches('/'),
                 time.year.unwrap(),
                 time.month.unwrap(),
-                uri.query().map(|query| format!("?{query}")).unwrap_or_default()
+                uri.query()
+                    .map(|query| format!("?{query}"))
+                    .unwrap_or_default()
             )
         } else {
             format!(
@@ -358,7 +480,9 @@ async fn parse_log_request(state: &AppState, uri: &Uri, content_type: &str) -> R
                 time.year.unwrap(),
                 time.month.unwrap(),
                 time.day.unwrap(),
-                uri.query().map(|query| format!("?{query}")).unwrap_or_default()
+                uri.query()
+                    .map(|query| format!("?{query}"))
+                    .unwrap_or_default()
             )
         };
         return Ok(LogRequest {
@@ -404,7 +528,10 @@ async fn resolve_channel_id(state: &AppState, query: &HashMap<String, String>) -
     Err(anyhow!("missing channel"))
 }
 
-async fn resolve_optional_user_id(state: &AppState, query: &HashMap<String, String>) -> Result<Option<String>> {
+async fn resolve_optional_user_id(
+    state: &AppState,
+    query: &HashMap<String, String>,
+) -> Result<Option<String>> {
     if let Some(user_id) = query.get("userid") {
         return Ok(Some(user_id.to_string()));
     }
@@ -429,11 +556,17 @@ fn parse_timestamp(input: &str) -> Result<DateTime<Utc>> {
         .ok_or_else(|| anyhow!("invalid timestamp"))
 }
 
-fn respond_with_events(messages: Vec<ChatMessage>, response_type: ResponseType, compress_brotli: bool) -> Result<Response> {
+fn respond_with_events(
+    messages: Vec<ChatMessage>,
+    response_type: ResponseType,
+    compress_brotli: bool,
+) -> Result<Response> {
     match response_type {
         ResponseType::Json => {
             let mut response = Json(ChatLog { messages }).into_response();
-            response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             Ok(response)
         }
         ResponseType::Raw => {
@@ -468,11 +601,20 @@ fn bytes_response(rendered: String, compress_brotli: bool) -> Result<Response> {
         Response::new(Body::from(rendered))
     };
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
-    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     if compress_brotli {
-        response.headers_mut().insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
-        response.headers_mut().insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+        response
+            .headers_mut()
+            .insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
+        response
+            .headers_mut()
+            .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
     }
     Ok(response)
 }
@@ -507,15 +649,30 @@ fn direct_brotli_response(path: std::path::PathBuf) -> Result<Response> {
     let stream = ReaderStream::new(File::from_std(std::fs::File::open(path)?));
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
-    response.headers_mut().insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
-    response.headers_mut().insert(VARY, HeaderValue::from_static("Accept-Encoding"));
-    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     Ok(response)
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
-    (status, Json(ErrorResponse { message: message.to_string() })).into_response()
+    (
+        status,
+        Json(ErrorResponse {
+            message: message.to_string(),
+        }),
+    )
+        .into_response()
 }
 
 fn root_response() -> &'static str {

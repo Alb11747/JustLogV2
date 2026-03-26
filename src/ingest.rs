@@ -70,7 +70,10 @@ impl IngestManager {
     pub async fn start(&self, initial_channels: Vec<String>) {
         {
             let mut desired = self.desired_channels.write().await;
-            *desired = initial_channels.into_iter().map(|value| value.to_lowercase()).collect();
+            *desired = initial_channels
+                .into_iter()
+                .map(|value| value.to_lowercase())
+                .collect();
         }
         let redundancy = self.config.read().await.ingest.redundancy_factor.max(1);
         for lane_index in 0..redundancy {
@@ -126,7 +129,11 @@ impl IngestManager {
 
         write_irc_line(&mut writer_half, &format!("PASS oauth:{}", config.oauth)).await?;
         write_irc_line(&mut writer_half, &format!("NICK {}", config.username)).await?;
-        write_irc_line(&mut writer_half, "CAP REQ :twitch.tv/commands twitch.tv/tags twitch.tv/membership").await?;
+        write_irc_line(
+            &mut writer_half,
+            "CAP REQ :twitch.tv/commands twitch.tv/tags twitch.tv/membership",
+        )
+        .await?;
 
         let desired_channels = self.desired_channels.read().await.clone();
         for channel in desired_channels {

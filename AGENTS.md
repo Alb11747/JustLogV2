@@ -14,6 +14,7 @@ Use conventional-style prefixes:
 - `refactor:` for code structure changes without behavior changes
 - `chore:` for maintenance, tooling, dependency, or release bookkeeping
 - `docs:` for documentation-only changes
+- `test:` for test code changes that don't affect runtime behavior
 
 Format:
 

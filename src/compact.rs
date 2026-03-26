@@ -16,7 +16,10 @@ pub fn spawn_compactor(config: SharedConfig, store: Store) {
             ) {
                 error!("compactor iteration failed: {error}");
             }
-            sleep(Duration::from_secs(snapshot.storage.compact_interval_seconds)).await;
+            sleep(Duration::from_secs(
+                snapshot.storage.compact_interval_seconds,
+            ))
+            .await;
         }
     });
 }

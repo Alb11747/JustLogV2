@@ -220,7 +220,12 @@ impl Store {
     ) -> Result<Vec<StoredEvent>> {
         let mut events = Vec::new();
         for key in enumerate_user_months(channel_id, user_id, from, to) {
-            events.extend(self.read_user_logs(&key.channel_id, &key.user_id, key.year, key.month)?);
+            events.extend(self.read_user_logs(
+                &key.channel_id,
+                &key.user_id,
+                key.year,
+                key.month,
+            )?);
         }
         events.retain(|event| event.timestamp >= from && event.timestamp <= to);
         events.sort_by_key(|event| (event.timestamp.timestamp(), event.seq));
@@ -285,7 +290,11 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn latest_user_log_month(&self, channel_id: &str, user_id: &str) -> Result<Option<(i32, u32)>> {
+    pub fn latest_user_log_month(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Result<Option<(i32, u32)>> {
         let logs = self.get_available_logs_for_user(channel_id, user_id)?;
         let Some(first) = logs.first() else {
             return Ok(None);
@@ -293,7 +302,11 @@ impl Store {
         Ok(Some((first.year.parse()?, first.month.parse()?)))
     }
 
-    pub fn random_user_message(&self, channel_id: &str, user_id: &str) -> Result<Option<StoredEvent>> {
+    pub fn random_user_message(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Result<Option<StoredEvent>> {
         let events = self.get_all_user_events(channel_id, user_id)?;
         choose_random(events)
     }
@@ -336,7 +349,9 @@ impl Store {
         if !self.archive_enabled {
             return Ok(());
         }
-        for partition in self.compactable_channel_days(now - Duration::days(compact_after_channel_days))? {
+        for partition in
+            self.compactable_channel_days(now - Duration::days(compact_after_channel_days))?
+        {
             self.compact_channel_partition(&partition.key)?;
         }
         for partition in self.compactable_user_months(now, compact_after_user_months)? {
@@ -350,7 +365,10 @@ impl Store {
         Ok(db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
     }
 
-    fn compactable_channel_days(&self, threshold: DateTime<Utc>) -> Result<Vec<ChannelPartitionSummary>> {
+    fn compactable_channel_days(
+        &self,
+        threshold: DateTime<Utc>,
+    ) -> Result<Vec<ChannelPartitionSummary>> {
         let db = self.db.lock().unwrap();
         let mut statement = db.prepare(
             r#"
@@ -457,7 +475,16 @@ impl Store {
         );
         let temp_path = self.root_dir.join(format!("{relative}.tmp"));
         let final_path = self.root_dir.join(&relative);
-        self.write_pending_segment("channel", &key.channel_id, None, key.year, key.month, Some(key.day), &temp_path, &final_path)?;
+        self.write_pending_segment(
+            "channel",
+            &key.channel_id,
+            None,
+            key.year,
+            key.month,
+            Some(key.day),
+            &temp_path,
+            &final_path,
+        )?;
         self.write_segment_file(&final_path, &temp_path, &events)?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -487,13 +514,17 @@ impl Store {
             "#,
             params![key.channel_id, key.year, key.month, key.day],
         )?;
-        tx.execute("DELETE FROM pending_segments WHERE final_path = ?1", params![relative])?;
+        tx.execute(
+            "DELETE FROM pending_segments WHERE final_path = ?1",
+            params![relative],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn compact_user_partition(&self, key: &UserMonthKey) -> Result<()> {
-        let events = self.read_hot_user_events(&key.channel_id, &key.user_id, key.year, key.month)?;
+        let events =
+            self.read_hot_user_events(&key.channel_id, &key.user_id, key.year, key.month)?;
         if events.is_empty() {
             return Ok(());
         }
@@ -542,7 +573,10 @@ impl Store {
             "#,
             params![key.channel_id, key.user_id, key.year, key.month],
         )?;
-        tx.execute("DELETE FROM pending_segments WHERE final_path = ?1", params![relative])?;
+        tx.execute(
+            "DELETE FROM pending_segments WHERE final_path = ?1",
+            params![relative],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -561,8 +595,16 @@ impl Store {
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let relative_temp = temp_path.strip_prefix(&self.root_dir).unwrap_or(temp_path).to_string_lossy().to_string();
-        let relative_final = final_path.strip_prefix(&self.root_dir).unwrap_or(final_path).to_string_lossy().to_string();
+        let relative_temp = temp_path
+            .strip_prefix(&self.root_dir)
+            .unwrap_or(temp_path)
+            .to_string_lossy()
+            .to_string();
+        let relative_final = final_path
+            .strip_prefix(&self.root_dir)
+            .unwrap_or(final_path)
+            .to_string_lossy()
+            .to_string();
         let db = self.db.lock().unwrap();
         db.execute(
             r#"
@@ -574,12 +616,22 @@ impl Store {
         Ok(())
     }
 
-    fn write_segment_file(&self, final_path: &Path, temp_path: &Path, events: &[StoredEvent]) -> Result<()> {
+    fn write_segment_file(
+        &self,
+        final_path: &Path,
+        temp_path: &Path,
+        events: &[StoredEvent],
+    ) -> Result<()> {
         if let Some(parent) = temp_path.parent() {
             fs::create_dir_all(parent)?;
         }
         let file = File::create(temp_path)?;
-        let mut writer = CompressorWriter::new(file, 64 * 1024, self.compression_quality, self.compression_lgwin);
+        let mut writer = CompressorWriter::new(
+            file,
+            64 * 1024,
+            self.compression_quality,
+            self.compression_lgwin,
+        );
         for event in events {
             writer.write_all(event.raw.as_bytes())?;
             writer.write_all(b"\n")?;
@@ -632,7 +684,13 @@ impl Store {
         .map_err(Into::into)
     }
 
-    fn read_channel_segment(&self, channel_id: &str, year: i32, month: u32, day: u32) -> Result<Vec<StoredEvent>> {
+    fn read_channel_segment(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+    ) -> Result<Vec<StoredEvent>> {
         let segment = match self.segment_for_channel_day(channel_id, year, month, day)? {
             Some(segment) => segment,
             None => return Ok(Vec::new()),
@@ -640,7 +698,13 @@ impl Store {
         self.load_segment_events(&segment)
     }
 
-    fn read_user_segment(&self, channel_id: &str, user_id: &str, year: i32, month: u32) -> Result<Vec<StoredEvent>> {
+    fn read_user_segment(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        year: i32,
+        month: u32,
+    ) -> Result<Vec<StoredEvent>> {
         let segment = match self.segment_for_user_month(channel_id, user_id, year, month)? {
             Some(segment) => segment,
             None => return Ok(Vec::new()),
@@ -737,7 +801,12 @@ impl Store {
     fn get_all_user_events(&self, channel_id: &str, user_id: &str) -> Result<Vec<StoredEvent>> {
         let mut events = Vec::new();
         for log in self.get_available_logs_for_user(channel_id, user_id)? {
-            events.extend(self.read_user_logs(channel_id, user_id, log.year.parse()?, log.month.parse()?)?);
+            events.extend(self.read_user_logs(
+                channel_id,
+                user_id,
+                log.year.parse()?,
+                log.month.parse()?,
+            )?);
         }
         Ok(events)
     }
@@ -759,7 +828,10 @@ impl Store {
 fn filter_user_events(events: Vec<StoredEvent>, user_id: &str) -> Vec<StoredEvent> {
     events
         .into_iter()
-        .filter(|event| event.user_id.as_deref() == Some(user_id) || event.target_user_id.as_deref() == Some(user_id))
+        .filter(|event| {
+            event.user_id.as_deref() == Some(user_id)
+                || event.target_user_id.as_deref() == Some(user_id)
+        })
         .collect()
 }
 
@@ -772,7 +844,11 @@ fn choose_random(events: Vec<StoredEvent>) -> Result<Option<StoredEvent>> {
     Ok(events.into_iter().nth(index))
 }
 
-fn enumerate_channel_days(channel_id: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<ChannelDayKey> {
+fn enumerate_channel_days(
+    channel_id: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<ChannelDayKey> {
     let mut keys = Vec::new();
     let mut cursor = from.date_naive();
     let end = to.date_naive();
@@ -788,7 +864,12 @@ fn enumerate_channel_days(channel_id: &str, from: DateTime<Utc>, to: DateTime<Ut
     keys
 }
 
-fn enumerate_user_months(channel_id: &str, user_id: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<UserMonthKey> {
+fn enumerate_user_months(
+    channel_id: &str,
+    user_id: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<UserMonthKey> {
     let mut keys = Vec::new();
     let mut year = from.year();
     let mut month = from.month();
@@ -815,11 +896,18 @@ fn enumerate_user_months(channel_id: &str, user_id: &str, from: DateTime<Utc>, t
 fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
     let timestamp = row.get::<_, String>(11)?;
     let timestamp = DateTime::parse_from_rfc3339(&timestamp)
-        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(error)))?
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?
         .with_timezone(&Utc);
     let tags_json = row.get::<_, String>(12)?;
-    let tags = serde_json::from_str(&tags_json)
-        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(error)))?;
+    let tags = serde_json::from_str(&tags_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(StoredEvent {
         seq: row.get(0)?,
         event_uid: row.get(1)?,

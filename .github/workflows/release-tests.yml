@@ -1,0 +1,29 @@
+name: Release Tests
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run locked integration tests
+        run: cargo test --locked --test integration
+
+      - name: Run locked local network tests
+        run: cargo test --locked --test network
+
+      - name: Check release build
+        run: cargo check --locked --release
