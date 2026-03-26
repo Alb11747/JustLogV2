@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use justlog::api;
 use justlog::app::{AppState, CommandService, resolve_channel_logins};
 use justlog::config::Config;
+use justlog::debug_sync::DebugRuntime;
 use justlog::helix::{HelixClient, UserData};
 use justlog::ingest::IngestManager;
 use justlog::model::CanonicalEvent;
@@ -125,6 +126,88 @@ impl MockHelix {
 }
 
 #[derive(Clone)]
+pub struct MockJustLogServer {
+    pub address: SocketAddr,
+    routes: Arc<Mutex<HashMap<String, MockRouteResponse>>>,
+}
+
+#[derive(Clone)]
+struct MockRouteResponse {
+    status: StatusCode,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl MockJustLogServer {
+    pub async fn start() -> Self {
+        async fn handler(
+            axum::extract::State(routes): axum::extract::State<
+                Arc<Mutex<HashMap<String, MockRouteResponse>>>,
+            >,
+            request: AxumRequest,
+        ) -> impl IntoResponse {
+            let key = request
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| request.uri().path().to_string());
+            let route = routes.lock().await.get(&key).cloned();
+            let Some(route) = route else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let mut response = axum::response::Response::new(Body::from(route.body));
+            *response.status_mut() = route.status;
+            for (name, value) in route.headers {
+                response.headers_mut().insert(
+                    axum::http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(&value).unwrap(),
+                );
+            }
+            response
+        }
+
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new().route("/{*path}", get(handler)).with_state(routes.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        sleep(Duration::from_millis(50)).await;
+        Self { address, routes }
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    pub async fn set_json(&self, path_and_query: &str, value: serde_json::Value) {
+        self.routes.lock().await.insert(
+            path_and_query.to_string(),
+            MockRouteResponse {
+                status: StatusCode::OK,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: serde_json::to_vec(&value).unwrap(),
+            },
+        );
+    }
+
+    pub async fn set_text(&self, path_and_query: &str, body: &str) {
+        self.routes.lock().await.insert(
+            path_and_query.to_string(),
+            MockRouteResponse {
+                status: StatusCode::OK,
+                headers: vec![(
+                    "content-type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )],
+                body: body.as_bytes().to_vec(),
+            },
+        );
+    }
+}
+
+#[derive(Clone)]
 pub struct MockIrc {
     pub address: SocketAddr,
     connections: Arc<Mutex<Vec<mpsc::UnboundedSender<ServerEvent>>>>,
@@ -227,14 +310,26 @@ pub struct TestHarness {
 
 impl TestHarness {
     pub async fn start(channel_ids: Vec<String>) -> Self {
-        Self::start_with_options(channel_ids, true).await
+        Self::start_with_options(channel_ids, true, Arc::new(DebugRuntime::disabled())).await
     }
 
     pub async fn start_without_ingest(channel_ids: Vec<String>) -> Self {
-        Self::start_with_options(channel_ids, false).await
+        Self::start_with_options(channel_ids, false, Arc::new(DebugRuntime::disabled())).await
     }
 
-    async fn start_with_options(channel_ids: Vec<String>, start_ingest: bool) -> Self {
+    pub async fn start_with_debug_runtime(
+        channel_ids: Vec<String>,
+        start_ingest: bool,
+        debug_runtime: Arc<DebugRuntime>,
+    ) -> Self {
+        Self::start_with_options(channel_ids, start_ingest, debug_runtime).await
+    }
+
+    async fn start_with_options(
+        channel_ids: Vec<String>,
+        start_ingest: bool,
+        debug_runtime: Arc<DebugRuntime>,
+    ) -> Self {
         let users = vec![
             user("1", "channelone"),
             user("2", "channeltwo"),
@@ -276,6 +371,7 @@ impl TestHarness {
             config: shared_config.clone(),
             store: store.clone(),
             helix: helix.clone(),
+            debug_runtime,
             ingest: ingest_slot.clone(),
             start_time: Instant::now(),
             optout_codes: Arc::new(Mutex::new(HashMap::new())),
@@ -333,6 +429,18 @@ impl TestHarness {
                 year,
                 month,
                 day,
+            })
+            .unwrap();
+    }
+
+    pub fn compact_user_month(&self, channel_id: &str, user_id: &str, year: i32, month: u32) {
+        self.state
+            .store
+            .compact_user_partition(&justlog::model::UserMonthKey {
+                channel_id: channel_id.to_string(),
+                user_id: user_id.to_string(),
+                year,
+                month,
             })
             .unwrap();
     }

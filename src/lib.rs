@@ -2,6 +2,7 @@ pub mod api;
 pub mod app;
 pub mod compact;
 pub mod config;
+pub mod debug_sync;
 pub mod helix;
 pub mod import;
 pub mod ingest;

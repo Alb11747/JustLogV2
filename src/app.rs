@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 use crate::api;
 use crate::compact::spawn_compactor;
 use crate::config::{Config, SharedConfig};
+use crate::debug_sync::DebugRuntime;
 use crate::helix::HelixClient;
 use crate::import::import_legacy_logs;
 use crate::ingest::{ChatCommandService, IngestManager};
@@ -41,6 +42,7 @@ pub struct AppState {
     pub config: SharedConfig,
     pub store: Store,
     pub helix: HelixClient,
+    pub debug_runtime: Arc<DebugRuntime>,
     pub ingest: Arc<RwLock<Option<IngestManager>>>,
     pub start_time: Instant,
     pub optout_codes: Arc<Mutex<HashMap<String, Instant>>>,
@@ -50,6 +52,7 @@ pub async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli.config)?;
     init_tracing(&config.log_level);
+    let debug_runtime = Arc::new(DebugRuntime::from_env(&config.logs_directory)?);
 
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let store = Store::open(&config)?;
@@ -66,6 +69,7 @@ pub async fn run_cli() -> Result<()> {
         config: shared_config.clone(),
         store: store.clone(),
         helix: helix.clone(),
+        debug_runtime: debug_runtime.clone(),
         ingest: ingest_slot.clone(),
         start_time: Instant::now(),
         optout_codes: Arc::new(Mutex::new(HashMap::new())),
@@ -77,7 +81,7 @@ pub async fn run_cli() -> Result<()> {
 
     let initial_channels = resolve_channel_logins(&helix, &config.channels).await?;
     ingest.start(initial_channels).await;
-    spawn_compactor(shared_config.clone(), store.clone());
+    spawn_compactor(shared_config.clone(), store.clone(), debug_runtime);
 
     let app = api::router(state);
     serve(app, &config.listen_address).await

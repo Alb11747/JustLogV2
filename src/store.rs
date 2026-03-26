@@ -9,6 +9,7 @@ use chrono::{DateTime, Datelike, Duration, Utc};
 use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::debug_sync::RECONCILIATION_DELAY_SECONDS;
 use crate::config::Config;
 use crate::model::{
     CanonicalEvent, ChannelDayKey, ChannelLogFile, ChannelPartitionSummary, SegmentRecord,
@@ -28,6 +29,33 @@ pub struct Store {
 pub struct RawResponsePlan {
     pub segment_path: Option<PathBuf>,
     pub events: Vec<StoredEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconciliationJob {
+    pub id: i64,
+    pub channel_id: String,
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+    pub segment_path: String,
+    pub scheduled_at: DateTime<Utc>,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub status: String,
+    pub conflict_count: i64,
+    pub repair_status: String,
+    pub unhealthy: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconciliationOutcome {
+    pub checked_at: DateTime<Utc>,
+    pub status: String,
+    pub conflict_count: i64,
+    pub repair_status: String,
+    pub unhealthy: i64,
+    pub last_error: Option<String>,
 }
 
 impl Store {
@@ -109,6 +137,25 @@ impl Store {
                 temp_path TEXT NOT NULL,
                 final_path TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS reconciliation_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL,
+                day INTEGER NOT NULL,
+                segment_path TEXT NOT NULL,
+                scheduled_at INTEGER NOT NULL,
+                checked_at INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                conflict_count INTEGER NOT NULL DEFAULT 0,
+                repair_status TEXT NOT NULL DEFAULT 'none',
+                unhealthy INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS reconciliation_jobs_partition_idx
+                ON reconciliation_jobs(channel_id, year, month, day);
             "#,
         )?;
         Ok(())
@@ -519,6 +566,15 @@ impl Store {
             params![relative],
         )?;
         tx.commit()?;
+        drop(db);
+        self.schedule_reconciliation(
+            &key.channel_id,
+            key.year,
+            key.month,
+            key.day,
+            &relative,
+            Utc::now() + Duration::seconds(RECONCILIATION_DELAY_SECONDS),
+        )?;
         Ok(())
     }
 
@@ -638,7 +694,168 @@ impl Store {
         }
         writer.flush()?;
         drop(writer);
+        if final_path.exists() {
+            fs::remove_file(final_path)?;
+        }
         fs::rename(temp_path, final_path)?;
+        Ok(())
+    }
+
+    pub fn schedule_reconciliation(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+        segment_path: &str,
+        scheduled_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            r#"
+            INSERT INTO reconciliation_jobs(
+                channel_id, year, month, day, segment_path, scheduled_at, checked_at, status,
+                conflict_count, repair_status, unhealthy, last_error
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL, 'pending', 0, 'none', 0, NULL)
+            ON CONFLICT(channel_id, year, month, day)
+            DO UPDATE SET
+                segment_path = excluded.segment_path,
+                scheduled_at = excluded.scheduled_at,
+                checked_at = NULL,
+                status = 'pending',
+                conflict_count = 0,
+                repair_status = 'none',
+                unhealthy = 0,
+                last_error = NULL
+            "#,
+            params![
+                channel_id,
+                year,
+                month,
+                day,
+                segment_path,
+                scheduled_at.timestamp(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn due_reconciliation_jobs(&self, now: DateTime<Utc>) -> Result<Vec<ReconciliationJob>> {
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare(
+            r#"
+            SELECT id, channel_id, year, month, day, segment_path, scheduled_at, checked_at,
+                   status, conflict_count, repair_status, unhealthy, last_error
+            FROM reconciliation_jobs
+            WHERE scheduled_at <= ?1 AND checked_at IS NULL
+            ORDER BY scheduled_at ASC, id ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![now.timestamp()], map_reconciliation_job_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn record_reconciliation_outcome(
+        &self,
+        job: &ReconciliationJob,
+        outcome: &ReconciliationOutcome,
+    ) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            r#"
+            UPDATE reconciliation_jobs
+            SET checked_at = ?2,
+                status = ?3,
+                conflict_count = ?4,
+                repair_status = ?5,
+                unhealthy = ?6,
+                last_error = ?7
+            WHERE id = ?1
+            "#,
+            params![
+                job.id,
+                outcome.checked_at.timestamp(),
+                outcome.status,
+                outcome.conflict_count,
+                outcome.repair_status,
+                outcome.unhealthy,
+                outcome.last_error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_reconciliation_error(&self, job: &ReconciliationJob, error: &str) -> Result<()> {
+        self.record_reconciliation_outcome(
+            job,
+            &ReconciliationOutcome {
+                checked_at: Utc::now(),
+                status: "error".to_string(),
+                conflict_count: 0,
+                repair_status: "none".to_string(),
+                unhealthy: 1,
+                last_error: Some(error.to_string()),
+            },
+        )
+    }
+
+    pub fn channel_day_is_unhealthy(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+    ) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        let unhealthy = db
+            .query_row(
+                r#"
+                SELECT unhealthy
+                FROM reconciliation_jobs
+                WHERE channel_id = ?1 AND year = ?2 AND month = ?3 AND day = ?4
+                "#,
+                params![channel_id, year, month, day],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(unhealthy.unwrap_or_default() == 1)
+    }
+
+    pub fn replace_channel_segment(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+        events: &[StoredEvent],
+    ) -> Result<()> {
+        let segment = self
+            .segment_for_channel_day(channel_id, year, month, day)?
+            .ok_or_else(|| anyhow!("missing channel segment for repair"))?;
+        let final_path = self.root_dir.join(&segment.path);
+        let temp_path = self.root_dir.join(format!("{}.repair.tmp", segment.path));
+        self.write_segment_file(&final_path, &temp_path, events)?;
+        let db = self.db.lock().unwrap();
+        db.execute(
+            r#"
+            UPDATE segments
+            SET line_count = ?1, start_ts = ?2, end_ts = ?3
+            WHERE id = ?4
+            "#,
+            params![
+                events.len() as i64,
+                events
+                    .first()
+                    .map(|event| event.timestamp.timestamp())
+                    .unwrap_or_default(),
+                events
+                    .last()
+                    .map(|event| event.timestamp.timestamp())
+                    .unwrap_or_default(),
+                segment.id,
+            ],
+        )?;
         Ok(())
     }
 
@@ -941,6 +1158,42 @@ fn map_segment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SegmentRecord> {
         end_ts: row.get(10)?,
         compression: row.get(11)?,
         passthrough_raw: row.get::<_, i64>(12)? == 1,
+    })
+}
+
+fn map_reconciliation_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReconciliationJob> {
+    let scheduled_at = timestamp_from_sql(6, row.get::<_, i64>(6)?)?;
+    let checked_at = row
+        .get::<_, Option<i64>>(7)?
+        .map(|value| timestamp_from_sql(7, value))
+        .transpose()?;
+    Ok(ReconciliationJob {
+        id: row.get(0)?,
+        channel_id: row.get(1)?,
+        year: row.get(2)?,
+        month: row.get::<_, i64>(3)? as u32,
+        day: row.get::<_, i64>(4)? as u32,
+        segment_path: row.get(5)?,
+        scheduled_at,
+        checked_at,
+        status: row.get(8)?,
+        conflict_count: row.get(9)?,
+        repair_status: row.get(10)?,
+        unhealthy: row.get(11)?,
+        last_error: row.get(12)?,
+    })
+}
+
+fn timestamp_from_sql(index: usize, timestamp: i64) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp(timestamp, 0).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid unix timestamp {timestamp}"),
+            )),
+        )
     })
 }
 

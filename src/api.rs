@@ -16,6 +16,7 @@ use serde::Deserialize;
 use tokio::fs::File;
 use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
+use tracing::warn;
 
 use crate::app::AppState;
 use crate::model::{
@@ -240,14 +241,22 @@ async fn admin_channels_handler(state: AppState, request: Request, join: bool) -
 }
 
 async fn log_handler(state: AppState, request: Request) -> Result<Response> {
+    let accept_encoding = request
+        .headers()
+        .get("accept-encoding")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let log_request = parse_log_request(
         &state,
         request.uri(),
-        request
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default(),
+        &content_type,
     )
     .await?;
     if let Some(redirect_path) = log_request.redirect_path {
@@ -274,33 +283,26 @@ async fn log_handler(state: AppState, request: Request) -> Result<Response> {
         }
     }
 
-    if log_request.time.random {
-        return random_response(state, log_request).await;
+    if should_force_trusted_fallback(&state, &log_request).await? {
+        return fallback_response(&state, request.uri(), &accept_encoding, &content_type).await;
     }
 
-    if log_request.time.from.is_some() || log_request.time.to.is_some() {
-        return range_response(
-            state,
-            log_request,
-            request
-                .headers()
-                .get("accept-encoding")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default(),
-        )
-        .await;
-    }
+    let local = if log_request.time.random {
+        random_response(state.clone(), log_request).await
+    } else if log_request.time.from.is_some() || log_request.time.to.is_some() {
+        range_response(state.clone(), log_request, &accept_encoding).await
+    } else {
+        dated_response(state.clone(), log_request, &accept_encoding).await
+    };
 
-    dated_response(
-        state,
-        log_request,
-        request
-            .headers()
-            .get("accept-encoding")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default(),
-    )
-    .await
+    match local {
+        Ok(response) => Ok(response),
+        Err(error) if state.debug_runtime.fallback_enabled() => {
+            warn!("local log read failed; falling back to trusted justlog: {error}");
+            fallback_response(&state, request.uri(), &accept_encoding, &content_type).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn random_response(state: AppState, request: LogRequest) -> Result<Response> {
@@ -516,6 +518,55 @@ fn query_map(uri: &Uri) -> HashMap<String, String> {
     url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
         .into_owned()
         .collect()
+}
+
+async fn should_force_trusted_fallback(state: &AppState, request: &LogRequest) -> Result<bool> {
+    if !state.debug_runtime.fallback_enabled() {
+        return Ok(false);
+    }
+    if request.time.random || request.user_id.is_some() {
+        return Ok(false);
+    }
+    if request.time.from.is_some() || request.time.to.is_some() {
+        let from = request
+            .time
+            .from
+            .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
+        let to = request.time.to.unwrap_or_else(Utc::now);
+        let mut cursor = from.date_naive();
+        let end = to.date_naive();
+        while cursor <= end {
+            if state.store.channel_day_is_unhealthy(
+                &request.channel_id,
+                cursor.year(),
+                cursor.month(),
+                cursor.day(),
+            )? {
+                return Ok(true);
+            }
+            cursor = cursor.succ_opt().unwrap();
+        }
+        return Ok(false);
+    }
+    match (request.time.year, request.time.month, request.time.day) {
+        (Some(year), Some(month), Some(day)) => state
+            .store
+            .channel_day_is_unhealthy(&request.channel_id, year, month, day),
+        _ => Ok(false),
+    }
+}
+
+async fn fallback_response(
+    state: &AppState,
+    uri: &Uri,
+    accept_encoding: &str,
+    content_type: &str,
+) -> Result<Response> {
+    state
+        .debug_runtime
+        .proxy_fallback_request(uri, accept_encoding, content_type)
+        .await
+        .map_err(Into::into)
 }
 
 async fn resolve_channel_id(state: &AppState, query: &HashMap<String, String>) -> Result<String> {
