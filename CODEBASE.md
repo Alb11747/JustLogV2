@@ -354,11 +354,15 @@ Validation outcomes are logged to `reconciliation.log` and also upserted into `r
 
 `src/api.rs` exposes all routes through a catch-all Axum handler.
 
+The checked-in OpenAPI contract lives at [`openapi.yaml`](C:\Users\Albert\Sync\Projects\JustLogV2\openapi.yaml). The running app also serves that same file from `/openapi.yaml` and exposes a browser UI at `/docs`. Any API contract change should update `openapi.yaml` in the same change.
+
 ### Basic Routes
 
 - `GET /healthz`: liveness check.
 - `GET /readyz`: readiness check.
 - `GET /`: short plaintext route summary.
+- `GET /openapi.yaml`: serves the checked-in OpenAPI document.
+- `GET /docs`: browser UI backed by `/openapi.yaml`.
 - `GET /channels`: list configured channels, resolved to login names.
 - `GET /list?channel=<login>` or `channelid=<id>`: list available log partitions.
 

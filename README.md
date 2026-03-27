@@ -41,6 +41,19 @@ IRC auth is anonymous by default. If `oauth` is omitted or empty, JustLog connec
 
 For the Docker and upload workflow in this repo, keep the runtime file at `./data/config.json` instead.
 
+## API docs and OpenAPI
+
+The canonical API contract lives in [`openapi.yaml`](C:\Users\Albert\Sync\Projects\JustLogV2\openapi.yaml).
+
+When the app is running locally, you can use:
+
+- `http://127.0.0.1:8026/docs` for the browser-based API UI
+- `http://127.0.0.1:8026/openapi.yaml` for the raw OpenAPI document
+
+For Postman or similar tools, import `openapi.yaml` directly from the repo or point the importer at the running `/openapi.yaml` route.
+
+Any HTTP API change must update `openapi.yaml` in the same change. Treat route additions, removals, request or response shape changes, status code changes, auth changes, and path/query contract changes as OpenAPI-sensitive by default.
+
 ## Recent Message Backfill
 
 JustLogV2 can optionally fetch short-gap missed chat from Robotty's recent-messages API and store it through the normal ingest pipeline. This path is env-driven, off by default, and best-effort only.

@@ -34,6 +34,72 @@ async fn basic_routes_are_healthy() {
     assert_status_ok(&harness, "/").await;
     assert_status_ok(&harness, "/healthz").await;
     assert_status_ok(&harness, "/readyz").await;
+    assert_status_ok(&harness, "/openapi.yaml").await;
+    assert_status_ok(&harness, "/docs").await;
+}
+
+#[tokio::test]
+async fn openapi_route_serves_checked_in_spec() {
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+
+    let response = harness
+        .request(
+            Request::builder()
+                .uri("/openapi.yaml")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/yaml; charset=utf-8"
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let expected = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml")).unwrap();
+    assert_eq!(String::from_utf8(body.to_vec()).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn docs_route_points_at_served_openapi_spec() {
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+
+    let response = harness
+        .request(
+            Request::builder()
+                .uri("/docs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+
+    let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
+        .unwrap();
+    assert!(body.contains("spec-url=\"/openapi.yaml\""));
+    assert!(body.contains("rapidoc"));
+}
+
+#[test]
+fn openapi_file_covers_high_risk_contract_areas() {
+    let openapi = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml")).unwrap();
+
+    assert!(openapi.contains("name: X-Api-Key"));
+    assert!(openapi.contains("/admin/channels:"));
+    assert!(openapi.contains("/admin/import/raw:"));
+    assert!(openapi.contains("name: channel"));
+    assert!(openapi.contains("name: channelid"));
+    assert!(openapi.contains("/channel/{channelLogin}/{year}/{month}/{day}:"));
+    assert!(openapi.contains("/channelid/{channelId}/{year}/{month}/{day}:"));
+    assert!(openapi.contains("application/json:"));
+    assert!(openapi.contains("text/plain:"));
 }
 
 #[tokio::test]

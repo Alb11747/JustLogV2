@@ -27,6 +27,8 @@ use crate::model::{
     AllChannelsJson, ChannelInfo, ChannelLogList, ChatLog, ChatMessage, ErrorResponse, UserLogList,
 };
 
+const OPENAPI_YAML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"));
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponseType {
     Json,
@@ -102,6 +104,8 @@ pub async fn dispatch(state: AppState, request: Request) -> Response {
         (_, "/healthz") => StatusCode::OK.into_response(),
         (_, "/readyz") => StatusCode::OK.into_response(),
         (_, "/") => root_response().into_response(),
+        (_, "/openapi.yaml") => openapi_response(),
+        (_, "/docs") => docs_response(),
         (_, "/channels") => match channels_handler(state).await {
             Ok(response) => response,
             Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -1017,7 +1021,71 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 }
 
 fn root_response() -> &'static str {
-    "justlog v2\n\nRoutes: /channels /list /channel/... /channelid/... /optout /admin/channels /admin/import/raw\n"
+    "justlog v2\n\nRoutes: /channels /list /channel/... /channelid/... /optout /admin/channels /admin/import/raw /openapi.yaml /docs\n"
+}
+
+fn openapi_response() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/yaml; charset=utf-8")
+        .body(Body::from(OPENAPI_YAML))
+        .unwrap()
+}
+
+fn docs_response() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(format!(
+            r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JustLogV2 API Docs</title>
+  <script type="module" src="https://unpkg.com/rapidoc/dist/rapidoc-min.js"></script>
+  <style>
+    body {{
+      margin: 0;
+      background: #f6f1e8;
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }}
+    .banner {{
+      padding: 18px 24px;
+      background: linear-gradient(135deg, #1f5f8b, #2d8f85);
+      color: #fff8ee;
+    }}
+    .banner h1 {{
+      margin: 0 0 6px;
+      font-size: 28px;
+    }}
+    .banner p {{
+      margin: 0;
+      font-size: 14px;
+      opacity: 0.92;
+    }}
+  </style>
+</head>
+<body>
+  <div class="banner">
+    <h1>JustLogV2 API</h1>
+    <p>Interactive docs are powered by the checked-in OpenAPI contract served from <code>/openapi.yaml</code>.</p>
+  </div>
+  <rapi-doc
+    spec-url="/openapi.yaml"
+    render-style="read"
+    show-header="false"
+    allow-authentication="true"
+    allow-try="true"
+    persist-auth="true"
+    theme="light"
+    regular-font="Segoe UI"
+    mono-font="Consolas">
+  </rapi-doc>
+</body>
+</html>"#
+        )))
+        .unwrap()
 }
 
 fn random_string(len: usize) -> String {

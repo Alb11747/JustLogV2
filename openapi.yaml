@@ -1,0 +1,786 @@
+openapi: 3.1.0
+info:
+  title: JustLogV2 HTTP API
+  version: 0.1.1
+  summary: Twitch chat log retrieval, import, and admin control API.
+  description: |
+    JustLogV2 stores Twitch chat and exposes HTTP routes for channel lists, archived log reads,
+    import workflows, and a few admin operations.
+
+    The log-reading routes intentionally support multiple response modes:
+    - JSON chat payloads with `?json=1` or `?type=json`
+    - plain text log rendering by default
+    - raw IRC line output with `?raw=1` or `?type=raw`
+
+    Path normalization is part of the contract:
+    - uppercase log paths redirect to lowercase
+    - omitted date segments redirect to a canonical path with inferred defaults
+servers:
+  - url: http://127.0.0.1:8026
+    description: Default local listener
+tags:
+  - name: Meta
+  - name: Channels
+  - name: Logs
+  - name: Admin
+  - name: Import
+paths:
+  /:
+    get:
+      tags: [Meta]
+      summary: Show the route summary banner
+      operationId: getRoot
+      responses:
+        '200':
+          description: Plaintext route summary
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "justlog v2\n\nRoutes: /channels /list /channel/... /channelid/... /optout /admin/channels /admin/import/raw /openapi.yaml /docs\n"
+  /healthz:
+    get:
+      tags: [Meta]
+      summary: Liveness probe
+      operationId: getHealthz
+      responses:
+        '200':
+          description: Service is alive
+  /readyz:
+    get:
+      tags: [Meta]
+      summary: Readiness probe
+      operationId: getReadyz
+      responses:
+        '200':
+          description: Service is ready to serve traffic
+  /openapi.yaml:
+    get:
+      tags: [Meta]
+      summary: Fetch the checked-in OpenAPI contract
+      operationId: getOpenApiDocument
+      responses:
+        '200':
+          description: OpenAPI YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+            text/yaml:
+              schema:
+                type: string
+  /docs:
+    get:
+      tags: [Meta]
+      summary: Open the interactive API documentation UI
+      operationId: getDocsUi
+      responses:
+        '200':
+          description: Browser UI backed by `/openapi.yaml`
+          content:
+            text/html:
+              schema:
+                type: string
+  /metrics:
+    get:
+      tags: [Meta]
+      summary: Read the event counter metric
+      description: |
+        Exposed only when metrics are enabled. The default route is `/metrics`, but the runtime
+        route may change with configuration.
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Prometheus-style plaintext metric payload
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "justlog_events_total 42\n"
+  /channels:
+    get:
+      tags: [Channels]
+      summary: List configured channels
+      description: Returns configured channels resolved to login names through Helix.
+      operationId: getChannels
+      responses:
+        '200':
+          description: Channel list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllChannelsJson'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /list:
+    get:
+      tags: [Logs]
+      summary: List available log partitions
+      description: |
+        Query by channel login or channel id. Optionally scope the listing to a user login or
+        user id. Channel-day listings may include import-folder discoveries.
+      operationId: getAvailableLogs
+      parameters:
+        - $ref: '#/components/parameters/channelQuery'
+        - $ref: '#/components/parameters/channelIdQuery'
+        - $ref: '#/components/parameters/userQuery'
+        - $ref: '#/components/parameters/userIdQuery'
+      responses:
+        '200':
+          description: Available log partitions
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ChannelLogList'
+                  - $ref: '#/components/schemas/UserLogList'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /optout:
+    post:
+      tags: [Admin]
+      summary: Create a short-lived opt-out confirmation code
+      operationId: createOptoutCode
+      responses:
+        '200':
+          description: Six-character confirmation code
+          content:
+            application/json:
+              schema:
+                type: string
+                example: "ab12cd"
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+  /admin/channels:
+    post:
+      tags: [Admin]
+      summary: Add channels by channel id
+      operationId: addChannels
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChannelsPayload'
+      responses:
+        '200':
+          description: Join request accepted
+          content:
+            application/json:
+              schema:
+                type: string
+                example: 'Doubters? Joined channels or already in: ["1","2"]'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+    delete:
+      tags: [Admin]
+      summary: Remove channels by channel id
+      operationId: removeChannels
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChannelsPayload'
+      responses:
+        '200':
+          description: Part request accepted
+          content:
+            application/json:
+              schema:
+                type: string
+                example: 'Doubters? Removed channels ["1","2"]'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+  /admin/import/raw:
+    post:
+      tags: [Import]
+      summary: Bulk-import raw IRC files from the import folder
+      operationId: importRawFiles
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkImportRawPayload'
+      responses:
+        '200':
+          description: Import summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkImportRawResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+  /channel/{channelLogin}:
+    get:
+      tags: [Logs]
+      summary: Resolve the channel login and redirect to today's channel-day route
+      operationId: getChannelDefaultPeriod
+      parameters:
+        - $ref: '#/components/parameters/channelLoginPath'
+      responses:
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channel/{channelLogin}/{year}/{month}/{day}:
+    get:
+      tags: [Logs]
+      summary: Read channel-day logs by channel login
+      operationId: getChannelDayByLogin
+      parameters:
+        - $ref: '#/components/parameters/channelLoginPath'
+        - $ref: '#/components/parameters/yearPath'
+        - $ref: '#/components/parameters/monthPath'
+        - $ref: '#/components/parameters/dayPath'
+        - $ref: '#/components/parameters/logResponseType'
+        - $ref: '#/components/parameters/jsonFlag'
+        - $ref: '#/components/parameters/rawFlag'
+        - $ref: '#/components/parameters/reverseFlag'
+        - $ref: '#/components/parameters/fromQuery'
+        - $ref: '#/components/parameters/toQuery'
+      responses:
+        '200':
+          $ref: '#/components/responses/LogRouteSuccess'
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channel/{channelLogin}/random:
+    get:
+      tags: [Logs]
+      summary: Read one random channel message by channel login
+      operationId: getRandomChannelMessageByLogin
+      parameters:
+        - $ref: '#/components/parameters/channelLoginPath'
+        - $ref: '#/components/parameters/logResponseType'
+        - $ref: '#/components/parameters/jsonFlag'
+        - $ref: '#/components/parameters/rawFlag'
+      responses:
+        '200':
+          $ref: '#/components/responses/LogRouteSuccess'
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channel/{channelLogin}/user/{userLogin}:
+    get:
+      tags: [Logs]
+      summary: Resolve logins and redirect to the latest known user-month route
+      operationId: getUserDefaultPeriodByLogins
+      parameters:
+        - $ref: '#/components/parameters/channelLoginPath'
+        - $ref: '#/components/parameters/userLoginPath'
+      responses:
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channel/{channelLogin}/user/{userLogin}/{year}/{month}:
+    get:
+      tags: [Logs]
+      summary: Read user-month logs by channel and user login
+      operationId: getUserMonthByLogins
+      parameters:
+        - $ref: '#/components/parameters/channelLoginPath'
+        - $ref: '#/components/parameters/userLoginPath'
+        - $ref: '#/components/parameters/yearPath'
+        - $ref: '#/components/parameters/monthPath'
+        - $ref: '#/components/parameters/logResponseType'
+        - $ref: '#/components/parameters/jsonFlag'
+        - $ref: '#/components/parameters/rawFlag'
+        - $ref: '#/components/parameters/reverseFlag'
+        - $ref: '#/components/parameters/fromQuery'
+        - $ref: '#/components/parameters/toQuery'
+      responses:
+        '200':
+          $ref: '#/components/responses/LogRouteSuccess'
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channel/{channelLogin}/user/{userLogin}/random:
+    get:
+      tags: [Logs]
+      summary: Read one random user message by channel and user login
+      operationId: getRandomUserMessageByLogins
+      parameters:
+        - $ref: '#/components/parameters/channelLoginPath'
+        - $ref: '#/components/parameters/userLoginPath'
+        - $ref: '#/components/parameters/logResponseType'
+        - $ref: '#/components/parameters/jsonFlag'
+        - $ref: '#/components/parameters/rawFlag'
+      responses:
+        '200':
+          $ref: '#/components/responses/LogRouteSuccess'
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channelid/{channelId}:
+    get:
+      tags: [Logs]
+      summary: Redirect to today's channel-day route by channel id
+      operationId: getChannelIdDefaultPeriod
+      parameters:
+        - $ref: '#/components/parameters/channelIdPath'
+      responses:
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channelid/{channelId}/{year}/{month}/{day}:
+    get:
+      tags: [Logs]
+      summary: Read channel-day logs by channel id
+      operationId: getChannelDayById
+      parameters:
+        - $ref: '#/components/parameters/channelIdPath'
+        - $ref: '#/components/parameters/yearPath'
+        - $ref: '#/components/parameters/monthPath'
+        - $ref: '#/components/parameters/dayPath'
+        - $ref: '#/components/parameters/logResponseType'
+        - $ref: '#/components/parameters/jsonFlag'
+        - $ref: '#/components/parameters/rawFlag'
+        - $ref: '#/components/parameters/reverseFlag'
+        - $ref: '#/components/parameters/fromQuery'
+        - $ref: '#/components/parameters/toQuery'
+      responses:
+        '200':
+          $ref: '#/components/responses/LogRouteSuccess'
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channelid/{channelId}/random:
+    get:
+      tags: [Logs]
+      summary: Read one random channel message by channel id
+      operationId: getRandomChannelMessageById
+      parameters:
+        - $ref: '#/components/parameters/channelIdPath'
+        - $ref: '#/components/parameters/logResponseType'
+        - $ref: '#/components/parameters/jsonFlag'
+        - $ref: '#/components/parameters/rawFlag'
+      responses:
+        '200':
+          $ref: '#/components/responses/LogRouteSuccess'
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channelid/{channelId}/userid/{userId}:
+    get:
+      tags: [Logs]
+      summary: Redirect to the latest known user-month route by numeric ids
+      operationId: getUserIdDefaultPeriod
+      parameters:
+        - $ref: '#/components/parameters/channelIdPath'
+        - $ref: '#/components/parameters/userIdPath'
+      responses:
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channelid/{channelId}/userid/{userId}/{year}/{month}:
+    get:
+      tags: [Logs]
+      summary: Read user-month logs by channel id and user id
+      operationId: getUserMonthByIds
+      parameters:
+        - $ref: '#/components/parameters/channelIdPath'
+        - $ref: '#/components/parameters/userIdPath'
+        - $ref: '#/components/parameters/yearPath'
+        - $ref: '#/components/parameters/monthPath'
+        - $ref: '#/components/parameters/logResponseType'
+        - $ref: '#/components/parameters/jsonFlag'
+        - $ref: '#/components/parameters/rawFlag'
+        - $ref: '#/components/parameters/reverseFlag'
+        - $ref: '#/components/parameters/fromQuery'
+        - $ref: '#/components/parameters/toQuery'
+      responses:
+        '200':
+          $ref: '#/components/responses/LogRouteSuccess'
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /channelid/{channelId}/userid/{userId}/random:
+    get:
+      tags: [Logs]
+      summary: Read one random user message by numeric ids
+      operationId: getRandomUserMessageByIds
+      parameters:
+        - $ref: '#/components/parameters/channelIdPath'
+        - $ref: '#/components/parameters/userIdPath'
+        - $ref: '#/components/parameters/logResponseType'
+        - $ref: '#/components/parameters/jsonFlag'
+        - $ref: '#/components/parameters/rawFlag'
+      responses:
+        '200':
+          $ref: '#/components/responses/LogRouteSuccess'
+        '302':
+          $ref: '#/components/responses/CanonicalRedirect'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  parameters:
+    channelQuery:
+      name: channel
+      in: query
+      description: Channel login name
+      schema:
+        type: string
+    channelIdQuery:
+      name: channelid
+      in: query
+      description: Numeric Twitch channel id
+      schema:
+        type: string
+    userQuery:
+      name: user
+      in: query
+      description: User login name
+      schema:
+        type: string
+    userIdQuery:
+      name: userid
+      in: query
+      description: Numeric Twitch user id
+      schema:
+        type: string
+    channelLoginPath:
+      name: channelLogin
+      in: path
+      required: true
+      schema:
+        type: string
+    channelIdPath:
+      name: channelId
+      in: path
+      required: true
+      schema:
+        type: string
+    userLoginPath:
+      name: userLogin
+      in: path
+      required: true
+      schema:
+        type: string
+    userIdPath:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+    yearPath:
+      name: year
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1970
+    monthPath:
+      name: month
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 12
+    dayPath:
+      name: day
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 31
+    logResponseType:
+      name: type
+      in: query
+      description: Select `json` for structured messages or `raw` for raw IRC output. Omit for plaintext rendering.
+      schema:
+        type: string
+        enum: [json, raw]
+    jsonFlag:
+      name: json
+      in: query
+      description: Any presence of this flag selects JSON output.
+      schema:
+        type: string
+    rawFlag:
+      name: raw
+      in: query
+      description: Any presence of this flag selects raw IRC output.
+      schema:
+        type: string
+    reverseFlag:
+      name: reverse
+      in: query
+      description: Any presence of this flag reverses event order.
+      schema:
+        type: string
+    fromQuery:
+      name: from
+      in: query
+      description: Unix timestamp in seconds. Enables range reads when paired with or without `to`.
+      schema:
+        type: integer
+        format: int64
+    toQuery:
+      name: to
+      in: query
+      description: Unix timestamp in seconds. Enables range reads when paired with or without `from`.
+      schema:
+        type: integer
+        format: int64
+  responses:
+    ErrorResponse:
+      description: JSON error response
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            generic:
+              value:
+                message: could not load logs
+    CanonicalRedirect:
+      description: Redirect to a lowercase or canonicalized route
+      headers:
+        Location:
+          description: Redirect destination
+          schema:
+            type: string
+    LogRouteSuccess:
+      description: |
+        Successful log response. The actual media type depends on query parameters:
+        JSON for `?json=1` or `type=json`, text/plain by default, and text/plain raw IRC for
+        `?raw=1` or `type=raw`. Text responses may be Brotli-compressed when the client sends
+        `Accept-Encoding: br`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ChatLog'
+        text/plain:
+          schema:
+            type: string
+  schemas:
+    AllChannelsJson:
+      type: object
+      required: [channels]
+      properties:
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChannelInfo'
+    ChannelInfo:
+      type: object
+      required: [userID, name]
+      properties:
+        userID:
+          type: string
+          description: Numeric Twitch channel id
+        name:
+          type: string
+          description: Channel login name
+    ChannelLogList:
+      type: object
+      required: [availableLogs]
+      properties:
+        availableLogs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChannelLogFile'
+    UserLogList:
+      type: object
+      required: [availableLogs]
+      properties:
+        availableLogs:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserLogFile'
+    ChannelLogFile:
+      type: object
+      required: [year, month, day]
+      properties:
+        year:
+          type: string
+        month:
+          type: string
+        day:
+          type: string
+    UserLogFile:
+      type: object
+      required: [year, month]
+      properties:
+        year:
+          type: string
+        month:
+          type: string
+    ChatLog:
+      type: object
+      required: [messages]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+    ChatMessage:
+      type: object
+      required:
+        - text
+        - systemText
+        - username
+        - displayName
+        - channel
+        - timestamp
+        - id
+        - type
+        - raw
+        - tags
+      properties:
+        text:
+          type: string
+        systemText:
+          type: string
+        username:
+          type: string
+        displayName:
+          type: string
+        channel:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        id:
+          type: string
+        type:
+          type: integer
+          description: Message kind. Common values are 1=privmsg, 2=clearchat, 4=usernotice.
+        raw:
+          type: string
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+    ErrorResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+    ChannelsPayload:
+      type: object
+      required: [channels]
+      properties:
+        channels:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: Numeric Twitch channel ids
+    BulkImportRawPayload:
+      type: object
+      properties:
+        channel_id:
+          type: string
+          nullable: true
+          description: Optional numeric channel id filter
+        limit_files:
+          type: integer
+          minimum: 0
+          nullable: true
+        dry_run:
+          type: boolean
+          default: false
+    BulkImportRawResponse:
+      type: object
+      required: [summary]
+      properties:
+        summary:
+          $ref: '#/components/schemas/BulkRawImportSummary'
+    BulkRawImportSummary:
+      type: object
+      required:
+        - files_scanned
+        - raw_candidates
+        - files_selected
+        - files_skipped_v1_preferred
+        - files_current
+        - files_pending
+        - files_imported
+        - files_failed
+        - files_deleted
+        - affected_channel_days
+        - affected_user_months
+        - elapsed_ms
+        - dry_run
+      properties:
+        files_scanned:
+          type: integer
+        raw_candidates:
+          type: integer
+        files_selected:
+          type: integer
+        files_skipped_v1_preferred:
+          type: integer
+        files_current:
+          type: integer
+        files_pending:
+          type: integer
+        files_imported:
+          type: integer
+        files_failed:
+          type: integer
+        files_deleted:
+          type: integer
+        affected_channel_days:
+          type: integer
+        affected_user_months:
+          type: integer
+        elapsed_ms:
+          type: integer
+          format: int64
+        dry_run:
+          type: boolean
+        channel_id:
+          type: string
+          nullable: true

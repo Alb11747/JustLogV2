@@ -52,6 +52,8 @@ Agents should normally commit:
 - When adding a new meaningful feature, update the relevant documentation in the same change when practical.
 - Treat user-visible behavior, new endpoints, config changes, and operational workflow changes as documentation-sensitive by default.
 - If a feature does not need a docs update, agents should make that a conscious decision rather than silently skipping docs.
+- `openapi.yaml` is the canonical HTTP API contract. Any HTTP route change, request or response schema change, status-code change, auth-header change, or query/path contract change must update `openapi.yaml` in the same change.
+- When changing the HTTP API, also update any docs that point people at `openapi.yaml`, `/openapi.yaml`, or `/docs` if the usage story changes.
 
 Agents should normally avoid committing:
 
