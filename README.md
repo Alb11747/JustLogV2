@@ -30,8 +30,8 @@ The app listens on port `8025` by default and expects a JSON config file. The mi
 
 ```json
 {
-  "adminAPIKey": "replace-me",
-  "channels": ["channel_login_here"]
+    "adminAPIKey": "replace-me",
+    "channels": ["channel_login_here"]
 }
 ```
 
@@ -163,8 +163,6 @@ docker compose up -d --build
 ```
 
 The container expects `/data/config.json`, so the host-side file should be `./data/config.json`. Logs and SQLite state remain under that same `data/` directory. Review `.env` before the first deployment if you want to change the host port or enable any optional env-driven features.
-
-`upload-project-to-server.cmd` now checks for both `.env` and `data/config.json` before syncing so it does not push an incomplete deployment by accident.
 
 ## Auto-published images
 
