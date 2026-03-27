@@ -103,7 +103,7 @@ pub async fn dispatch(state: AppState, request: Request) -> Response {
     match (request.method().clone(), path.as_str()) {
         (_, "/healthz") => StatusCode::OK.into_response(),
         (_, "/readyz") => StatusCode::OK.into_response(),
-        (_, "/") => root_response().into_response(),
+        (_, "/") => docs_redirect_response(),
         (_, "/openapi.yaml") => openapi_response(),
         (_, "/docs") => docs_response(),
         (_, "/channels") => match channels_handler(state).await {
@@ -1022,6 +1022,15 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 
 fn root_response() -> &'static str {
     "justlog v2\n\nRoutes: /channels /list /channel/... /channelid/... /optout /admin/channels /admin/import/raw /openapi.yaml /docs\n"
+}
+
+fn docs_redirect_response() -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::FOUND;
+    response
+        .headers_mut()
+        .insert(LOCATION, HeaderValue::from_static("/docs"));
+    response
 }
 
 fn openapi_response() -> Response {

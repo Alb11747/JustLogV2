@@ -31,11 +31,22 @@ fn write_gzip(path: &std::path::Path, content: &str) {
 async fn basic_routes_are_healthy() {
     let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
 
-    assert_status_ok(&harness, "/").await;
     assert_status_ok(&harness, "/healthz").await;
     assert_status_ok(&harness, "/readyz").await;
     assert_status_ok(&harness, "/openapi.yaml").await;
     assert_status_ok(&harness, "/docs").await;
+}
+
+#[tokio::test]
+async fn root_redirects_to_docs() {
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+
+    let response = harness
+        .request(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::FOUND);
+    assert_eq!(response.headers().get("location").unwrap(), "/docs");
 }
 
 #[tokio::test]
