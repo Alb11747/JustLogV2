@@ -1,13 +1,33 @@
 mod common;
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use justlog::model::CanonicalEvent;
+use justlog::recent_messages::RecentMessagesRuntime;
 use tokio::time::{Duration, sleep};
 
-use common::{TestHarness, privmsg};
+use common::{MockJustLogServer, TestHarness, privmsg};
+
+fn recent_messages_runtime(base_url: &str) -> RecentMessagesRuntime {
+    let mut vars = HashMap::new();
+    vars.insert("JUSTLOG_RECENT_MESSAGES_ENABLED".to_string(), "1".to_string());
+    vars.insert("JUSTLOG_RECENT_MESSAGES_URL".to_string(), base_url.to_string());
+    RecentMessagesRuntime::from_summary(RecentMessagesRuntime::summary_from_map(&vars))
+}
+
+async fn wait_for_event_count(harness: &TestHarness, expected: i64) {
+    for _ in 0..40 {
+        if harness.state.store.event_count().unwrap() == expected {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(harness.state.store.event_count().unwrap(), expected);
+}
 
 #[tokio::test]
 async fn mirrored_ingest_deduplicates_and_recovers_from_reconnect() {
@@ -63,6 +83,226 @@ async fn mirrored_ingest_deduplicates_and_recovers_from_reconnect() {
     sleep(Duration::from_millis(500)).await;
 
     assert_eq!(harness.state.store.event_count().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn reconnect_backfill_loads_missed_messages_from_robotty() {
+    let remote = MockJustLogServer::start().await;
+    remote
+        .set_json(
+            "/api/v2/recent-messages/channelone?limit=800",
+            serde_json::json!({ "messages": [], "error": null, "error_code": null }),
+        )
+        .await;
+    let harness = TestHarness::start_with_recent_messages_runtime(
+        vec!["1".to_string()],
+        true,
+        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+    )
+    .await;
+    harness.irc.wait_for_connections(2).await;
+
+    remote
+        .set_json(
+            "/api/v2/recent-messages/channelone?limit=800",
+            serde_json::json!({
+                "messages": [privmsg(
+                    "robotty-1",
+                    "1",
+                    "200",
+                    "viewer",
+                    "viewer",
+                    "channelone",
+                    1_704_067_250_000,
+                    "missed from robotty"
+                )],
+                "error": null,
+                "error_code": null
+            }),
+        )
+        .await;
+
+    harness.irc.reconnect_first().await;
+    harness.irc.wait_for_connections(3).await;
+    wait_for_event_count(&harness, 1).await;
+}
+
+#[tokio::test]
+async fn runtime_join_triggers_recent_message_backfill() {
+    let remote = MockJustLogServer::start().await;
+    remote
+        .set_json(
+            "/api/v2/recent-messages/channelone?limit=800",
+            serde_json::json!({ "messages": [], "error": null, "error_code": null }),
+        )
+        .await;
+    remote
+        .set_json(
+            "/api/v2/recent-messages/channeltwo?limit=800",
+            serde_json::json!({
+                "messages": [privmsg(
+                    "robotty-join",
+                    "2",
+                    "200",
+                    "viewer",
+                    "viewer",
+                    "channeltwo",
+                    1_704_067_260_000,
+                    "joined backfill"
+                )],
+                "error": null,
+                "error_code": null
+            }),
+        )
+        .await;
+    let harness = TestHarness::start_with_recent_messages_runtime(
+        vec!["1".to_string()],
+        true,
+        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+    )
+    .await;
+    harness.irc.wait_for_connections(2).await;
+
+    harness
+        .state
+        .ingest
+        .read()
+        .await
+        .clone()
+        .unwrap()
+        .join_channels(&["channeltwo".to_string()])
+        .await;
+
+    wait_for_event_count(&harness, 1).await;
+}
+
+#[tokio::test]
+async fn robotty_backfill_does_not_duplicate_existing_events() {
+    let remote = MockJustLogServer::start().await;
+    let duplicate_raw = privmsg(
+        "robotty-dup",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_067_270_000,
+        "duplicate message",
+    );
+    remote
+        .set_json(
+            "/api/v2/recent-messages/channelone?limit=800",
+            serde_json::json!({ "messages": [], "error": null, "error_code": null }),
+        )
+        .await;
+    let harness = TestHarness::start_with_recent_messages_runtime(
+        vec!["1".to_string()],
+        true,
+        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+    )
+    .await;
+    harness.irc.wait_for_connections(2).await;
+
+    let event = CanonicalEvent::from_raw(&duplicate_raw).unwrap().unwrap();
+    harness.seed_channel_event(&event);
+    remote
+        .set_json(
+            "/api/v2/recent-messages/channelone?limit=800",
+            serde_json::json!({ "messages": [duplicate_raw], "error": null, "error_code": null }),
+        )
+        .await;
+
+    harness.irc.reconnect_first().await;
+    harness.irc.wait_for_connections(3).await;
+    wait_for_event_count(&harness, 1).await;
+}
+
+#[tokio::test]
+async fn robotty_api_errors_do_not_break_live_ingest() {
+    let remote = MockJustLogServer::start().await;
+    remote
+        .set_json(
+            "/api/v2/recent-messages/channelone?limit=800",
+            serde_json::json!({
+                "messages": [],
+                "error": "The bot is currently not joined to this channel",
+                "error_code": "channel_not_joined"
+            }),
+        )
+        .await;
+    let harness = TestHarness::start_with_recent_messages_runtime(
+        vec!["1".to_string()],
+        true,
+        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+    )
+    .await;
+    harness.irc.wait_for_connections(2).await;
+
+    harness
+        .irc
+        .broadcast_line(&privmsg(
+            "live-after-error",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_067_280_000,
+            "live still works",
+        ))
+        .await;
+    wait_for_event_count(&harness, 1).await;
+}
+
+#[tokio::test]
+async fn malformed_robotty_payload_lines_are_ignored_without_crashing_ingest() {
+    let remote = MockJustLogServer::start().await;
+    remote
+        .set_json(
+            "/api/v2/recent-messages/channelone?limit=800",
+            serde_json::json!({
+                "messages": [
+                    "not raw irc",
+                    ":tmi.twitch.tv NOTICE * :maintenance",
+                    privmsg(
+                        "robotty-good",
+                        "1",
+                        "200",
+                        "viewer",
+                        "viewer",
+                        "channelone",
+                        1_704_067_290_000,
+                        "good one"
+                    )
+                ],
+                "error": null,
+                "error_code": null
+            }),
+        )
+        .await;
+    let harness = TestHarness::start_with_recent_messages_runtime(
+        vec!["1".to_string()],
+        true,
+        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+    )
+    .await;
+    harness.irc.wait_for_connections(2).await;
+    wait_for_event_count(&harness, 1).await;
+
+    harness
+        .irc
+        .broadcast_line(&privmsg(
+            "live-after-malformed",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_067_291_000,
+            "still alive",
+        ))
+        .await;
+    wait_for_event_count(&harness, 2).await;
 }
 
 #[tokio::test]

@@ -1049,6 +1049,7 @@ mod tests {
     use crate::ingest::{ChatCommandService, IngestManager};
     use crate::legacy_txt::LegacyTxtRuntime;
     use crate::model::CanonicalEvent;
+    use crate::recent_messages::RecentMessagesRuntime;
     use crate::store::Store;
     use anyhow::Result;
     use axum::body::Body;
@@ -1126,6 +1127,7 @@ mod tests {
             state.config.clone(),
             state.store.clone(),
             Arc::new(NoopCommands),
+            Arc::new(RecentMessagesRuntime::disabled()),
         );
         *state.ingest.write().await = Some(ingest.clone());
         ingest.start(Vec::new()).await;

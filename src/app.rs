@@ -24,6 +24,7 @@ use crate::import::import_legacy_logs;
 use crate::ingest::{ChatCommandService, IngestManager};
 use crate::legacy_txt::LegacyTxtRuntime;
 use crate::model::CanonicalEvent;
+use crate::recent_messages::RecentMessagesRuntime;
 use crate::store::Store;
 
 #[derive(Parser)]
@@ -58,6 +59,7 @@ pub async fn run_cli() -> Result<()> {
     init_tracing(&config.log_level);
     let debug_runtime = Arc::new(DebugRuntime::from_env(&config.logs_directory)?);
     let legacy_txt = Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory));
+    let recent_messages = Arc::new(RecentMessagesRuntime::from_env());
 
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let store = Store::open(&config)?;
@@ -87,7 +89,12 @@ pub async fn run_cli() -> Result<()> {
         info!("oauth not configured; starting ingest in anonymous justinfan mode");
     }
     let command_service = Arc::new(CommandService::new(state.clone()));
-    let ingest = IngestManager::new(shared_config.clone(), store.clone(), command_service);
+    let ingest = IngestManager::new(
+        shared_config.clone(),
+        store.clone(),
+        command_service,
+        recent_messages,
+    );
     *ingest_slot.write().await = Some(ingest.clone());
 
     let initial_channels = resolve_channel_logins(&helix, &config.channels).await?;

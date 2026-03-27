@@ -8,6 +8,7 @@ pub mod import;
 pub mod ingest;
 pub mod legacy_txt;
 pub mod model;
+pub mod recent_messages;
 pub mod store;
 
 pub use app::run_cli;

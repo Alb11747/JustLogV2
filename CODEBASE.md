@@ -36,6 +36,7 @@ At runtime:
 
 - `HelixClient` resolves Twitch user IDs and logins through the Twitch Helix API.
 - `IngestManager` maintains one or more IRC connections and turns raw IRC lines into canonical events.
+- `RecentMessagesRuntime` optionally backfills short-gap missed chat from Robotty's recent-messages API.
 - `Store` persists recent events in SQLite and archives older partitions into Brotli segment files.
 - `api` reads from the store and returns logs as JSON, plain text, or raw IRC text.
 - `CommandService` listens for `!justlog ...` chat commands and updates config or channel membership.
@@ -66,6 +67,7 @@ At runtime:
 - `src/config.rs`: JSON config schema, defaults, normalization, and persistence.
 - `src/helix.rs`: Twitch Helix client for access tokens and user lookups with in-memory caching.
 - `src/ingest.rs`: Twitch IRC connection management, message parsing, deduplication, and outbound join/part/say handling.
+- `src/recent_messages.rs`: env-only runtime for optional Robotty recent-message backfill.
 - `src/store.rs`: SQLite schema, inserts, queries, compaction, and segment file I/O.
 - `src/model.rs`: canonical event model, API response structs, and raw IRC parsing helpers.
 - `src/compact.rs`: background loop that periodically archives old partitions.
@@ -166,6 +168,12 @@ Supported flags:
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=0|1`
 - `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS=<n>`
 
+Recent-message backfill is also env-only:
+
+- `JUSTLOG_RECENT_MESSAGES_ENABLED=0|1`
+- `JUSTLOG_RECENT_MESSAGES_URL=<base-url>`
+- `JUSTLOG_RECENT_MESSAGES_LIMIT=<n>`
+
 Behavior summary:
 
 - Raw IRC `.txt` and `.txt.gz` files found under the import folder are imported into native storage.
@@ -189,6 +197,7 @@ Behavior summary:
 - Each lane connects to the configured IRC endpoint.
 - On connect, it sends `PASS`, `NICK`, and Twitch capability requests.
 - It joins every desired channel currently tracked in memory.
+- If recent-message backfill is enabled, it also triggers a best-effort Robotty fetch for connected channels and newly joined channels.
 
 ### Message Handling
 
@@ -201,6 +210,8 @@ For each incoming IRC line:
 - `PRIVMSG` events are passed to the chat command service
 - opted-out channels/users are skipped
 - remaining events are inserted into the store
+
+Robotty backfill uses the same canonical parsing and insert path, but skips chat-command execution so replayed history does not re-run `!justlog` side effects.
 
 ### Outbound Commands
 

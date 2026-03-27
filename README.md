@@ -41,6 +41,24 @@ IRC auth is anonymous by default. If `oauth` is omitted or empty, JustLog connec
 
 For the Docker and upload workflow in this repo, keep the runtime file at `./data/config.json` instead.
 
+## Recent Message Backfill
+
+JustLogV2 can optionally fetch short-gap missed chat from Robotty's recent-messages API and store it through the normal ingest pipeline. This path is env-driven, off by default, and best-effort only.
+
+Supported env flags:
+
+- `JUSTLOG_RECENT_MESSAGES_ENABLED=0|1`: enable or disable Robotty backfill. Default is `0`.
+- `JUSTLOG_RECENT_MESSAGES_URL=<base-url>`: recent-messages base URL. Default is `https://recent-messages.robotty.de/api/v2/recent-messages`.
+- `JUSTLOG_RECENT_MESSAGES_LIMIT=<n>`: number of recent messages to request per fetch. Default is `800`.
+
+Behavior summary:
+
+- Fetches run after successful IRC connects and reconnects for the currently desired channels.
+- Fetches also run after runtime channel joins for newly joined logins.
+- Remote API errors, malformed payloads, and unsupported IRC lines are logged and skipped.
+- Backfill never tears down live ingest if the remote API fails.
+- Fetched messages are replayed into storage only and do not re-run chat commands such as `!justlog ...`.
+
 ## Import Folder Compatibility
 
 JustLogV2 supports an optional recursive import folder for channel-day reads, `/list`, and a dedicated admin-triggered bulk raw import path. This is a compatibility feature layered around API reads and migration workflows; it is not part of live ingest.

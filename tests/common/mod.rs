@@ -19,6 +19,7 @@ use justlog::helix::{HelixClient, UserData};
 use justlog::ingest::IngestManager;
 use justlog::legacy_txt::LegacyTxtRuntime;
 use justlog::model::CanonicalEvent;
+use justlog::recent_messages::RecentMessagesRuntime;
 use justlog::store::Store;
 use serde_json::json;
 use tempfile::TempDir;
@@ -317,7 +318,13 @@ pub struct TestHarness {
 
 impl TestHarness {
     pub async fn start(channel_ids: Vec<String>) -> Self {
-        Self::start_with_options(channel_ids, true, Arc::new(DebugRuntime::disabled())).await
+        Self::start_with_options(
+            channel_ids,
+            true,
+            Arc::new(DebugRuntime::disabled()),
+            Arc::new(RecentMessagesRuntime::disabled()),
+        )
+        .await
     }
 
     pub async fn start_anonymous(channel_ids: Vec<String>) -> Self {
@@ -325,13 +332,20 @@ impl TestHarness {
             channel_ids,
             true,
             Arc::new(DebugRuntime::disabled()),
+            Arc::new(RecentMessagesRuntime::disabled()),
             "",
         )
         .await
     }
 
     pub async fn start_without_ingest(channel_ids: Vec<String>) -> Self {
-        Self::start_with_options(channel_ids, false, Arc::new(DebugRuntime::disabled())).await
+        Self::start_with_options(
+            channel_ids,
+            false,
+            Arc::new(DebugRuntime::disabled()),
+            Arc::new(RecentMessagesRuntime::disabled()),
+        )
+        .await
     }
 
     pub async fn start_with_debug_runtime(
@@ -339,18 +353,40 @@ impl TestHarness {
         start_ingest: bool,
         debug_runtime: Arc<DebugRuntime>,
     ) -> Self {
-        Self::start_with_options(channel_ids, start_ingest, debug_runtime).await
+        Self::start_with_options(
+            channel_ids,
+            start_ingest,
+            debug_runtime,
+            Arc::new(RecentMessagesRuntime::disabled()),
+        )
+        .await
+    }
+
+    pub async fn start_with_recent_messages_runtime(
+        channel_ids: Vec<String>,
+        start_ingest: bool,
+        recent_messages_runtime: Arc<RecentMessagesRuntime>,
+    ) -> Self {
+        Self::start_with_options(
+            channel_ids,
+            start_ingest,
+            Arc::new(DebugRuntime::disabled()),
+            recent_messages_runtime,
+        )
+        .await
     }
 
     async fn start_with_options(
         channel_ids: Vec<String>,
         start_ingest: bool,
         debug_runtime: Arc<DebugRuntime>,
+        recent_messages_runtime: Arc<RecentMessagesRuntime>,
     ) -> Self {
         Self::start_with_options_and_oauth(
             channel_ids,
             start_ingest,
             debug_runtime,
+            recent_messages_runtime,
             "oauth:777777777",
         )
         .await
@@ -360,6 +396,7 @@ impl TestHarness {
         channel_ids: Vec<String>,
         start_ingest: bool,
         debug_runtime: Arc<DebugRuntime>,
+        recent_messages_runtime: Arc<RecentMessagesRuntime>,
         oauth: &str,
     ) -> Self {
         let users = vec![
@@ -411,7 +448,12 @@ impl TestHarness {
         };
         if start_ingest {
             let command_service = Arc::new(CommandService::new(state.clone()));
-            let ingest = IngestManager::new(shared_config.clone(), store.clone(), command_service);
+            let ingest = IngestManager::new(
+                shared_config.clone(),
+                store.clone(),
+                command_service,
+                recent_messages_runtime,
+            );
             *ingest_slot.write().await = Some(ingest.clone());
             let initial_logins = resolve_channel_logins(&helix, &config.channels)
                 .await
