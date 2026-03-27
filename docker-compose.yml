@@ -1,5 +1,5 @@
 services:
-  justlog-v2:
+  justlog:
     container_name: justlog-v2
     image: justlog-v2:local
     build:
