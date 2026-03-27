@@ -123,7 +123,7 @@ The config file is JSON-based and modeled in `src/config.rs`.
 - `channels`: Twitch channel IDs to ingest on startup.
 - `logsDirectory`: root directory for archived logs and the SQLite file.
 - `listenAddress`: HTTP bind address; `:8026` becomes `0.0.0.0:8026`.
-- `adminAPIKey`: required for `/admin/channels`.
+- `adminAPIKey`: required for `/admin/channels` and `/admin/import/raw`.
 - `admins`: usernames allowed to use privileged `!justlog` chat commands.
 - `optOut`: map of opted-out user IDs.
 - `archive`: enables or disables background compaction.
@@ -386,7 +386,7 @@ Current non-scope:
 - range reads
 - archive generation
 
-The module searches recursively under `JUSTLOG_IMPORT_FOLDER` for files whose trailing path matches:
+The module searches recursively under `JUSTLOG_IMPORT_FOLDER` for supported files anywhere in the tree. Legacy path suffixes such as:
 
 ```text
 .../<channel_id>/<year>/<month>/<day>.txt
@@ -404,6 +404,8 @@ Supported import families:
 
 If multiple matching files exist, imported and reconstructed messages are stable-sorted by timestamp. Parse failures are ignored and do not fail requests.
 
+For large migrations, `POST /admin/import/raw` is the preferred path. It reuses the same raw-file classification, imports raw IRC files in bulk, merges affected channel-day archives immediately, refreshes related user-month archives, and returns a summary JSON payload.
+
 For large import folders, raw IRC imports are streamed line-by-line instead of buffering full files in memory. The module logs start, periodic progress, and completion summaries through tracing, writes an `importing` status before each raw-file import begins, and only treats a file as current when its fingerprint matches a terminal status (`imported` or `seen`). If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request. When the delete flags are enabled, consumed files are removed after successful raw import, already-current raw files can also be removed during preflight, and reconstructed files are removed after successful overlay parsing, then empty parent directories are pruned.
 
 Whenever the import folder is checked, the module also prunes empty directories below that root and removes empty parent layers upward when possible.
@@ -418,6 +420,7 @@ Debugging note:
 - `POST /optout`: create a short-lived confirmation code for chat-based self opt-out
 - `POST /admin/channels`: add channel IDs, requires `X-Api-Key`
 - `DELETE /admin/channels`: remove channel IDs, requires `X-Api-Key`
+- `POST /admin/import/raw`: bulk raw import under `JUSTLOG_IMPORT_FOLDER`, requires `X-Api-Key`
 
 ### Metrics
 

@@ -331,6 +331,110 @@ async fn import_folder_raw_import_merges_into_existing_archived_day() {
 }
 
 #[tokio::test]
+async fn admin_bulk_import_raw_dry_run_reports_v1_candidates() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("v1/1/2024/1/2/channel.txt.gz");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    write_gzip(
+        &import_file,
+        &privmsg(
+            "bulk-dry-run-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "bulk dry run",
+        ),
+    );
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let response = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1","dry_run":true}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["summary"]["dry_run"], true);
+    assert_eq!(json["summary"]["files_selected"], 1);
+    assert_eq!(json["summary"]["files_pending"], 1);
+    assert_eq!(harness.state.store.event_count().unwrap(), 0);
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+    }
+}
+
+#[tokio::test]
+async fn admin_bulk_import_raw_imports_v1_channel_tree() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("v1/1/2024/1/2/channel.txt.gz");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    write_gzip(
+        &import_file,
+        &privmsg(
+            "bulk-import-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "bulk imported route",
+        ),
+    );
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let response = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["summary"]["files_imported"], 1);
+    assert_eq!(json["summary"]["affected_channel_days"], 1);
+
+    let archived = harness
+        .state
+        .store
+        .read_archived_channel_segment_strict("1", 2024, 1, 2)
+        .unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].text, "bulk imported route");
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+    }
+}
+
+#[tokio::test]
 async fn import_folder_can_delete_raw_files_after_successful_import() {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();

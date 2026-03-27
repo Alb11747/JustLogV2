@@ -43,7 +43,7 @@ For the Docker and upload workflow in this repo, keep the runtime file at `./dat
 
 ## Import Folder Compatibility
 
-JustLogV2 supports an optional recursive import folder for channel-day reads and `/list`. This is a compatibility feature layered around API reads; it is not part of ingest, archive generation, or compaction.
+JustLogV2 supports an optional recursive import folder for channel-day reads, `/list`, and a dedicated admin-triggered bulk raw import path. This is a compatibility feature layered around API reads and migration workflows; it is not part of live ingest.
 
 Supported env flags:
 
@@ -63,6 +63,7 @@ Behavior summary:
 - Simple sparse TXT files like `[0:04:26] user: msg` stay separate and are controlled by `JUSTLOG_LEGACY_TXT_MODE`.
 - JSON `.json` and `.json.gz` chat exports stay separate and are merged at read time.
 - `off` only disables reconstructed overlays. It does not disable raw IRC imports.
+- Large raw migrations should use `POST /admin/import/raw` instead of relying on a normal log request to do the work.
 
 The current scope is channel-day reads and `/list`. User-month, random, and range reads still use native data only.
 
@@ -90,6 +91,14 @@ The easiest workflow is:
 4. Copy files anywhere under `./data/import-folder`.
 5. Restart the service with `docker compose up -d --build` or `docker compose restart`.
 
+For large v1 migrations, prefer:
+
+```text
+POST /admin/import/raw
+```
+
+with the `X-Api-Key` header instead of waiting for a normal `/channelid/...` request to import everything.
+
 Example host paths:
 
 ```text
@@ -99,6 +108,13 @@ Example host paths:
 ```
 
 The service recurses under the import folder, so only the trailing `.../<channel_id>/<year>/<month>/<day>.*` suffix matters.
+
+It also supports v1-style raw layouts such as:
+
+```text
+./data/import-folder/v1/<channel_id>/<year>/<month>/<day>/channel.txt.gz
+./data/import-folder/v1/<channel_id>/<year>/<month>/<user_id>.txt.gz
+```
 
 ### Supported file families
 
@@ -141,6 +157,7 @@ Large import folders are handled incrementally:
 - If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1`, raw files that are already current in native storage are also deleted during the preflight scan. This flag defaults to `1`.
 - If `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`, successfully parsed reconstructed TXT / JSON files are deleted after the request that consumed them.
 - If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1`, reconstructed TXT / JSON files that were already consumed successfully and are still unchanged are deleted during later discovery before reparsing.
+- `POST /admin/import/raw` can bulk-import raw IRC files under `JUSTLOG_IMPORT_FOLDER`, optionally filtered by `channel_id`, limited by file count, or run as `dry_run`.
 
 ### Import stall troubleshooting
 
@@ -153,6 +170,7 @@ Useful signals:
 - `Checking raw import status for ...` without a matching `Completed raw import status check for ...` points at store lock contention before the actual file import starts.
 - `Starting raw import scan for ...` means preflight completed and the request is inside the file import loop.
 - `Completed raw import ...` plus `Deleted consumed import file ...` confirms the import and delete-after-success path both finished.
+- `Parsed log request ...`, `Completed opt-out checks ...`, `Completed trusted fallback check ...`, and `Entering dated_response ...` show whether a request is stalling before the importer starts.
 
 One real failure pattern in this repo was a self-deadlock in the background compactor. The compactor held the `Store` SQLite mutex while asking the store another question that also tried to lock the same mutex. That blocked request-time calls such as `imported_raw_file_is_current(...)`, which made log routes appear to hang in the import layer even though the real owner was background compaction.
 
@@ -231,6 +249,8 @@ Stop it again:
 ```powershell
 docker compose down
 ```
+
+`docker stop` and `docker compose down` now trigger graceful shutdown handling so the HTTP listener stops accepting new work and ingest/background loops exit instead of immediately trying to reconnect.
 
 The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}` and forwards it to the app's in-container listener on `8026`, mounts `./data` to `/data`, mounts `${JUSTLOG_IMPORT_HOST_DIR:-./data/import-folder}` to `/import-folder`, keeps logs and SQLite state under the `/data` mount, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
 

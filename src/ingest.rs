@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use moka::sync::Cache;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, watch};
 use tokio::time::sleep;
 use tokio_native_tls::{TlsConnector, native_tls};
 use tracing::{error, info, warn};
@@ -35,6 +35,7 @@ pub struct IngestManager {
     store: Store,
     commands: Arc<dyn ChatCommandService>,
     outbound: broadcast::Sender<OutboundCommand>,
+    shutdown: watch::Sender<bool>,
     desired_channels: Arc<RwLock<HashSet<String>>>,
     rr_counter: Arc<AtomicUsize>,
     dedupe: Cache<String, ()>,
@@ -61,11 +62,13 @@ impl IngestManager {
         commands: Arc<dyn ChatCommandService>,
     ) -> Self {
         let (outbound, _) = broadcast::channel(1024);
+        let (shutdown, _) = watch::channel(false);
         Self {
             config,
             store,
             commands,
             outbound,
+            shutdown,
             desired_channels: Arc::new(RwLock::new(HashSet::new())),
             rr_counter: Arc::new(AtomicUsize::new(0)),
             dedupe: Cache::builder()
@@ -90,6 +93,10 @@ impl IngestManager {
                 lane.run_lane(lane_index).await;
             });
         }
+    }
+
+    pub fn stop(&self) {
+        let _ = self.shutdown.send(true);
     }
 
     pub async fn join_channels(&self, channels: &[String]) {
@@ -119,16 +126,28 @@ impl IngestManager {
     }
 
     async fn run_lane(&self, lane_index: usize) {
+        let mut shutdown = self.shutdown.subscribe();
         loop {
             match self.connect_once(lane_index).await {
                 Ok(()) => warn!("ingest lane {lane_index} disconnected cleanly"),
                 Err(error) => warn!("ingest lane {lane_index} disconnected: {error}"),
             }
-            sleep(Duration::from_millis(750)).await;
+            if *shutdown.borrow() {
+                info!("ingest lane {lane_index} stopping");
+                return;
+            }
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    info!("ingest lane {lane_index} stopping");
+                    return;
+                }
+                _ = sleep(Duration::from_millis(750)) => {}
+            }
         }
     }
 
     async fn connect_once(&self, lane_index: usize) -> Result<()> {
+        let mut shutdown = self.shutdown.subscribe();
         let config = self.config.read().await.clone();
         let stream = connect_stream(&config).await?;
         let (reader_half, mut writer_half) = tokio::io::split(stream);
@@ -159,6 +178,9 @@ impl IngestManager {
 
         loop {
             tokio::select! {
+                _ = shutdown.changed() => {
+                    return Ok(());
+                }
                 maybe_line = reader.next_line() => {
                     let line = maybe_line?;
                     let Some(line) = line else {

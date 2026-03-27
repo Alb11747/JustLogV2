@@ -66,6 +66,26 @@ async fn mirrored_ingest_deduplicates_and_recovers_from_reconnect() {
 }
 
 #[tokio::test]
+async fn ingest_stop_prevents_reconnect_after_disconnect() {
+    let harness = TestHarness::start(vec!["1".to_string()]).await;
+    harness.irc.wait_for_connections(2).await;
+
+    harness.irc.reconnect_first().await;
+    sleep(Duration::from_millis(100)).await;
+    harness
+        .state
+        .ingest
+        .read()
+        .await
+        .clone()
+        .expect("ingest should be running")
+        .stop();
+
+    sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(harness.irc.connection_count().await, 2);
+}
+
+#[tokio::test]
 async fn anonymous_ingest_uses_placeholder_pass_and_generated_justinfan_nick() {
     let harness = TestHarness::start_anonymous(vec!["1".to_string()]).await;
     harness.irc.wait_for_connections(2).await;

@@ -273,6 +273,10 @@ impl MockIrc {
     pub async fn client_lines(&self) -> Vec<String> {
         self.client_lines.lock().await.clone()
     }
+
+    pub async fn connection_count(&self) -> usize {
+        self.connections.lock().await.len()
+    }
 }
 
 async fn handle_irc_connection(

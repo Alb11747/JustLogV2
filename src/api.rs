@@ -14,6 +14,7 @@ use axum::routing::any;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use regex::Regex;
 use serde::Deserialize;
+use serde::Serialize;
 use tokio::fs::File;
 use tokio::task;
 use tokio::time::sleep;
@@ -21,7 +22,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::app::AppState;
-use crate::legacy_txt::{LegacyTxtMode, merge_messages};
+use crate::legacy_txt::{BulkRawImportSummary, LegacyTxtMode, merge_messages};
 use crate::model::{
     AllChannelsJson, ChannelInfo, ChannelLogList, ChatLog, ChatMessage, ErrorResponse, UserLogList,
 };
@@ -55,6 +56,21 @@ struct LogRequest {
 #[derive(Deserialize)]
 struct ChannelsPayload {
     channels: Vec<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct BulkImportRawPayload {
+    #[serde(default)]
+    channel_id: Option<String>,
+    #[serde(default)]
+    limit_files: Option<usize>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+struct BulkImportRawResponse {
+    summary: BulkRawImportSummary,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -110,6 +126,11 @@ pub async fn dispatch(state: AppState, request: Request) -> Response {
                 Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
             }
         }
+        (Method::POST, "/admin/import/raw") => match admin_import_raw_handler(state, request).await
+        {
+            Ok(response) => response,
+            Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+        },
         _ => match log_handler(state, request).await {
             Ok(response) => response,
             Err(error) => {
@@ -302,6 +323,43 @@ async fn admin_channels_handler(state: AppState, request: Request, join: bool) -
     Ok(Json(text).into_response())
 }
 
+async fn admin_import_raw_handler(state: AppState, request: Request) -> Result<Response> {
+    let api_key = request
+        .headers()
+        .get("X-Api-Key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let expected = state.config.read().await.admin_api_key.clone();
+    if api_key.is_empty() || api_key != expected {
+        return Ok(error_response(
+            StatusCode::FORBIDDEN,
+            "No I don't think so.",
+        ));
+    }
+
+    let body = axum::body::to_bytes(request.into_body(), usize::MAX).await?;
+    let payload = if body.is_empty() {
+        BulkImportRawPayload::default()
+    } else {
+        serde_json::from_slice::<BulkImportRawPayload>(&body)?
+    };
+    info!(
+        "Admin bulk raw import requested: channel_filter={:?}, limit_files={:?}, dry_run={}",
+        payload.channel_id, payload.limit_files, payload.dry_run
+    );
+    let legacy_txt = state.legacy_txt.clone();
+    let store = state.store.clone();
+    let channel_id = payload.channel_id.clone();
+    let limit_files = payload.limit_files;
+    let dry_run = payload.dry_run;
+    let summary = run_blocking(move || {
+        legacy_txt.bulk_import_raw(&store, channel_id.as_deref(), limit_files, dry_run)
+    })
+    .await?;
+    Ok(Json(BulkImportRawResponse { summary }).into_response())
+}
+
 async fn log_handler(state: AppState, request: Request) -> Result<Response> {
     let accept_encoding = request
         .headers()
@@ -315,7 +373,19 @@ async fn log_handler(state: AppState, request: Request) -> Result<Response> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    let parse_started = Instant::now();
     let log_request = parse_log_request(&state, request.uri(), &content_type).await?;
+    info!(
+        "Parsed log request in {:?}: channel_id={}, user_id={:?}, year={:?}, month={:?}, day={:?}, random={}, response_type={:?}",
+        parse_started.elapsed(),
+        log_request.channel_id,
+        log_request.user_id,
+        log_request.time.year,
+        log_request.time.month,
+        log_request.time.day,
+        log_request.time.random,
+        log_request.response_type
+    );
     if let Some(redirect_path) = log_request.redirect_path {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::FOUND;
@@ -326,6 +396,7 @@ async fn log_handler(state: AppState, request: Request) -> Result<Response> {
     }
 
     {
+        let opt_out_started = Instant::now();
         let config = state.config.read().await;
         if config.is_opted_out(&log_request.channel_id)
             || log_request
@@ -338,9 +409,19 @@ async fn log_handler(state: AppState, request: Request) -> Result<Response> {
                 "User or channel has opted out",
             ));
         }
+        info!(
+            "Completed opt-out checks in {:?}",
+            opt_out_started.elapsed()
+        );
     }
 
-    if should_force_trusted_fallback(&state, &log_request).await? {
+    let fallback_check_started = Instant::now();
+    let should_fallback = should_force_trusted_fallback(&state, &log_request).await?;
+    info!(
+        "Completed trusted fallback check in {:?}: should_fallback={should_fallback}",
+        fallback_check_started.elapsed()
+    );
+    if should_fallback {
         return fallback_response(&state, request.uri(), &accept_encoding, &content_type).await;
     }
 
@@ -418,6 +499,15 @@ async fn dated_response(
     request: LogRequest,
     accept_encoding: &str,
 ) -> Result<Response> {
+    info!(
+        "Entering dated_response: channel_id={}, user_id={:?}, year={:?}, month={:?}, day={:?}, response_type={:?}",
+        request.channel_id,
+        request.user_id,
+        request.time.year,
+        request.time.month,
+        request.time.day,
+        request.response_type
+    );
     let year = request.time.year.ok_or_else(|| anyhow!("invalid year"))?;
     let month = request.time.month.ok_or_else(|| anyhow!("invalid month"))?;
     let mut events = if let Some(user_id) = request.user_id.as_deref() {
@@ -443,6 +533,9 @@ async fn dated_response(
         let legacy_txt = state.legacy_txt.clone();
         let store = state.store.clone();
         let channel_id = request.channel_id.clone();
+        info!(
+            "Starting request-driven raw import for channel-day {channel_id}/{year}/{month}/{day}"
+        );
         let import_outcome = run_blocking(move || {
             legacy_txt.import_raw_channel_day(&store, &channel_id, year, month, day)
         })
@@ -924,7 +1017,7 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 }
 
 fn root_response() -> &'static str {
-    "justlog v2\n\nRoutes: /channels /list /channel/... /channelid/... /optout /admin/channels\n"
+    "justlog v2\n\nRoutes: /channels /list /channel/... /channelid/... /optout /admin/channels /admin/import/raw\n"
 }
 
 fn random_string(len: usize) -> String {

@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use flate2::read::GzDecoder;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
@@ -61,6 +61,23 @@ pub struct ChannelDayImport {
 pub struct RawImportOutcome {
     pub affected_channel_days: BTreeSet<ChannelDayKey>,
     pub affected_user_months: BTreeSet<UserMonthKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct BulkRawImportSummary {
+    pub files_scanned: usize,
+    pub raw_candidates: usize,
+    pub files_selected: usize,
+    pub files_current: usize,
+    pub files_pending: usize,
+    pub files_imported: usize,
+    pub files_failed: usize,
+    pub files_deleted: usize,
+    pub affected_channel_days: usize,
+    pub affected_user_months: usize,
+    pub elapsed_ms: u128,
+    pub dry_run: bool,
+    pub channel_id: Option<String>,
 }
 
 impl RawImportOutcome {
@@ -331,6 +348,127 @@ impl LegacyTxtRuntime {
         Ok(logs)
     }
 
+    pub fn bulk_import_raw(
+        &self,
+        store: &Store,
+        channel_id: Option<&str>,
+        limit_files: Option<usize>,
+        dry_run: bool,
+    ) -> Result<BulkRawImportSummary> {
+        let started = Instant::now();
+        let files = self.discover_import_files()?;
+        let raw_candidates = files
+            .iter()
+            .filter(|file| file.kind == ImportKind::RawIrc)
+            .count();
+        let mut selected = files
+            .into_iter()
+            .filter(|file| file.kind == ImportKind::RawIrc)
+            .collect::<Vec<_>>();
+        if let Some(channel_id) = channel_id {
+            selected.retain(|file| raw_file_matches_channel(file, channel_id));
+        }
+        if let Some(limit) = limit_files {
+            selected.truncate(limit);
+        }
+
+        let mut summary = BulkRawImportSummary {
+            files_scanned: raw_candidates,
+            raw_candidates,
+            files_selected: selected.len(),
+            dry_run,
+            channel_id: channel_id.map(str::to_string),
+            ..BulkRawImportSummary::default()
+        };
+
+        info!(
+            "Starting bulk raw import: channel_filter={:?}, dry_run={}, selected_files={}",
+            channel_id,
+            dry_run,
+            selected.len()
+        );
+
+        let mut outcome = RawImportOutcome::default();
+        let total_files = selected.len();
+        for (index, file) in selected.into_iter().enumerate() {
+            let path_key = file.path.to_string_lossy().to_string();
+            let status_check_started = Instant::now();
+            info!(
+                "Bulk import status check {}/{} for {}",
+                index + 1,
+                total_files,
+                file.path.display()
+            );
+            let is_current = store.imported_raw_file_is_current(&path_key, &file.fingerprint)?;
+            info!(
+                "Completed bulk import status check for {} in {:?}: current={is_current}",
+                file.path.display(),
+                status_check_started.elapsed()
+            );
+            if is_current {
+                summary.files_current += 1;
+                if !dry_run && self.delete_current_raw_if_configured(&file) {
+                    summary.files_deleted += 1;
+                }
+                continue;
+            }
+
+            summary.files_pending += 1;
+            if dry_run {
+                continue;
+            }
+
+            match import_raw_file_with_progress(store, &file, index + 1, total_files) {
+                Ok(file_outcome) => {
+                    summary.files_imported += 1;
+                    outcome.extend(file_outcome);
+                    if self.delete_import_file_if_configured(&file, true) {
+                        summary.files_deleted += 1;
+                    }
+                }
+                Err(error) => {
+                    let failed_status = format!("failed:{error}");
+                    let _ = store.record_imported_raw_file(
+                        &path_key,
+                        &file.fingerprint,
+                        &failed_status,
+                    );
+                    summary.files_failed += 1;
+                    warn!(
+                        "Failed bulk raw import for {}: {error:#}",
+                        file.path.display()
+                    );
+                }
+            }
+        }
+
+        if !dry_run && !outcome.affected_channel_days.is_empty() {
+            let day_keys = outcome
+                .affected_channel_days
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            store.merge_imported_channel_days_into_archives(&day_keys)?;
+        }
+        summary.affected_channel_days = outcome.affected_channel_days.len();
+        summary.affected_user_months = outcome.affected_user_months.len();
+        summary.elapsed_ms = started.elapsed().as_millis();
+        info!(
+            "Completed bulk raw import: scanned={}, selected={}, current={}, pending={}, imported={}, failed={}, deleted={}, channel_days={}, user_months={}, elapsed_ms={}",
+            summary.files_scanned,
+            summary.files_selected,
+            summary.files_current,
+            summary.files_pending,
+            summary.files_imported,
+            summary.files_failed,
+            summary.files_deleted,
+            summary.affected_channel_days,
+            summary.affected_user_months,
+            summary.elapsed_ms
+        );
+        Ok(summary)
+    }
+
     fn discover_import_files(&self) -> Result<Vec<ImportFile>> {
         let Some(root) = self.import_folder_path() else {
             return Ok(Vec::new());
@@ -467,14 +605,14 @@ impl LegacyTxtRuntime {
         Ok(outcome)
     }
 
-    fn delete_import_file_if_configured(&self, file: &ImportFile, is_raw: bool) {
+    fn delete_import_file_if_configured(&self, file: &ImportFile, is_raw: bool) -> bool {
         let should_delete = if is_raw {
             self.delete_raw_after_import
         } else {
             self.delete_reconstructed_after_read
         };
         if !should_delete {
-            return;
+            return false;
         }
         if fs::remove_file(&file.path).is_ok() {
             if let Some(root) = self.import_folder.as_deref() {
@@ -487,18 +625,20 @@ impl LegacyTxtRuntime {
                 if is_raw { "raw" } else { "reconstructed" },
                 file.path.display()
             );
+            true
         } else {
             warn!(
                 "Failed to delete consumed {} import file {}",
                 if is_raw { "raw" } else { "reconstructed" },
                 file.path.display()
             );
+            false
         }
     }
 
-    fn delete_current_raw_if_configured(&self, file: &ImportFile) {
+    fn delete_current_raw_if_configured(&self, file: &ImportFile) -> bool {
         if !self.delete_current_raw_on_discovery {
-            return;
+            return false;
         }
         if fs::remove_file(&file.path).is_ok() {
             if let Some(root) = self.import_folder.as_deref() {
@@ -507,11 +647,13 @@ impl LegacyTxtRuntime {
                 }
             }
             info!("Deleted already-imported raw file {}", file.path.display());
+            true
         } else {
             warn!(
                 "Failed to delete already-imported raw file {}",
                 file.path.display()
             );
+            false
         }
     }
 
@@ -623,6 +765,27 @@ fn classify_import_file(path: &Path) -> Result<Option<ImportKind>> {
     } else {
         Ok(Some(ImportKind::SimpleText))
     }
+}
+
+fn raw_file_matches_channel(file: &ImportFile, channel_id: &str) -> bool {
+    if let Some((matched_channel_id, _, _, _)) = infer_legacy_path_channel_day(&file.path) {
+        if matched_channel_id == channel_id {
+            return true;
+        }
+    }
+    let mut matched = false;
+    let _ = for_each_line_in_supported_file(&file.path, |line| {
+        let Some(raw) = extract_raw_irc_line(&line) else {
+            return Ok(());
+        };
+        if let Ok(Some(event)) = CanonicalEvent::from_raw(&raw) {
+            if event.room_id == channel_id {
+                matched = true;
+            }
+        }
+        Ok(())
+    });
+    matched
 }
 
 fn behaves_like_raw_irc_path(path: &Path) -> Result<bool> {

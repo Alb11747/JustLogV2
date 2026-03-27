@@ -11,7 +11,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HyperServerBuilder;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -71,6 +71,7 @@ pub async fn run_cli() -> Result<()> {
 
     let helix = HelixClient::new(&config);
     let ingest_slot = Arc::new(RwLock::new(None));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = AppState {
         config: shared_config.clone(),
         store: store.clone(),
@@ -91,18 +92,43 @@ pub async fn run_cli() -> Result<()> {
 
     let initial_channels = resolve_channel_logins(&helix, &config.channels).await?;
     ingest.start(initial_channels).await;
-    spawn_compactor(shared_config.clone(), store.clone(), debug_runtime);
+    spawn_compactor(
+        shared_config.clone(),
+        store.clone(),
+        debug_runtime,
+        shutdown_rx.clone(),
+    );
 
-    serve(state, &config.listen_address).await
+    tokio::select! {
+        result = serve(state, &config.listen_address, shutdown_rx) => {
+            result?;
+        }
+        _ = wait_for_shutdown_signal() => {
+            info!("shutdown signal received");
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    ingest.stop();
+    Ok(())
 }
 
-async fn serve(state: AppState, listen_address: &str) -> Result<()> {
+async fn serve(
+    state: AppState,
+    listen_address: &str,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let bind_address = normalize_listen_address(listen_address);
     let listener = TcpListener::bind(bind_address).await?;
     let local_address = listener.local_addr()?;
     info!("Listening on {local_address}");
     loop {
-        let (stream, remote_address) = listener.accept().await?;
+        let accept = listener.accept();
+        tokio::pin!(accept);
+        let (stream, remote_address) = tokio::select! {
+            result = &mut accept => result?,
+            _ = shutdown.changed() => return Ok(()),
+        };
         let state = state.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
@@ -119,6 +145,25 @@ async fn serve(state: AppState, listen_address: &str) -> Result<()> {
                 warn!("failed to serve HTTP connection from {remote_address}: {error}");
             }
         });
+    }
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
