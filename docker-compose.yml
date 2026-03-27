@@ -1,7 +1,7 @@
 services:
-  justlogv2:
-    container_name: justlogv2
-    image: justlogv2:local
+  justlog-v2:
+    container_name: justlog-v2
+    image: justlog-v2:local
     build:
       context: .
       dockerfile: Dockerfile
