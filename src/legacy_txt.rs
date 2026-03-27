@@ -29,6 +29,7 @@ pub struct LegacyTxtRuntime {
     check_each_request: bool,
     mode: LegacyTxtMode,
     delete_raw_after_import: bool,
+    delete_current_raw_on_discovery: bool,
     delete_reconstructed_after_read: bool,
     import_folder_exists_at_startup: bool,
 }
@@ -79,6 +80,10 @@ impl LegacyTxtRuntime {
             check_each_request: env_flag("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST", false),
             mode,
             delete_raw_after_import: env_flag("JUSTLOG_IMPORT_DELETE_RAW", false),
+            delete_current_raw_on_discovery: env_flag(
+                "JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW",
+                true,
+            ),
             delete_reconstructed_after_read: env_flag("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED", false),
             import_folder_exists_at_startup,
         }
@@ -357,6 +362,7 @@ impl LegacyTxtRuntime {
                 status_check_started.elapsed()
             );
             if is_current {
+                self.delete_current_raw_if_configured(&file);
                 continue;
             }
             let metadata_started = Instant::now();
@@ -418,6 +424,25 @@ impl LegacyTxtRuntime {
         } else {
             warn!(
                 "Failed to delete consumed import file {}",
+                file.path.display()
+            );
+        }
+    }
+
+    fn delete_current_raw_if_configured(&self, file: &ImportFile) {
+        if !self.delete_current_raw_on_discovery {
+            return;
+        }
+        if fs::remove_file(&file.path).is_ok() {
+            if let Some(root) = self.import_folder.as_deref() {
+                if let Some(parent) = file.path.parent() {
+                    remove_empty_dir_and_parents(root, parent);
+                }
+            }
+            info!("Deleted already-imported raw file {}", file.path.display());
+        } else {
+            warn!(
+                "Failed to delete already-imported raw file {}",
                 file.path.display()
             );
         }
@@ -1157,6 +1182,7 @@ mod tests {
             check_each_request: true,
             mode: LegacyTxtMode::MissingOnly,
             delete_raw_after_import: false,
+            delete_current_raw_on_discovery: true,
             delete_reconstructed_after_read: false,
             import_folder_exists_at_startup: true,
         };

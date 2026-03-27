@@ -161,6 +161,7 @@ Supported flags:
 - `JUSTLOG_LEGACY_TXT_MODE=missing_only|merge|off`
 - `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`
 - `JUSTLOG_IMPORT_DELETE_RAW=1`
+- `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=0|1`
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`
 
 Behavior summary:
@@ -171,6 +172,7 @@ Behavior summary:
 - `JUSTLOG_LEGACY_TXT_MODE` only controls reconstructed overlays.
 - `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1` only affects reconstructed-file discovery freshness.
 - `JUSTLOG_IMPORT_DELETE_RAW=1` removes successfully imported raw source files.
+- `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1` also removes raw source files whose path and fingerprint are already marked current in SQLite. This defaults to on.
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` removes successfully consumed reconstructed TXT / JSON files.
 
 ## Ingestion Pipeline
@@ -400,7 +402,7 @@ Supported import families:
 
 If multiple matching files exist, imported and reconstructed messages are stable-sorted by timestamp. Parse failures are ignored and do not fail requests.
 
-For large import folders, raw IRC imports are streamed line-by-line instead of buffering full files in memory. The module logs start, periodic progress, and completion summaries through tracing, writes an `importing` status before each raw-file import begins, and only treats a file as current when its fingerprint matches a terminal status (`imported` or `seen`). If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request. When the delete flags are enabled, consumed files are removed after successful raw import or successful reconstructed parsing, then empty parent directories are pruned.
+For large import folders, raw IRC imports are streamed line-by-line instead of buffering full files in memory. The module logs start, periodic progress, and completion summaries through tracing, writes an `importing` status before each raw-file import begins, and only treats a file as current when its fingerprint matches a terminal status (`imported` or `seen`). If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request. When the delete flags are enabled, consumed files are removed after successful raw import, already-current raw files can also be removed during preflight, and reconstructed files are removed after successful overlay parsing, then empty parent directories are pruned.
 
 Whenever the import folder is checked, the module also prunes empty directories below that root and removes empty parent layers upward when possible.
 
