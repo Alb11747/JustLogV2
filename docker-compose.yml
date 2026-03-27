@@ -17,6 +17,7 @@ services:
       JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST: ${JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST:-0}
     user: "${JUSTLOG_UID:-1000}:${JUSTLOG_GID:-1000}"
     restart: unless-stopped
+    stop_grace_period: 60s
     ports:
       - "${JUSTLOG_PUBLIC_PORT}:8026"
     volumes:
