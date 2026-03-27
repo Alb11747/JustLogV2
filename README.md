@@ -49,6 +49,8 @@ Supported env flags:
 - `JUSTLOG_IMPORT_FOLDER=<path>`: in-container or local folder to search recursively.
 - `JUSTLOG_LEGACY_TXT_MODE=missing_only|merge|off`: applies only to reconstructed data. Default is `missing_only`.
 - `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`: re-check reconstructed-file availability on each request.
+- `JUSTLOG_IMPORT_DELETE_RAW=1`: delete raw IRC source files after they are successfully imported into native storage.
+- `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`: delete reconstructed TXT / JSON source files after they are successfully consumed on read.
 
 Behavior summary:
 
@@ -80,8 +82,9 @@ The easiest workflow is:
 
 1. Set `JUSTLOG_IMPORT_FOLDER=/import-folder` in `.env`.
 2. Choose `JUSTLOG_LEGACY_TXT_MODE` for reconstructed simple TXT and JSON overlays.
-3. Copy files anywhere under `./data/import-folder`.
-4. Restart the service with `docker compose up -d --build` or `docker compose restart`.
+3. Optionally set `JUSTLOG_IMPORT_DELETE_RAW=1` and/or `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` if you want consumed source files removed automatically.
+4. Copy files anywhere under `./data/import-folder`.
+5. Restart the service with `docker compose up -d --build` or `docker compose restart`.
 
 Example host paths:
 
@@ -130,10 +133,12 @@ Large import folders are handled incrementally:
 - Raw-file bookkeeping records an `importing` state before work starts and only marks a file complete when it finishes.
 - If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request.
 - Re-importing an already completed raw file is skipped when its fingerprint is unchanged.
+- If `JUSTLOG_IMPORT_DELETE_RAW=1`, successfully imported raw files are deleted after completion.
+- If `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`, successfully parsed reconstructed TXT / JSON files are deleted after the request that consumed them.
 
 ### Empty directory cleanup
 
-Whenever the import folder is checked, the compatibility layer prunes empty directories below that root and removes empty parent directories upward when possible, while leaving non-empty branches alone.
+Whenever the import folder is checked, the compatibility layer prunes empty directories below that root and removes empty parent directories upward when possible, while leaving non-empty branches alone. This also runs after delete-after-success removes consumed import files.
 
 ## Debug Validation
 

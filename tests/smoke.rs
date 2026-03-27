@@ -228,6 +228,54 @@ async fn import_folder_raw_irc_txt_imports_into_native_store_without_duplication
 }
 
 #[tokio::test]
+async fn import_folder_can_delete_raw_files_after_successful_import() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("nested/1/2024/1/2.txt");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(
+        &import_file,
+        privmsg(
+            "import-raw-delete-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "raw imported then deleted",
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
+        std::env::set_var("JUSTLOG_IMPORT_DELETE_RAW", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert!(body.contains("raw imported then deleted"));
+    assert!(!import_file.exists());
+    assert!(!import_root.join("nested/1/2024/1").exists());
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_RAW");
+    }
+}
+
+#[tokio::test]
 async fn import_folder_retries_files_left_in_importing_state() {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();
@@ -290,6 +338,45 @@ async fn import_folder_retries_files_left_in_importing_state() {
     unsafe {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+    }
+}
+
+#[tokio::test]
+async fn import_folder_can_delete_reconstructed_files_after_read() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("overlay/1/2024/1/2.json");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(
+        &import_file,
+        r##"{"streamer":{"name":"channelone","id":1},"video":{"title":"vod title","id":"vod-1"},"comments":[{"_id":"json-delete-1","created_at":"2024-01-02T00:00:04Z","channel_id":"1","content_id":"vod-1","commenter":{"display_name":"JsonDeleteUser","_id":"300","name":"jsondeleteuser","logo":"https://example.com/logo.png"},"message":{"body":"json deleted after read","user_color":"#FF0000","user_badges":[],"emoticons":[]}}]}"##,
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
+        std::env::set_var("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert!(body.contains("json deleted after read"));
+    assert!(!import_file.exists());
+    assert!(!import_root.join("overlay/1/2024/1").exists());
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED");
     }
 }
 

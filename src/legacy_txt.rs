@@ -27,6 +27,8 @@ pub struct LegacyTxtRuntime {
     import_folder: Option<PathBuf>,
     check_each_request: bool,
     mode: LegacyTxtMode,
+    delete_raw_after_import: bool,
+    delete_reconstructed_after_read: bool,
     import_folder_exists_at_startup: bool,
 }
 
@@ -78,6 +80,8 @@ impl LegacyTxtRuntime {
             import_folder,
             check_each_request: env_flag("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST", false),
             mode,
+            delete_raw_after_import: env_flag("JUSTLOG_IMPORT_DELETE_RAW", false),
+            delete_reconstructed_after_read: env_flag("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED", false),
             import_folder_exists_at_startup,
         }
     }
@@ -126,15 +130,20 @@ impl LegacyTxtRuntime {
             match file.kind {
                 ImportKind::RawIrc => {}
                 ImportKind::SimpleText => {
+                    if self.mode == LegacyTxtMode::Off {
+                        continue;
+                    }
                     if let Ok(messages) =
                         parse_sparse_txt_file(&file.path, channel_login, year, month, day)
                     {
                         result.simple_messages.extend(messages);
+                        self.delete_import_file_if_configured(&file, false);
                     }
                 }
                 ImportKind::JsonExport => {
                     if let Ok(messages) = parse_json_export_file(&file.path, channel_login) {
                         result.complete_messages.extend(messages);
+                        self.delete_import_file_if_configured(&file, false);
                     }
                 }
             }
@@ -320,9 +329,35 @@ impl LegacyTxtRuntime {
                 let _ =
                     store.record_imported_raw_file(&path_key, &file.fingerprint, &failed_status);
                 warn!("Failed raw import for {}: {error:#}", file.path.display());
+                continue;
             }
+            self.delete_import_file_if_configured(&file, true);
         }
         Ok(())
+    }
+
+    fn delete_import_file_if_configured(&self, file: &ImportFile, is_raw: bool) {
+        let should_delete = if is_raw {
+            self.delete_raw_after_import
+        } else {
+            self.delete_reconstructed_after_read
+        };
+        if !should_delete {
+            return;
+        }
+        if fs::remove_file(&file.path).is_ok() {
+            if let Some(root) = self.import_folder.as_deref() {
+                if let Some(parent) = file.path.parent() {
+                    remove_empty_dir_and_parents(root, parent);
+                }
+            }
+            info!("Deleted consumed import file {}", file.path.display());
+        } else {
+            warn!(
+                "Failed to delete consumed import file {}",
+                file.path.display()
+            );
+        }
     }
 }
 
@@ -946,6 +981,8 @@ mod tests {
             import_folder: Some(root.clone()),
             check_each_request: true,
             mode: LegacyTxtMode::MissingOnly,
+            delete_raw_after_import: false,
+            delete_reconstructed_after_read: false,
             import_folder_exists_at_startup: true,
         };
         let files = runtime.discover_channel_day_files("1", 2024, 1, 2).unwrap();
