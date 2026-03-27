@@ -208,6 +208,59 @@ async fn optout_flow_updates_config_and_blocks_queries() {
 }
 
 #[tokio::test]
+async fn user_month_reads_include_messages_from_compacted_channel_days() {
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let first = CanonicalEvent::from_raw(&privmsg(
+        "user-month-1",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_153_600_000,
+        "from compacted day",
+    ))
+    .unwrap()
+    .unwrap();
+    let second = CanonicalEvent::from_raw(&privmsg(
+        "user-month-2",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_240_000_000,
+        "still hot",
+    ))
+    .unwrap()
+    .unwrap();
+    harness.seed_channel_event(&first);
+    harness.seed_channel_event(&second);
+    harness.compact_channel_day("1", 2024, 1, 2);
+
+    let response = harness
+        .request(
+            Request::builder()
+                .uri("/channelid/1/userid/200/2024/1?json=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let messages = json["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["text"] == "from compacted day")
+    );
+    assert!(messages.iter().any(|message| message["text"] == "still hot"));
+}
+
+#[tokio::test]
 async fn raw_route_can_passthrough_brotli_or_fallback_to_transformed_brotli() {
     let harness = TestHarness::start(vec!["1".to_string()]).await;
     let event = CanonicalEvent::from_raw(&privmsg(

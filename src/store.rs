@@ -238,8 +238,10 @@ impl Store {
         month: u32,
     ) -> Result<Vec<StoredEvent>> {
         let mut events = self.read_user_segment(channel_id, user_id, year, month)?;
+        events.extend(self.read_channel_segments_for_user(channel_id, user_id, year, month)?);
         events.extend(self.read_hot_user_events(channel_id, user_id, year, month)?);
         events.sort_by_key(|event| (event.timestamp.timestamp(), event.seq));
+        events.dedup_by(|left, right| left.event_uid == right.event_uid);
         Ok(events)
     }
 
@@ -1082,6 +1084,34 @@ impl Store {
         };
         self.load_segment_events(&segment)
             .map(|events| filter_user_events(events, user_id))
+    }
+
+    fn read_channel_segments_for_user(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        year: i32,
+        month: u32,
+    ) -> Result<Vec<StoredEvent>> {
+        let mut events = Vec::new();
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare(
+            r#"
+            SELECT id, scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw
+            FROM segments
+            WHERE scope = 'channel' AND channel_id = ?1 AND year = ?2 AND month = ?3
+            ORDER BY day ASC
+            "#,
+        )?;
+        let segments = statement
+            .query_map(params![channel_id, year, month], map_segment_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        drop(db);
+        for segment in segments {
+            events.extend(filter_user_events(self.load_segment_events(&segment)?, user_id));
+        }
+        Ok(events)
     }
 
     fn load_segment_events(&self, segment: &SegmentRecord) -> Result<Vec<StoredEvent>> {
