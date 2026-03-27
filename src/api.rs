@@ -175,7 +175,19 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
         let legacy_txt = state.legacy_txt.clone();
         let store = state.store.clone();
         let channel_id_for_import = channel_id.clone();
-        run_blocking(move || legacy_txt.import_raw_channel(&store, &channel_id_for_import)).await?;
+        let import_outcome =
+            run_blocking(move || legacy_txt.import_raw_channel(&store, &channel_id_for_import))
+                .await?;
+        let archive_enabled = state.config.read().await.archive;
+        if archive_enabled && !import_outcome.affected_channel_days.is_empty() {
+            let store = state.store.clone();
+            let affected = import_outcome
+                .affected_channel_days
+                .into_iter()
+                .collect::<Vec<_>>();
+            run_blocking(move || store.merge_imported_channel_days_into_archives(&affected))
+                .await?;
+        }
 
         let store = state.store.clone();
         let channel_id_for_logs = channel_id.clone();
@@ -431,10 +443,20 @@ async fn dated_response(
         let legacy_txt = state.legacy_txt.clone();
         let store = state.store.clone();
         let channel_id = request.channel_id.clone();
-        run_blocking(move || {
+        let import_outcome = run_blocking(move || {
             legacy_txt.import_raw_channel_day(&store, &channel_id, year, month, day)
         })
         .await?;
+        let archive_enabled = state.config.read().await.archive;
+        if archive_enabled && !import_outcome.affected_channel_days.is_empty() {
+            let store = state.store.clone();
+            let affected = import_outcome
+                .affected_channel_days
+                .into_iter()
+                .collect::<Vec<_>>();
+            run_blocking(move || store.merge_imported_channel_days_into_archives(&affected))
+                .await?;
+        }
 
         let store = state.store.clone();
         let channel_id_for_native = request.channel_id.clone();

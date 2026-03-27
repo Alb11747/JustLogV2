@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
@@ -13,7 +13,9 @@ use serde::Deserialize;
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
-use crate::model::{CanonicalEvent, ChannelLogFile, ChatMessage, PRIVMSG_TYPE};
+use crate::model::{
+    CanonicalEvent, ChannelDayKey, ChannelLogFile, ChatMessage, PRIVMSG_TYPE, UserMonthKey,
+};
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,27 @@ struct ImportFile {
 pub struct ChannelDayImport {
     pub complete_messages: Vec<ChatMessage>,
     pub simple_messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RawImportOutcome {
+    pub affected_channel_days: BTreeSet<ChannelDayKey>,
+    pub affected_user_months: BTreeSet<UserMonthKey>,
+}
+
+impl RawImportOutcome {
+    fn record_event(&mut self, event: &CanonicalEvent) {
+        self.affected_channel_days.insert(event.channel_day_key());
+        for key in event.user_month_keys() {
+            self.affected_user_months.insert(key);
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.affected_channel_days
+            .extend(other.affected_channel_days);
+        self.affected_user_months.extend(other.affected_user_months);
+    }
 }
 
 const IMPORT_PROGRESS_LINE_INTERVAL: usize = 100_000;
@@ -109,7 +132,7 @@ impl LegacyTxtRuntime {
         year: i32,
         month: u32,
         day: u32,
-    ) -> Result<()> {
+    ) -> Result<RawImportOutcome> {
         let files = self.discover_import_files()?;
         let (raw_count, simple_count, json_count) = import_kind_counts(&files);
         info!(
@@ -123,11 +146,10 @@ impl LegacyTxtRuntime {
             store,
             files,
             &format!("channel-day {channel_id}/{year}/{month}/{day}"),
-        )?;
-        Ok(())
+        )
     }
 
-    pub fn import_raw_channel(&self, store: &Store, channel_id: &str) -> Result<()> {
+    pub fn import_raw_channel(&self, store: &Store, channel_id: &str) -> Result<RawImportOutcome> {
         let files = self.discover_import_files()?;
         let (raw_count, simple_count, json_count) = import_kind_counts(&files);
         info!(
@@ -137,8 +159,7 @@ impl LegacyTxtRuntime {
             simple_count,
             json_count
         );
-        self.import_raw_files(store, files, &format!("channel {channel_id}"))?;
-        Ok(())
+        self.import_raw_files(store, files, &format!("channel {channel_id}"))
     }
 
     pub fn load_channel_day_import(
@@ -368,7 +389,12 @@ impl LegacyTxtRuntime {
         None
     }
 
-    fn import_raw_files(&self, store: &Store, files: Vec<ImportFile>, scope: &str) -> Result<()> {
+    fn import_raw_files(
+        &self,
+        store: &Store,
+        files: Vec<ImportFile>,
+        scope: &str,
+    ) -> Result<RawImportOutcome> {
         info!("Preparing raw import candidates for {scope}");
         let pending = files
             .into_iter()
@@ -376,7 +402,7 @@ impl LegacyTxtRuntime {
             .collect::<Vec<_>>();
         if pending.is_empty() {
             info!("Raw import scan for {scope}: no raw candidate files found");
-            return Ok(());
+            return Ok(RawImportOutcome::default());
         }
 
         let mut remaining = Vec::new();
@@ -410,7 +436,7 @@ impl LegacyTxtRuntime {
         }
         if remaining.is_empty() {
             info!("Raw import scan for {scope}: all raw candidate files already current");
-            return Ok(());
+            return Ok(RawImportOutcome::default());
         }
 
         info!(
@@ -420,19 +446,25 @@ impl LegacyTxtRuntime {
         );
 
         let total_files = remaining.len();
+        let mut outcome = RawImportOutcome::default();
         for (index, file) in remaining.into_iter().enumerate() {
-            if let Err(error) = import_raw_file_with_progress(store, &file, index + 1, total_files)
-            {
-                let path_key = file.path.to_string_lossy().to_string();
-                let failed_status = format!("failed:{error}");
-                let _ =
-                    store.record_imported_raw_file(&path_key, &file.fingerprint, &failed_status);
-                warn!("Failed raw import for {}: {error:#}", file.path.display());
-                continue;
+            match import_raw_file_with_progress(store, &file, index + 1, total_files) {
+                Ok(file_outcome) => outcome.extend(file_outcome),
+                Err(error) => {
+                    let path_key = file.path.to_string_lossy().to_string();
+                    let failed_status = format!("failed:{error}");
+                    let _ = store.record_imported_raw_file(
+                        &path_key,
+                        &file.fingerprint,
+                        &failed_status,
+                    );
+                    warn!("Failed raw import for {}: {error:#}", file.path.display());
+                    continue;
+                }
             }
             self.delete_import_file_if_configured(&file, true);
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn delete_import_file_if_configured(&self, file: &ImportFile, is_raw: bool) {
@@ -697,7 +729,7 @@ fn import_raw_file_with_progress(
     file: &ImportFile,
     index: usize,
     total_files: usize,
-) -> Result<()> {
+) -> Result<RawImportOutcome> {
     let path_key = file.path.to_string_lossy().to_string();
     let import_marker_started = Instant::now();
     info!("Recording raw import start for {}", file.path.display());
@@ -722,6 +754,7 @@ fn import_raw_file_with_progress(
     let mut imported = 0usize;
     let mut parse_errors = 0usize;
     let mut skipped_events = 0usize;
+    let mut outcome = RawImportOutcome::default();
     for_each_line_in_supported_file(&file.path, |line| {
         scanned_lines += 1;
         let Some(raw) = extract_raw_irc_line(&line) else {
@@ -744,6 +777,7 @@ fn import_raw_file_with_progress(
             Ok(Some(event)) => {
                 if store.insert_event(&event)? {
                     imported += 1;
+                    outcome.record_event(&event);
                 } else {
                     skipped_events += 1;
                 }
@@ -791,7 +825,7 @@ fn import_raw_file_with_progress(
         skipped_events,
         parse_errors
     );
-    Ok(())
+    Ok(outcome)
 }
 
 fn parse_sparse_txt_file(

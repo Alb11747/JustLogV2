@@ -235,7 +235,94 @@ async fn import_folder_raw_irc_txt_imports_into_native_store_without_duplication
 
     assert!(first.contains("raw imported"));
     assert!(second.contains("raw imported"));
-    assert_eq!(harness.state.store.event_count().unwrap(), 1);
+    assert_eq!(harness.state.store.event_count().unwrap(), 0);
+    let archived = harness
+        .state
+        .store
+        .read_archived_channel_segment_strict("1", 2024, 1, 2)
+        .unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].text, "raw imported");
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+    }
+}
+
+#[tokio::test]
+async fn import_folder_raw_import_merges_into_existing_archived_day() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("logs/archive-late.log");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(
+        &import_file,
+        privmsg(
+            "archived-import-2",
+            "1",
+            "201",
+            "lateviewer",
+            "lateviewer",
+            "channelone",
+            1_704_153_605_000,
+            "late imported archived line",
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    harness.seed_channel_event(
+        &CanonicalEvent::from_raw(&privmsg(
+            "archived-import-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "existing archived line",
+        ))
+        .unwrap()
+        .unwrap(),
+    );
+    harness.compact_channel_day("1", 2024, 1, 2);
+    assert_eq!(harness.state.store.event_count().unwrap(), 0);
+
+    let body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert!(body.contains("existing archived line"));
+    assert!(body.contains("late imported archived line"));
+    assert_eq!(harness.state.store.event_count().unwrap(), 0);
+
+    let archived = harness
+        .state
+        .store
+        .read_archived_channel_segment_strict("1", 2024, 1, 2)
+        .unwrap();
+    assert_eq!(archived.len(), 2);
+    assert!(
+        archived
+            .iter()
+            .any(|event| event.text == "existing archived line")
+    );
+    assert!(
+        archived
+            .iter()
+            .any(|event| event.text == "late imported archived line")
+    );
 
     unsafe {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
@@ -349,7 +436,14 @@ async fn import_folder_retries_files_left_in_importing_state() {
         .await;
 
     assert!(body.contains("raw imported after retry"));
-    assert_eq!(harness.state.store.event_count().unwrap(), 1);
+    assert_eq!(harness.state.store.event_count().unwrap(), 0);
+    let archived = harness
+        .state
+        .store
+        .read_archived_channel_segment_strict("1", 2024, 1, 2)
+        .unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].text, "raw imported after retry");
 
     unsafe {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
@@ -536,7 +630,14 @@ async fn import_folder_can_import_log_files_from_arbitrary_subdirs() {
         .await;
 
     assert!(body.contains("log import anywhere"));
-    assert_eq!(harness.state.store.event_count().unwrap(), 1);
+    assert_eq!(harness.state.store.event_count().unwrap(), 0);
+    let archived = harness
+        .state
+        .store
+        .read_archived_channel_segment_strict("1", 2024, 3, 21)
+        .unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].text, "log import anywhere");
 
     unsafe {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");

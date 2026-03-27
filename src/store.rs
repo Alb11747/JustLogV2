@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -468,6 +469,19 @@ impl Store {
         }
         for partition in self.compactable_user_months(now, compact_after_user_months)? {
             self.compact_user_partition(&partition.key)?;
+        }
+        Ok(())
+    }
+
+    pub fn merge_imported_channel_days_into_archives(
+        &self,
+        day_keys: &[ChannelDayKey],
+    ) -> Result<()> {
+        if !self.archive_enabled {
+            return Ok(());
+        }
+        for key in day_keys {
+            self.merge_imported_channel_day_into_archives(key)?;
         }
         Ok(())
     }
@@ -1157,6 +1171,77 @@ impl Store {
         Ok(relative)
     }
 
+    fn merge_imported_channel_day_into_archives(&self, key: &ChannelDayKey) -> Result<()> {
+        let mut day_events =
+            self.read_channel_logs(&key.channel_id, key.year, key.month, key.day)?;
+        if day_events.is_empty() {
+            return Ok(());
+        }
+        dedupe_and_sort_stored_events(&mut day_events);
+        self.replace_or_create_channel_segment(
+            &key.channel_id,
+            key.year,
+            key.month,
+            key.day,
+            &day_events,
+        )?;
+
+        let db = self.lock_db();
+        db.execute(
+            r#"
+            DELETE FROM events
+            WHERE room_id = ?1
+              AND strftime('%Y', timestamp_rfc3339) = printf('%04d', ?2)
+              AND strftime('%m', timestamp_rfc3339) = printf('%02d', ?3)
+              AND strftime('%d', timestamp_rfc3339) = printf('%02d', ?4)
+            "#,
+            params![key.channel_id, key.year, key.month, key.day],
+        )?;
+        drop(db);
+
+        let mut user_months = BTreeSet::new();
+        for event in &day_events {
+            if let Some(user_id) = event.user_id.clone() {
+                user_months.insert(UserMonthKey {
+                    channel_id: event.room_id.clone(),
+                    user_id,
+                    year: event.timestamp.year(),
+                    month: event.timestamp.month(),
+                });
+            }
+            if let Some(user_id) = event.target_user_id.clone() {
+                user_months.insert(UserMonthKey {
+                    channel_id: event.room_id.clone(),
+                    user_id,
+                    year: event.timestamp.year(),
+                    month: event.timestamp.month(),
+                });
+            }
+        }
+
+        for user_key in user_months {
+            let mut month_events = self.read_user_logs(
+                &user_key.channel_id,
+                &user_key.user_id,
+                user_key.year,
+                user_key.month,
+            )?;
+            if month_events.is_empty() {
+                continue;
+            }
+            dedupe_and_sort_stored_events(&mut month_events);
+            self.replace_or_create_user_segment(
+                &user_key.channel_id,
+                &user_key.user_id,
+                user_key.year,
+                user_key.month,
+                &month_events,
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn list_channel_segments_since(
         &self,
         start: Option<DateTime<Utc>>,
@@ -1514,6 +1599,15 @@ fn filter_user_events(events: Vec<StoredEvent>, user_id: &str) -> Vec<StoredEven
                 || event.target_user_id.as_deref() == Some(user_id)
         })
         .collect()
+}
+
+fn dedupe_and_sort_stored_events(events: &mut Vec<StoredEvent>) {
+    let mut seen = BTreeSet::new();
+    events.retain(|event| seen.insert(event.event_uid.clone()));
+    events.sort_by_key(|event| (event.timestamp.timestamp(), event.event_uid.clone()));
+    for (index, event) in events.iter_mut().enumerate() {
+        event.seq = index as i64;
+    }
 }
 
 fn choose_random(events: Vec<StoredEvent>) -> Result<Option<StoredEvent>> {
