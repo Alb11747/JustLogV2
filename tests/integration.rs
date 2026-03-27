@@ -1,5 +1,7 @@
 mod common;
 
+use std::time::{Duration as StdDuration, Instant};
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use justlog::model::CanonicalEvent;
@@ -205,6 +207,42 @@ async fn optout_flow_updates_config_and_blocks_queries() {
         )
         .await;
     assert_eq!(list.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn expired_optout_codes_cannot_be_redeemed() {
+    let harness = TestHarness::start(vec!["1".to_string()]).await;
+    harness
+        .state
+        .optout_codes
+        .lock()
+        .await
+        .insert("expired1".to_string(), Instant::now() - StdDuration::from_secs(1));
+
+    harness
+        .irc
+        .broadcast_line(&privmsg(
+            "expired-optout",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_067_221_000,
+            "!justlog optout expired1",
+        ))
+        .await;
+    sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        !harness
+            .state
+            .config
+            .read()
+            .await
+            .opt_out
+            .contains_key("200")
+    );
 }
 
 #[tokio::test]

@@ -255,7 +255,10 @@ impl CommandService {
         }
         {
             let mut codes = self.state.optout_codes.lock().await;
-            if codes.remove(&args[0]).is_some() {
+            if let Some(expires_at) = codes.remove(&args[0]) {
+                if expires_at <= Instant::now() {
+                    return Ok(());
+                }
                 if let Some(user_id) = event.user_id.clone() {
                     let mut config = self.state.config.write().await;
                     config.opt_out_users(&[user_id]);
