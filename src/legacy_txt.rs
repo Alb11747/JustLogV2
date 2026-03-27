@@ -3,6 +3,9 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
@@ -16,7 +19,7 @@ use walkdir::WalkDir;
 use crate::model::{
     CanonicalEvent, ChannelDayKey, ChannelLogFile, ChatMessage, PRIVMSG_TYPE, UserMonthKey,
 };
-use crate::store::Store;
+use crate::store::{InsertEventsBatchOutcome, Store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyTxtMode {
@@ -51,6 +54,54 @@ struct ImportFile {
     kind: ImportKind,
 }
 
+#[derive(Debug)]
+struct ParsedRawChunk {
+    file_index: usize,
+    events: Vec<CanonicalEvent>,
+}
+
+#[derive(Debug)]
+struct ParsedRawProgress {
+    file_index: usize,
+    scanned_lines: usize,
+    candidate_lines: usize,
+    parse_errors: usize,
+    parse_skipped: usize,
+}
+
+#[derive(Debug)]
+enum RawWorkerMessage {
+    Chunk(ParsedRawChunk),
+    Progress(ParsedRawProgress),
+    Finished {
+        file_index: usize,
+        scanned_lines: usize,
+        candidate_lines: usize,
+        parse_errors: usize,
+        parse_skipped: usize,
+    },
+    Failed {
+        file_index: usize,
+        scanned_lines: usize,
+        candidate_lines: usize,
+        parse_errors: usize,
+        parse_skipped: usize,
+        error: String,
+    },
+}
+
+#[derive(Debug, Default)]
+struct RawFileImportState {
+    scanned_lines: usize,
+    candidate_lines: usize,
+    parse_errors: usize,
+    parse_skipped: usize,
+    imported: usize,
+    skipped_events: usize,
+    affected_channel_days: BTreeSet<ChannelDayKey>,
+    affected_user_months: BTreeSet<UserMonthKey>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChannelDayImport {
     pub complete_messages: Vec<ChatMessage>,
@@ -81,13 +132,6 @@ pub struct BulkRawImportSummary {
 }
 
 impl RawImportOutcome {
-    fn record_event(&mut self, event: &CanonicalEvent) {
-        self.affected_channel_days.insert(event.channel_day_key());
-        for key in event.user_month_keys() {
-            self.affected_user_months.insert(key);
-        }
-    }
-
     fn extend(&mut self, other: Self) {
         self.affected_channel_days
             .extend(other.affected_channel_days);
@@ -96,6 +140,10 @@ impl RawImportOutcome {
 }
 
 const IMPORT_PROGRESS_LINE_INTERVAL: usize = 100_000;
+const RAW_IMPORT_CHUNK_EVENTS: usize = 4_000;
+const BULK_IMPORT_DISCOVERY_LOG_INTERVAL: usize = 500;
+const BULK_IMPORT_SUMMARY_FILE_INTERVAL: usize = 10;
+const BULK_IMPORT_CHANNEL_WARN_THRESHOLD: usize = 200;
 
 impl LegacyTxtRuntime {
     pub fn from_env(_default_logs_directory: &Path) -> Self {
@@ -271,6 +319,7 @@ impl LegacyTxtRuntime {
         store: &Store,
         channel_id: &str,
     ) -> Result<Vec<ChannelLogFile>> {
+        self.prune_import_root_for_maintenance();
         let mut logs = Vec::new();
         let mut seen = HashSet::new();
         let files = self.discover_import_files()?;
@@ -348,6 +397,17 @@ impl LegacyTxtRuntime {
         Ok(logs)
     }
 
+    fn prune_import_root_for_maintenance(&self) {
+        if !self.check_each_request {
+            return;
+        }
+        if let Some(root) = self.import_folder.as_deref() {
+            if root.exists() {
+                prune_empty_dirs(root);
+            }
+        }
+    }
+
     pub fn bulk_import_raw(
         &self,
         store: &Store,
@@ -356,30 +416,29 @@ impl LegacyTxtRuntime {
         dry_run: bool,
     ) -> Result<BulkRawImportSummary> {
         let started = Instant::now();
-        let files = self.discover_import_files()?;
-        let raw_candidates = files
-            .iter()
-            .filter(|file| file.kind == ImportKind::RawIrc)
-            .count();
-        let mut selected = files
-            .into_iter()
-            .filter(|file| file.kind == ImportKind::RawIrc)
-            .collect::<Vec<_>>();
-        if let Some(channel_id) = channel_id {
-            selected.retain(|file| raw_file_matches_channel(file, channel_id));
-        }
-        if let Some(limit) = limit_files {
-            selected.truncate(limit);
-        }
+        info!(
+            "Starting bulk raw import discovery: channel_filter={:?}, limit_files={:?}, dry_run={dry_run}",
+            channel_id, limit_files
+        );
+        let discovery_started = Instant::now();
+        let discovery = self.discover_bulk_raw_files(channel_id, limit_files)?;
+        let selected = discovery.selected;
 
         let mut summary = BulkRawImportSummary {
-            files_scanned: raw_candidates,
-            raw_candidates,
+            files_scanned: discovery.files_scanned,
+            raw_candidates: discovery.raw_candidates,
             files_selected: selected.len(),
             dry_run,
             channel_id: channel_id.map(str::to_string),
             ..BulkRawImportSummary::default()
         };
+        info!(
+            "Completed bulk raw import discovery in {:?}: files_scanned={}, raw_candidates={}, selected={}",
+            discovery_started.elapsed(),
+            summary.files_scanned,
+            summary.raw_candidates,
+            summary.files_selected
+        );
 
         info!(
             "Starting bulk raw import: channel_filter={:?}, dry_run={}, selected_files={}",
@@ -388,7 +447,7 @@ impl LegacyTxtRuntime {
             selected.len()
         );
 
-        let mut outcome = RawImportOutcome::default();
+        let mut pending = Vec::new();
         let total_files = selected.len();
         for (index, file) in selected.into_iter().enumerate() {
             let path_key = file.path.to_string_lossy().to_string();
@@ -412,46 +471,14 @@ impl LegacyTxtRuntime {
                 }
                 continue;
             }
-
             summary.files_pending += 1;
-            if dry_run {
-                continue;
-            }
-
-            match import_raw_file_with_progress(store, &file, index + 1, total_files) {
-                Ok(file_outcome) => {
-                    summary.files_imported += 1;
-                    outcome.extend(file_outcome);
-                    if self.delete_import_file_if_configured(&file, true) {
-                        summary.files_deleted += 1;
-                    }
-                }
-                Err(error) => {
-                    let failed_status = format!("failed:{error}");
-                    let _ = store.record_imported_raw_file(
-                        &path_key,
-                        &file.fingerprint,
-                        &failed_status,
-                    );
-                    summary.files_failed += 1;
-                    warn!(
-                        "Failed bulk raw import for {}: {error:#}",
-                        file.path.display()
-                    );
-                }
-            }
+            pending.push(file);
         }
 
-        if !dry_run && !outcome.affected_channel_days.is_empty() {
-            let day_keys = outcome
-                .affected_channel_days
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            store.merge_imported_channel_days_into_archives(&day_keys)?;
+        if !dry_run && !pending.is_empty() {
+            self.bulk_import_raw_pending_files(store, &pending, &mut summary)?;
         }
-        summary.affected_channel_days = outcome.affected_channel_days.len();
-        summary.affected_user_months = outcome.affected_user_months.len();
+
         summary.elapsed_ms = started.elapsed().as_millis();
         info!(
             "Completed bulk raw import: scanned={}, selected={}, current={}, pending={}, imported={}, failed={}, deleted={}, channel_days={}, user_months={}, elapsed_ms={}",
@@ -514,11 +541,9 @@ impl LegacyTxtRuntime {
             if !root.exists() {
                 return None;
             }
-            prune_empty_dirs(&root);
             return Some(root);
         }
         if self.import_folder_exists_at_startup && root.exists() {
-            prune_empty_dirs(&root);
             return Some(root);
         }
         if self.import_folder_exists_at_startup {
@@ -577,6 +602,13 @@ impl LegacyTxtRuntime {
             return Ok(RawImportOutcome::default());
         }
 
+        if remaining.len() >= BULK_IMPORT_CHANNEL_WARN_THRESHOLD {
+            warn!(
+                "Raw import scan for {scope}: {} pending files detected; consider POST /admin/import/raw for large migrations",
+                remaining.len()
+            );
+        }
+
         info!(
             "Starting raw import scan for {scope}: {} file(s), {:.2} MiB pending",
             remaining.len(),
@@ -603,6 +635,269 @@ impl LegacyTxtRuntime {
             self.delete_import_file_if_configured(&file, true);
         }
         Ok(outcome)
+    }
+
+    fn discover_bulk_raw_files(
+        &self,
+        channel_id: Option<&str>,
+        limit_files: Option<usize>,
+    ) -> Result<BulkRawDiscovery> {
+        let Some(root) = self.import_folder_path() else {
+            return Ok(BulkRawDiscovery::default());
+        };
+
+        let mut discovery = BulkRawDiscovery::default();
+        for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            discovery.files_scanned += 1;
+            if discovery.files_scanned % BULK_IMPORT_DISCOVERY_LOG_INTERVAL == 0 {
+                info!(
+                    "Bulk raw import discovery progress: scanned={} raw_candidates={} selected={}",
+                    discovery.files_scanned,
+                    discovery.raw_candidates,
+                    discovery.selected.len()
+                );
+            }
+            let path = entry.into_path();
+            if !is_supported_raw_import_path(&path) {
+                continue;
+            }
+            let fingerprint = match file_fingerprint(&path) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    warn!(
+                        "Skipping raw import candidate {}: {error:#}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let file = ImportFile {
+                path,
+                fingerprint,
+                kind: ImportKind::RawIrc,
+            };
+            let is_raw = match behaves_like_raw_irc_path(&file.path) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        "Skipping raw import candidate {} during classification: {error:#}",
+                        file.path.display()
+                    );
+                    false
+                }
+            };
+            if !is_raw {
+                continue;
+            }
+            discovery.raw_candidates += 1;
+            if channel_id.is_some_and(|value| !raw_file_matches_channel(&file, value)) {
+                continue;
+            }
+            discovery.selected.push(file);
+            if limit_files.is_some_and(|limit| discovery.selected.len() >= limit) {
+                break;
+            }
+        }
+        Ok(discovery)
+    }
+
+    fn bulk_import_raw_pending_files(
+        &self,
+        store: &Store,
+        files: &[ImportFile],
+        summary: &mut BulkRawImportSummary,
+    ) -> Result<()> {
+        let total_files = files.len();
+        if total_files == 0 {
+            return Ok(());
+        }
+        let worker_count = default_bulk_raw_worker_count().min(total_files.max(1));
+        info!(
+            "Starting parallel bulk raw import with {} worker(s) for {} pending file(s)",
+            worker_count, total_files
+        );
+
+        let (work_tx, work_rx) =
+            mpsc::sync_channel::<Option<(usize, ImportFile)>>(worker_count * 2);
+        let (result_tx, result_rx) = mpsc::sync_channel::<RawWorkerMessage>(worker_count * 4);
+
+        let mut workers = Vec::new();
+        let shared_rx = Arc::new(Mutex::new(work_rx));
+        for _ in 0..worker_count {
+            let sender = result_tx.clone();
+            let receiver = Arc::clone(&shared_rx);
+            workers.push(thread::spawn(move || {
+                raw_import_worker_loop(receiver, sender)
+            }));
+        }
+        drop(result_tx);
+
+        for (index, file) in files.iter().cloned().enumerate() {
+            let path_key = file.path.to_string_lossy().to_string();
+            store.record_imported_raw_file(&path_key, &file.fingerprint, "importing")?;
+            work_tx.send(Some((index, file)))?;
+        }
+        for _ in 0..worker_count {
+            work_tx.send(None)?;
+        }
+        drop(work_tx);
+
+        let mut states = HashMap::new();
+        let mut all_channel_days = BTreeSet::new();
+        let mut all_user_months = BTreeSet::new();
+        let mut finished = 0usize;
+        while finished < total_files {
+            let message = result_rx
+                .recv()
+                .map_err(|_| anyhow!("bulk raw import worker channel closed unexpectedly"))?;
+            match message {
+                RawWorkerMessage::Chunk(chunk) => {
+                    let batch_started = Instant::now();
+                    let outcome = store.insert_events_batch(&chunk.events)?;
+                    let state = states
+                        .entry(chunk.file_index)
+                        .or_insert_with(RawFileImportState::default);
+                    accumulate_insert_outcome(state, outcome);
+                    info!(
+                        "Committed raw batch for file {}/{} in {:?}: batch_events={}, imported={}, skipped={}",
+                        chunk.file_index + 1,
+                        total_files,
+                        batch_started.elapsed(),
+                        chunk.events.len(),
+                        state.imported,
+                        state.skipped_events
+                    );
+                }
+                RawWorkerMessage::Progress(progress) => {
+                    let state = states
+                        .entry(progress.file_index)
+                        .or_insert_with(RawFileImportState::default);
+                    state.scanned_lines = progress.scanned_lines;
+                    state.candidate_lines = progress.candidate_lines;
+                    state.parse_errors = progress.parse_errors;
+                    state.parse_skipped = progress.parse_skipped;
+                    let file = &files[progress.file_index];
+                    let status = format!(
+                        "importing:{}:{}:{}",
+                        state.scanned_lines, state.imported, state.parse_errors
+                    );
+                    let _ = store.record_imported_raw_file(
+                        &file.path.to_string_lossy(),
+                        &file.fingerprint,
+                        &status,
+                    );
+                    info!(
+                        "Bulk raw import progress {}: scanned {} lines, imported {}, parse_errors {}",
+                        file.path.display(),
+                        state.scanned_lines,
+                        state.imported,
+                        state.parse_errors
+                    );
+                }
+                RawWorkerMessage::Finished {
+                    file_index,
+                    scanned_lines,
+                    candidate_lines,
+                    parse_errors,
+                    parse_skipped,
+                } => {
+                    finished += 1;
+                    let file = &files[file_index];
+                    let state = states
+                        .entry(file_index)
+                        .or_insert_with(RawFileImportState::default);
+                    state.scanned_lines = scanned_lines;
+                    state.candidate_lines = candidate_lines;
+                    state.parse_errors = parse_errors;
+                    state.parse_skipped = parse_skipped;
+
+                    merge_state_archives(store, state, file)?;
+                    let status = if state.imported > 0 {
+                        "imported"
+                    } else {
+                        "seen"
+                    };
+                    store.record_imported_raw_file(
+                        &file.path.to_string_lossy(),
+                        &file.fingerprint,
+                        status,
+                    )?;
+                    summary.files_imported += 1;
+                    all_channel_days.extend(state.affected_channel_days.iter().cloned());
+                    all_user_months.extend(state.affected_user_months.iter().cloned());
+                    if self.delete_import_file_if_configured(file, true) {
+                        summary.files_deleted += 1;
+                    }
+                    info!(
+                        "Completed bulk raw import {}/{} {}: scanned {}, raw_candidates {}, imported {}, skipped {}, parse_errors {}",
+                        file_index + 1,
+                        total_files,
+                        file.path.display(),
+                        state.scanned_lines,
+                        state.candidate_lines,
+                        state.imported,
+                        state.skipped_events + state.parse_skipped,
+                        state.parse_errors
+                    );
+                    if finished % BULK_IMPORT_SUMMARY_FILE_INTERVAL == 0 || finished == total_files
+                    {
+                        info!(
+                            "Bulk raw import summary: finished={finished}/{total_files}, imported_files={}, failed_files={}, deleted_files={}, channel_days={}, user_months={}",
+                            summary.files_imported,
+                            summary.files_failed,
+                            summary.files_deleted,
+                            all_channel_days.len(),
+                            all_user_months.len()
+                        );
+                    }
+                }
+                RawWorkerMessage::Failed {
+                    file_index,
+                    scanned_lines,
+                    candidate_lines,
+                    parse_errors,
+                    parse_skipped,
+                    error,
+                } => {
+                    finished += 1;
+                    let file = &files[file_index];
+                    let state = states
+                        .entry(file_index)
+                        .or_insert_with(RawFileImportState::default);
+                    state.scanned_lines = scanned_lines;
+                    state.candidate_lines = candidate_lines;
+                    state.parse_errors = parse_errors;
+                    state.parse_skipped = parse_skipped;
+                    if !state.affected_channel_days.is_empty() {
+                        merge_state_archives(store, state, file)?;
+                    }
+                    let failed_status = format!("failed:{error}");
+                    let _ = store.record_imported_raw_file(
+                        &file.path.to_string_lossy(),
+                        &file.fingerprint,
+                        &failed_status,
+                    );
+                    summary.files_failed += 1;
+                    warn!(
+                        "Failed bulk raw import for {} after scanning {} lines: {}",
+                        file.path.display(),
+                        state.scanned_lines,
+                        error
+                    );
+                }
+            }
+        }
+
+        summary.affected_channel_days = all_channel_days.len();
+        summary.affected_user_months = all_user_months.len();
+
+        for worker in workers {
+            let _ = worker.join();
+        }
+        Ok(())
     }
 
     fn delete_import_file_if_configured(&self, file: &ImportFile, is_raw: bool) -> bool {
@@ -721,6 +1016,79 @@ impl LegacyTxtRuntime {
     }
 }
 
+#[derive(Debug, Default)]
+struct BulkRawDiscovery {
+    files_scanned: usize,
+    raw_candidates: usize,
+    selected: Vec<ImportFile>,
+}
+
+fn default_bulk_raw_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(2)
+        .min(4)
+        .max(1)
+}
+
+fn accumulate_insert_outcome(state: &mut RawFileImportState, outcome: InsertEventsBatchOutcome) {
+    state.imported += outcome.inserted;
+    state.skipped_events += outcome.skipped;
+    state
+        .affected_channel_days
+        .extend(outcome.affected_channel_days);
+    state
+        .affected_user_months
+        .extend(outcome.affected_user_months);
+}
+
+fn merge_state_archives(
+    store: &Store,
+    state: &RawFileImportState,
+    file: &ImportFile,
+) -> Result<()> {
+    if state.affected_channel_days.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let day_keys = state
+        .affected_channel_days
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    info!(
+        "Merging {} affected channel-day archive(s) after importing {}",
+        day_keys.len(),
+        file.path.display()
+    );
+    store.merge_imported_channel_days_into_archives(&day_keys)?;
+    info!(
+        "Completed archive merge for {} in {:?}",
+        file.path.display(),
+        started.elapsed()
+    );
+    Ok(())
+}
+
+fn raw_import_worker_loop(
+    receiver: Arc<Mutex<Receiver<Option<(usize, ImportFile)>>>>,
+    sender: SyncSender<RawWorkerMessage>,
+) {
+    loop {
+        let received = {
+            let guard = receiver.lock().unwrap();
+            guard.recv()
+        };
+        let Ok(job) = received else {
+            return;
+        };
+        let Some((file_index, file)) = job else {
+            return;
+        };
+        let _ = parse_raw_file_into_chunks(file_index, &file, &sender);
+    }
+}
+
 fn import_kind_counts(files: &[ImportFile]) -> (usize, usize, usize) {
     let mut raw = 0usize;
     let mut simple = 0usize;
@@ -767,6 +1135,18 @@ fn classify_import_file(path: &Path) -> Result<Option<ImportKind>> {
     }
 }
 
+fn is_supported_raw_import_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".txt")
+        || name.ends_with(".txt.gz")
+        || name.ends_with(".log")
+        || name.ends_with(".log.gz")
+}
+
 fn raw_file_matches_channel(file: &ImportFile, channel_id: &str) -> bool {
     if let Some((matched_channel_id, _, _, _)) = infer_legacy_path_channel_day(&file.path) {
         if matched_channel_id == channel_id {
@@ -791,15 +1171,32 @@ fn raw_file_matches_channel(file: &ImportFile, channel_id: &str) -> bool {
 fn behaves_like_raw_irc_path(path: &Path) -> Result<bool> {
     let mut saw_supported = false;
     let mut saw_raw_line = false;
+    let mut inspected_lines = 0usize;
     for_each_line_in_supported_file(path, |line| {
+        inspected_lines += 1;
         let Some(raw) = extract_raw_irc_line(&line) else {
+            if inspected_lines >= 200 {
+                return Err(anyhow!("classification-limit"));
+            }
             return Ok(());
         };
         saw_raw_line = true;
         if let Ok(Some(_)) = CanonicalEvent::from_raw(&raw) {
             saw_supported = true;
+            return Err(anyhow!("classification-match"));
+        }
+        if inspected_lines >= 200 {
+            return Err(anyhow!("classification-limit"));
         }
         Ok(())
+    })
+    .or_else(|error| {
+        let marker = error.to_string();
+        if marker == "classification-match" || marker == "classification-limit" {
+            Ok(())
+        } else {
+            Err(error)
+        }
     })?;
     Ok(saw_raw_line && saw_supported)
 }
@@ -923,6 +1320,7 @@ fn import_raw_file_with_progress(
     let mut parse_errors = 0usize;
     let mut skipped_events = 0usize;
     let mut outcome = RawImportOutcome::default();
+    let mut batch = Vec::with_capacity(RAW_IMPORT_CHUNK_EVENTS);
     for_each_line_in_supported_file(&file.path, |line| {
         scanned_lines += 1;
         let Some(raw) = extract_raw_irc_line(&line) else {
@@ -943,11 +1341,18 @@ fn import_raw_file_with_progress(
         candidate_lines += 1;
         match CanonicalEvent::from_raw(&raw) {
             Ok(Some(event)) => {
-                if store.insert_event(&event)? {
-                    imported += 1;
-                    outcome.record_event(&event);
-                } else {
-                    skipped_events += 1;
+                batch.push(event);
+                if batch.len() >= RAW_IMPORT_CHUNK_EVENTS {
+                    let batch_outcome = store.insert_events_batch(&batch)?;
+                    imported += batch_outcome.inserted;
+                    skipped_events += batch_outcome.skipped;
+                    outcome
+                        .affected_channel_days
+                        .extend(batch_outcome.affected_channel_days);
+                    outcome
+                        .affected_user_months
+                        .extend(batch_outcome.affected_user_months);
+                    batch.clear();
                 }
             }
             Ok(None) => {
@@ -972,6 +1377,18 @@ fn import_raw_file_with_progress(
         Ok(())
     })?;
 
+    if !batch.is_empty() {
+        let batch_outcome = store.insert_events_batch(&batch)?;
+        imported += batch_outcome.inserted;
+        skipped_events += batch_outcome.skipped;
+        outcome
+            .affected_channel_days
+            .extend(batch_outcome.affected_channel_days);
+        outcome
+            .affected_user_months
+            .extend(batch_outcome.affected_user_months);
+    }
+
     let status = if imported > 0 { "imported" } else { "seen" };
     let completion_marker_started = Instant::now();
     info!(
@@ -994,6 +1411,100 @@ fn import_raw_file_with_progress(
         parse_errors
     );
     Ok(outcome)
+}
+
+fn parse_raw_file_into_chunks(
+    file_index: usize,
+    file: &ImportFile,
+    sender: &SyncSender<RawWorkerMessage>,
+) -> Result<()> {
+    let file_size = fs::metadata(&file.path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    info!(
+        "Worker parsing raw file {}: {} ({:.2} MiB)",
+        file_index + 1,
+        file.path.display(),
+        file_size as f64 / (1024.0 * 1024.0)
+    );
+
+    let mut scanned_lines = 0usize;
+    let mut candidate_lines = 0usize;
+    let mut parse_errors = 0usize;
+    let mut parse_skipped = 0usize;
+    let mut chunk = Vec::with_capacity(RAW_IMPORT_CHUNK_EVENTS);
+
+    let parse_result = for_each_line_in_supported_file(&file.path, |line| {
+        scanned_lines += 1;
+        let Some(raw) = extract_raw_irc_line(&line) else {
+            if scanned_lines % IMPORT_PROGRESS_LINE_INTERVAL == 0 {
+                let _ = sender.send(RawWorkerMessage::Progress(ParsedRawProgress {
+                    file_index,
+                    scanned_lines,
+                    candidate_lines,
+                    parse_errors,
+                    parse_skipped,
+                }));
+            }
+            return Ok(());
+        };
+
+        candidate_lines += 1;
+        match CanonicalEvent::from_raw(&raw) {
+            Ok(Some(event)) => {
+                chunk.push(event);
+                if chunk.len() >= RAW_IMPORT_CHUNK_EVENTS {
+                    sender.send(RawWorkerMessage::Chunk(ParsedRawChunk {
+                        file_index,
+                        events: std::mem::take(&mut chunk),
+                    }))?;
+                }
+            }
+            Ok(None) => parse_skipped += 1,
+            Err(_) => parse_errors += 1,
+        }
+
+        if scanned_lines % IMPORT_PROGRESS_LINE_INTERVAL == 0 {
+            let _ = sender.send(RawWorkerMessage::Progress(ParsedRawProgress {
+                file_index,
+                scanned_lines,
+                candidate_lines,
+                parse_errors,
+                parse_skipped,
+            }));
+        }
+        Ok(())
+    });
+
+    match parse_result {
+        Ok(()) => {
+            if !chunk.is_empty() {
+                sender.send(RawWorkerMessage::Chunk(ParsedRawChunk {
+                    file_index,
+                    events: chunk,
+                }))?;
+            }
+            let _ = sender.send(RawWorkerMessage::Finished {
+                file_index,
+                scanned_lines,
+                candidate_lines,
+                parse_errors,
+                parse_skipped,
+            });
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sender.send(RawWorkerMessage::Failed {
+                file_index,
+                scanned_lines,
+                candidate_lines,
+                parse_errors,
+                parse_skipped,
+                error: error.to_string(),
+            });
+            Ok(())
+        }
+    }
 }
 
 fn parse_sparse_txt_file(
@@ -1484,6 +1995,8 @@ mod tests {
         };
         let files = runtime.discover_import_files().unwrap();
         assert_eq!(files.len(), 1);
+        assert!(root.join("nested/empty/a/b").exists());
+        prune_empty_dirs(&root);
         assert!(!root.join("nested/empty/a/b").exists());
     }
 

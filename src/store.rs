@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread;
 use std::time::Instant;
 use std::{
     cell::Cell,
@@ -30,9 +32,9 @@ thread_local! {
 pub struct Store {
     db: Arc<Mutex<Connection>>,
     root_dir: PathBuf,
-    compression_quality: u32,
-    compression_lgwin: u32,
     archive_enabled: bool,
+    compression_executor: Arc<CompressionExecutor>,
+    compression_paths: Arc<CompressionPathLocks>,
 }
 
 struct StoreDbGuard<'a> {
@@ -69,6 +71,14 @@ pub struct RawResponsePlan {
     pub events: Vec<StoredEvent>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct InsertEventsBatchOutcome {
+    pub inserted: usize,
+    pub skipped: usize,
+    pub affected_channel_days: BTreeSet<ChannelDayKey>,
+    pub affected_user_months: BTreeSet<UserMonthKey>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReconciliationJob {
     pub id: i64,
@@ -96,6 +106,102 @@ pub struct ReconciliationOutcome {
     pub last_error: Option<String>,
 }
 
+impl CompressionExecutor {
+    fn new(worker_count: usize, quality: u32, lgwin: u32) -> Self {
+        let bounded = worker_count.max(1);
+        let (sender, receiver) = mpsc::sync_channel::<CompressionRequest>(bounded * 2);
+        let shared_receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..bounded {
+            let receiver = Arc::clone(&shared_receiver);
+            thread::Builder::new()
+                .name(format!("justlog-compress-{index}"))
+                .spawn(move || compression_worker_loop(receiver, quality, lgwin))
+                .expect("failed to spawn compression worker");
+        }
+        Self { sender }
+    }
+
+    fn submit(
+        &self,
+        temp_path: PathBuf,
+        raws: Vec<String>,
+    ) -> Receiver<Result<CompressionResult, String>> {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(CompressionRequest {
+                temp_path,
+                raws,
+                response: response_tx,
+            })
+            .expect("compression executor stopped unexpectedly");
+        response_rx
+    }
+}
+
+impl CompressionPathLocks {
+    fn acquire(self: &Arc<Self>, path: PathBuf) -> CompressionPathGuard {
+        let mut locked = self.paths.lock().unwrap();
+        while locked.contains(&path) {
+            locked = self.ready.wait(locked).unwrap();
+        }
+        locked.insert(path.clone());
+        CompressionPathGuard {
+            locks: Arc::clone(self),
+            path,
+        }
+    }
+}
+
+impl Drop for CompressionPathGuard {
+    fn drop(&mut self) {
+        let mut locked = self.locks.paths.lock().unwrap();
+        locked.remove(&self.path);
+        self.locks.ready.notify_all();
+    }
+}
+
+#[derive(Debug)]
+struct CompressionRequest {
+    temp_path: PathBuf,
+    raws: Vec<String>,
+    response: SyncSender<Result<CompressionResult, String>>,
+}
+
+#[derive(Debug)]
+struct CompressionResult {
+    temp_path: PathBuf,
+    output_bytes: u64,
+    elapsed: std::time::Duration,
+}
+
+#[derive(Debug)]
+struct CompressionExecutor {
+    sender: SyncSender<CompressionRequest>,
+}
+
+#[derive(Debug, Default)]
+struct CompressionPathLocks {
+    paths: Mutex<BTreeSet<PathBuf>>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct CompressionPathGuard {
+    locks: Arc<CompressionPathLocks>,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct PreparedSegmentWrite {
+    final_path: PathBuf,
+    relative_path: String,
+    line_count: usize,
+    start_ts: i64,
+    end_ts: i64,
+    response: Receiver<Result<CompressionResult, String>>,
+    _path_guard: CompressionPathGuard,
+}
+
 impl Store {
     fn lock_db(&self) -> StoreDbGuard<'_> {
         STORE_DB_LOCK_DEPTH.with(|depth| {
@@ -115,13 +221,18 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.busy_timeout(std::time::Duration::from_secs(30))?;
+        let compression_threads = read_max_compress_threads_from_env();
 
         let store = Self {
             db: Arc::new(Mutex::new(connection)),
             root_dir: config.logs_directory.clone(),
-            compression_quality: config.compression.quality,
-            compression_lgwin: config.compression.lgwin,
             archive_enabled: config.archive,
+            compression_executor: Arc::new(CompressionExecutor::new(
+                compression_threads,
+                config.compression.quality,
+                config.compression.lgwin,
+            )),
+            compression_paths: Arc::new(CompressionPathLocks::default()),
         };
         store.initialize()?;
         store.recover_pending_segments()?;
@@ -252,6 +363,60 @@ impl Store {
             ],
         )?;
         Ok(inserted > 0)
+    }
+
+    pub fn insert_events_batch(
+        &self,
+        events: &[CanonicalEvent],
+    ) -> Result<InsertEventsBatchOutcome> {
+        if events.is_empty() {
+            return Ok(InsertEventsBatchOutcome::default());
+        }
+
+        let mut db = self.lock_db();
+        let tx = db.transaction()?;
+        let mut statement = tx.prepare(
+            r#"
+            INSERT OR IGNORE INTO events(
+                event_uid, kind, room_id, channel_login, username, display_name, user_id,
+                target_user_id, text, system_text, raw, timestamp_unix, timestamp_rfc3339, tags_json
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+        )?;
+
+        let mut outcome = InsertEventsBatchOutcome::default();
+        for event in events {
+            let inserted = statement.execute(params![
+                event.event_uid,
+                event.kind,
+                event.room_id,
+                event.channel_login,
+                event.username,
+                event.display_name,
+                event.user_id,
+                event.target_user_id,
+                event.text,
+                event.system_text,
+                event.raw,
+                event.timestamp.timestamp(),
+                event.timestamp.to_rfc3339(),
+                serde_json::to_string(&event.tags)?
+            ])?;
+            if inserted > 0 {
+                outcome.inserted += 1;
+                outcome
+                    .affected_channel_days
+                    .insert(event.channel_day_key());
+                for key in event.user_month_keys() {
+                    outcome.affected_user_months.insert(key);
+                }
+            } else {
+                outcome.skipped += 1;
+            }
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok(outcome)
     }
 
     pub fn read_channel_logs(
@@ -462,14 +627,19 @@ impl Store {
         if !self.archive_enabled {
             return Ok(());
         }
-        for partition in
-            self.compactable_channel_days(now - Duration::days(compact_after_channel_days))?
-        {
-            self.compact_channel_partition(&partition.key)?;
-        }
-        for partition in self.compactable_user_months(now, compact_after_user_months)? {
-            self.compact_user_partition(&partition.key)?;
-        }
+        let channel_keys = self
+            .compactable_channel_days(now - Duration::days(compact_after_channel_days))?
+            .into_iter()
+            .map(|partition| partition.key)
+            .collect::<Vec<_>>();
+        self.compact_channel_partitions_parallel(&channel_keys)?;
+
+        let user_keys = self
+            .compactable_user_months(now, compact_after_user_months)?
+            .into_iter()
+            .map(|partition| partition.key)
+            .collect::<Vec<_>>();
+        self.compact_user_partitions_parallel(&user_keys)?;
         Ok(())
     }
 
@@ -480,9 +650,7 @@ impl Store {
         if !self.archive_enabled {
             return Ok(());
         }
-        for key in day_keys {
-            self.merge_imported_channel_day_into_archives(key)?;
-        }
+        self.merge_imported_channel_days_into_archives_parallel(day_keys)?;
         Ok(())
     }
 
@@ -721,58 +889,14 @@ impl Store {
         );
         let temp_path = self.root_dir.join(format!("{relative}.tmp"));
         let final_path = self.root_dir.join(&relative);
-        self.write_pending_segment(
-            "channel",
-            &key.channel_id,
-            None,
-            key.year,
-            key.month,
-            Some(key.day),
-            &temp_path,
-            &final_path,
-        )?;
-        self.write_segment_file(&final_path, &temp_path, &events)?;
-        let mut db = self.lock_db();
-        let tx = db.transaction()?;
-        tx.execute(
-            r#"
-            INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
-            VALUES('channel', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'brotli', 1)
-            "#,
-            params![
-                key.channel_id,
-                key.year,
-                key.month,
-                key.day,
-                relative,
-                events.len() as i64,
-                events.first().map(|event| event.timestamp.timestamp()).unwrap_or_default(),
-                events.last().map(|event| event.timestamp.timestamp()).unwrap_or_default(),
-            ],
-        )?;
-        tx.execute(
-            r#"
-            DELETE FROM events
-            WHERE room_id = ?1
-              AND strftime('%Y', timestamp_rfc3339) = printf('%04d', ?2)
-              AND strftime('%m', timestamp_rfc3339) = printf('%02d', ?3)
-              AND strftime('%d', timestamp_rfc3339) = printf('%02d', ?4)
-            "#,
-            params![key.channel_id, key.year, key.month, key.day],
-        )?;
-        tx.execute(
-            "DELETE FROM pending_segments WHERE final_path = ?1",
-            params![relative],
-        )?;
-        tx.commit()?;
-        drop(db);
-        self.schedule_reconciliation(
+        let prepared = self.prepare_segment_write(&final_path, &temp_path, &events)?;
+        self.install_channel_segment_write(
+            prepared,
             &key.channel_id,
             key.year,
             key.month,
             key.day,
             &relative,
-            Utc::now() + Duration::seconds(RECONCILIATION_DELAY_SECONDS),
         )?;
         Ok(())
     }
@@ -789,50 +913,15 @@ impl Store {
         );
         let temp_path = self.root_dir.join(format!("{relative}.tmp"));
         let final_path = self.root_dir.join(&relative);
-        self.write_pending_segment(
-            "user",
+        let prepared = self.prepare_segment_write(&final_path, &temp_path, &events)?;
+        self.install_user_segment_write(
+            prepared,
             &key.channel_id,
-            Some(&key.user_id),
+            &key.user_id,
             key.year,
             key.month,
-            None,
-            &temp_path,
-            &final_path,
+            &relative,
         )?;
-        self.write_segment_file(&final_path, &temp_path, &events)?;
-        let mut db = self.lock_db();
-        let tx = db.transaction()?;
-        tx.execute(
-            r#"
-            INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
-            VALUES('user', ?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, 'brotli', 1)
-            "#,
-            params![
-                key.channel_id,
-                key.user_id,
-                key.year,
-                key.month,
-                relative,
-                events.len() as i64,
-                events.first().map(|event| event.timestamp.timestamp()).unwrap_or_default(),
-                events.last().map(|event| event.timestamp.timestamp()).unwrap_or_default(),
-            ],
-        )?;
-        tx.execute(
-            r#"
-            DELETE FROM events
-            WHERE room_id = ?1
-              AND (user_id = ?2 OR target_user_id = ?2)
-              AND strftime('%Y', timestamp_rfc3339) = printf('%04d', ?3)
-              AND strftime('%m', timestamp_rfc3339) = printf('%02d', ?4)
-            "#,
-            params![key.channel_id, key.user_id, key.year, key.month],
-        )?;
-        tx.execute(
-            "DELETE FROM pending_segments WHERE final_path = ?1",
-            params![relative],
-        )?;
-        tx.commit()?;
         Ok(())
     }
 
@@ -877,26 +966,165 @@ impl Store {
         temp_path: &Path,
         events: &[StoredEvent],
     ) -> Result<()> {
+        let prepared = self.prepare_segment_write(final_path, temp_path, events)?;
+        self.finish_segment_write(prepared)
+    }
+
+    fn prepare_segment_write(
+        &self,
+        final_path: &Path,
+        temp_path: &Path,
+        events: &[StoredEvent],
+    ) -> Result<PreparedSegmentWrite> {
+        let path_guard = self.compression_paths.acquire(final_path.to_path_buf());
         if let Some(parent) = temp_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = File::create(temp_path)?;
-        let mut writer = CompressorWriter::new(
-            file,
-            64 * 1024,
-            self.compression_quality,
-            self.compression_lgwin,
+        let raws = events
+            .iter()
+            .map(|event| event.raw.clone())
+            .collect::<Vec<_>>();
+        let line_count = events.len();
+        let start_ts = events
+            .first()
+            .map(|event| event.timestamp.timestamp())
+            .unwrap_or_default();
+        let end_ts = events
+            .last()
+            .map(|event| event.timestamp.timestamp())
+            .unwrap_or_default();
+        let response = self
+            .compression_executor
+            .submit(temp_path.to_path_buf(), raws);
+        tracing::info!(
+            "Compression job queued: target={}, lines={}",
+            final_path.display(),
+            line_count
         );
-        for event in events {
-            writer.write_all(event.raw.as_bytes())?;
-            writer.write_all(b"\n")?;
+        Ok(PreparedSegmentWrite {
+            final_path: final_path.to_path_buf(),
+            relative_path: final_path
+                .strip_prefix(&self.root_dir)
+                .unwrap_or(final_path)
+                .to_string_lossy()
+                .to_string(),
+            line_count,
+            start_ts,
+            end_ts,
+            response,
+            _path_guard: path_guard,
+        })
+    }
+
+    fn finish_segment_write(&self, prepared: PreparedSegmentWrite) -> Result<()> {
+        let result = prepared
+            .response
+            .recv()
+            .map_err(|_| anyhow!("compression worker stopped unexpectedly"))?
+            .map_err(|error| anyhow!(error))?;
+        tracing::info!(
+            "Compression install started: target={}, bytes={}, elapsed={:?}",
+            prepared.relative_path,
+            result.output_bytes,
+            result.elapsed
+        );
+        if prepared.final_path.exists() {
+            fs::remove_file(&prepared.final_path)?;
         }
-        writer.flush()?;
-        drop(writer);
-        if final_path.exists() {
-            fs::remove_file(final_path)?;
-        }
-        fs::rename(temp_path, final_path)?;
+        fs::rename(&result.temp_path, &prepared.final_path)?;
+        tracing::info!(
+            "Compression install completed: target={}",
+            prepared.relative_path
+        );
+        Ok(())
+    }
+
+    fn install_channel_segment_write(
+        &self,
+        prepared: PreparedSegmentWrite,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+        relative: &str,
+    ) -> Result<()> {
+        let line_count = prepared.line_count;
+        let start_ts = prepared.start_ts;
+        let end_ts = prepared.end_ts;
+        self.finish_segment_write(prepared)?;
+        let mut db = self.lock_db();
+        let tx = db.transaction()?;
+        tx.execute(
+            r#"
+            INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
+            VALUES('channel', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'brotli', 1)
+            "#,
+            params![channel_id, year, month, day, relative, line_count as i64, start_ts, end_ts],
+        )?;
+        tx.execute(
+            r#"
+            DELETE FROM events
+            WHERE room_id = ?1
+              AND strftime('%Y', timestamp_rfc3339) = printf('%04d', ?2)
+              AND strftime('%m', timestamp_rfc3339) = printf('%02d', ?3)
+              AND strftime('%d', timestamp_rfc3339) = printf('%02d', ?4)
+            "#,
+            params![channel_id, year, month, day],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_segments WHERE final_path = ?1",
+            params![relative],
+        )?;
+        tx.commit()?;
+        drop(db);
+        self.schedule_reconciliation(
+            channel_id,
+            year,
+            month,
+            day,
+            relative,
+            Utc::now() + Duration::seconds(RECONCILIATION_DELAY_SECONDS),
+        )?;
+        Ok(())
+    }
+
+    fn install_user_segment_write(
+        &self,
+        prepared: PreparedSegmentWrite,
+        channel_id: &str,
+        user_id: &str,
+        year: i32,
+        month: u32,
+        relative: &str,
+    ) -> Result<()> {
+        let line_count = prepared.line_count;
+        let start_ts = prepared.start_ts;
+        let end_ts = prepared.end_ts;
+        self.finish_segment_write(prepared)?;
+        let mut db = self.lock_db();
+        let tx = db.transaction()?;
+        tx.execute(
+            r#"
+            INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
+            VALUES('user', ?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, 'brotli', 1)
+            "#,
+            params![channel_id, user_id, year, month, relative, line_count as i64, start_ts, end_ts],
+        )?;
+        tx.execute(
+            r#"
+            DELETE FROM events
+            WHERE room_id = ?1
+              AND (user_id = ?2 OR target_user_id = ?2)
+              AND strftime('%Y', timestamp_rfc3339) = printf('%04d', ?3)
+              AND strftime('%m', timestamp_rfc3339) = printf('%02d', ?4)
+            "#,
+            params![channel_id, user_id, year, month],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_segments WHERE final_path = ?1",
+            params![relative],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1171,74 +1399,148 @@ impl Store {
         Ok(relative)
     }
 
-    fn merge_imported_channel_day_into_archives(&self, key: &ChannelDayKey) -> Result<()> {
-        let mut day_events =
-            self.read_channel_logs(&key.channel_id, key.year, key.month, key.day)?;
-        if day_events.is_empty() {
-            return Ok(());
-        }
-        dedupe_and_sort_stored_events(&mut day_events);
-        self.replace_or_create_channel_segment(
-            &key.channel_id,
-            key.year,
-            key.month,
-            key.day,
-            &day_events,
-        )?;
-
-        let db = self.lock_db();
-        db.execute(
-            r#"
-            DELETE FROM events
-            WHERE room_id = ?1
-              AND strftime('%Y', timestamp_rfc3339) = printf('%04d', ?2)
-              AND strftime('%m', timestamp_rfc3339) = printf('%02d', ?3)
-              AND strftime('%d', timestamp_rfc3339) = printf('%02d', ?4)
-            "#,
-            params![key.channel_id, key.year, key.month, key.day],
-        )?;
-        drop(db);
-
-        let mut user_months = BTreeSet::new();
-        for event in &day_events {
-            if let Some(user_id) = event.user_id.clone() {
-                user_months.insert(UserMonthKey {
-                    channel_id: event.room_id.clone(),
-                    user_id,
-                    year: event.timestamp.year(),
-                    month: event.timestamp.month(),
-                });
-            }
-            if let Some(user_id) = event.target_user_id.clone() {
-                user_months.insert(UserMonthKey {
-                    channel_id: event.room_id.clone(),
-                    user_id,
-                    year: event.timestamp.year(),
-                    month: event.timestamp.month(),
-                });
-            }
-        }
-
-        for user_key in user_months {
-            let mut month_events = self.read_user_logs(
-                &user_key.channel_id,
-                &user_key.user_id,
-                user_key.year,
-                user_key.month,
-            )?;
-            if month_events.is_empty() {
+    fn merge_imported_channel_days_into_archives_parallel(
+        &self,
+        day_keys: &[ChannelDayKey],
+    ) -> Result<()> {
+        let mut prepared_days = Vec::new();
+        for key in day_keys {
+            let mut day_events =
+                self.read_channel_logs(&key.channel_id, key.year, key.month, key.day)?;
+            if day_events.is_empty() {
                 continue;
             }
-            dedupe_and_sort_stored_events(&mut month_events);
-            self.replace_or_create_user_segment(
-                &user_key.channel_id,
-                &user_key.user_id,
-                user_key.year,
-                user_key.month,
-                &month_events,
+            dedupe_and_sort_stored_events(&mut day_events);
+            let relative = format!(
+                "segments/channel/{}/{}/{}/{}.br",
+                key.channel_id, key.year, key.month, key.day
+            );
+            let final_path = self.root_dir.join(&relative);
+            let temp_path = self.root_dir.join(format!("{relative}.repair.tmp"));
+            self.write_pending_segment(
+                "channel",
+                &key.channel_id,
+                None,
+                key.year,
+                key.month,
+                Some(key.day),
+                &temp_path,
+                &final_path,
             )?;
+            let prepared = self.prepare_segment_write(&final_path, &temp_path, &day_events)?;
+            prepared_days.push((key.clone(), relative, day_events, prepared));
         }
 
+        let mut user_months = BTreeSet::new();
+        for (key, relative, day_events, prepared) in prepared_days {
+            self.install_channel_segment_write(
+                prepared,
+                &key.channel_id,
+                key.year,
+                key.month,
+                key.day,
+                &relative,
+            )?;
+            for event in &day_events {
+                if let Some(user_id) = event.user_id.clone() {
+                    user_months.insert(UserMonthKey {
+                        channel_id: event.room_id.clone(),
+                        user_id,
+                        year: event.timestamp.year(),
+                        month: event.timestamp.month(),
+                    });
+                }
+                if let Some(user_id) = event.target_user_id.clone() {
+                    user_months.insert(UserMonthKey {
+                        channel_id: event.room_id.clone(),
+                        user_id,
+                        year: event.timestamp.year(),
+                        month: event.timestamp.month(),
+                    });
+                }
+            }
+        }
+
+        self.compact_user_partitions_parallel(&user_months.into_iter().collect::<Vec<_>>())
+    }
+
+    fn compact_channel_partitions_parallel(&self, keys: &[ChannelDayKey]) -> Result<()> {
+        let mut prepared = Vec::new();
+        for key in keys {
+            let events =
+                self.read_hot_channel_events(&key.channel_id, key.year, key.month, key.day)?;
+            if events.is_empty() {
+                continue;
+            }
+            let relative = format!(
+                "segments/channel/{}/{}/{}/{}.br",
+                key.channel_id, key.year, key.month, key.day
+            );
+            let temp_path = self.root_dir.join(format!("{relative}.tmp"));
+            let final_path = self.root_dir.join(&relative);
+            self.write_pending_segment(
+                "channel",
+                &key.channel_id,
+                None,
+                key.year,
+                key.month,
+                Some(key.day),
+                &temp_path,
+                &final_path,
+            )?;
+            let prepared_write = self.prepare_segment_write(&final_path, &temp_path, &events)?;
+            prepared.push((key.clone(), relative, prepared_write));
+        }
+        for (key, relative, prepared_write) in prepared {
+            self.install_channel_segment_write(
+                prepared_write,
+                &key.channel_id,
+                key.year,
+                key.month,
+                key.day,
+                &relative,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn compact_user_partitions_parallel(&self, keys: &[UserMonthKey]) -> Result<()> {
+        let mut prepared = Vec::new();
+        for key in keys {
+            let events =
+                self.read_hot_user_events(&key.channel_id, &key.user_id, key.year, key.month)?;
+            if events.is_empty() {
+                continue;
+            }
+            let relative = format!(
+                "segments/user/{}/{}/{}/{}.br",
+                key.channel_id, key.user_id, key.year, key.month
+            );
+            let temp_path = self.root_dir.join(format!("{relative}.tmp"));
+            let final_path = self.root_dir.join(&relative);
+            self.write_pending_segment(
+                "user",
+                &key.channel_id,
+                Some(&key.user_id),
+                key.year,
+                key.month,
+                None,
+                &temp_path,
+                &final_path,
+            )?;
+            let prepared_write = self.prepare_segment_write(&final_path, &temp_path, &events)?;
+            prepared.push((key.clone(), relative, prepared_write));
+        }
+        for (key, relative, prepared_write) in prepared {
+            self.install_user_segment_write(
+                prepared_write,
+                &key.channel_id,
+                &key.user_id,
+                key.year,
+                key.month,
+                &relative,
+            )?;
+        }
         Ok(())
     }
 
@@ -1610,6 +1912,86 @@ fn dedupe_and_sort_stored_events(events: &mut Vec<StoredEvent>) {
     }
 }
 
+fn read_max_compress_threads_from_env() -> usize {
+    std::env::var("JUSTLOG_IMPORT_MAX_COMPRESS_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(default_max_compress_threads)
+}
+
+fn default_max_compress_threads() -> usize {
+    thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(2)
+        .min(4)
+        .max(1)
+}
+
+fn compression_worker_loop(
+    receiver: Arc<Mutex<Receiver<CompressionRequest>>>,
+    quality: u32,
+    lgwin: u32,
+) {
+    loop {
+        let request = {
+            let guard = receiver.lock().unwrap();
+            guard.recv()
+        };
+        let Ok(request) = request else {
+            return;
+        };
+        let started = Instant::now();
+        tracing::info!(
+            "Compression job started: target={}, lines={}",
+            request.temp_path.display(),
+            request.raws.len()
+        );
+        let result =
+            write_compressed_segment_file(&request.temp_path, &request.raws, quality, lgwin)
+                .map(|output_bytes| CompressionResult {
+                    temp_path: request.temp_path.clone(),
+                    output_bytes,
+                    elapsed: started.elapsed(),
+                })
+                .map_err(|error| error.to_string());
+        match &result {
+            Ok(done) => tracing::info!(
+                "Compression job completed: target={}, bytes={}, elapsed={:?}",
+                done.temp_path.display(),
+                done.output_bytes,
+                done.elapsed
+            ),
+            Err(error) => tracing::warn!(
+                "Compression job failed: target={}, error={}",
+                request.temp_path.display(),
+                error
+            ),
+        }
+        let _ = request.response.send(result);
+    }
+}
+
+fn write_compressed_segment_file(
+    temp_path: &Path,
+    raws: &[String],
+    quality: u32,
+    lgwin: u32,
+) -> Result<u64> {
+    if let Some(parent) = temp_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(temp_path)?;
+    let mut writer = CompressorWriter::new(file, 64 * 1024, quality, lgwin);
+    for raw in raws {
+        writer.write_all(raw.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    drop(writer);
+    Ok(fs::metadata(temp_path)?.len())
+}
+
 fn choose_random(events: Vec<StoredEvent>) -> Result<Option<StoredEvent>> {
     if events.is_empty() {
         return Ok(None);
@@ -1784,9 +2166,9 @@ mod tests {
         let store = Store {
             db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             root_dir: PathBuf::new(),
-            compression_quality: 5,
-            compression_lgwin: 22,
             archive_enabled: false,
+            compression_executor: Arc::new(CompressionExecutor::new(1, 5, 22)),
+            compression_paths: Arc::new(CompressionPathLocks::default()),
         };
 
         let _outer = store.lock_db();

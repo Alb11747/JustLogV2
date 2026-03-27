@@ -55,6 +55,7 @@ Supported env flags:
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=0|1`: delete raw IRC source files that are already marked current in native storage. Default is `1`.
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`: delete reconstructed TXT / JSON source files after they are successfully consumed on read.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=0|1`: delete reconstructed TXT / JSON source files that are already marked consumed with the same fingerprint. Default is `0`.
+- `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS=<n>`: global cap for concurrent archive compression jobs. Default is `min(available_parallelism, 4)`.
 
 Behavior summary:
 
@@ -150,6 +151,7 @@ Large import folders are handled incrementally:
 - Raw IRC imports are streamed line-by-line instead of loading full files into memory.
 - The importer logs start, periodic progress, and completion summaries through normal tracing output.
 - Progress logs are emitted every `100000` scanned lines for long-running raw imports.
+- Archive compression now runs in parallel across independent segment files, capped by `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS`.
 - Raw-file bookkeeping records an `importing` state before work starts and only marks a file complete when it finishes.
 - If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request.
 - Re-importing an already completed raw file is skipped when its fingerprint is unchanged.
@@ -170,6 +172,7 @@ Useful signals:
 - `Checking raw import status for ...` without a matching `Completed raw import status check for ...` points at store lock contention before the actual file import starts.
 - `Starting raw import scan for ...` means preflight completed and the request is inside the file import loop.
 - `Completed raw import ...` plus `Deleted consumed import file ...` confirms the import and delete-after-success path both finished.
+- `Compression job queued ...`, `Compression job started ...`, `Compression job completed ...`, and `Compression install completed ...` show the archive compression lifecycle after raw import or compaction.
 - `Parsed log request ...`, `Completed opt-out checks ...`, `Completed trusted fallback check ...`, and `Entering dated_response ...` show whether a request is stalling before the importer starts.
 
 One real failure pattern in this repo was a self-deadlock in the background compactor. The compactor held the `Store` SQLite mutex while asking the store another question that also tried to lock the same mutex. That blocked request-time calls such as `imported_raw_file_is_current(...)`, which made log routes appear to hang in the import layer even though the real owner was background compaction.

@@ -164,6 +164,7 @@ Supported flags:
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=0|1`
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=0|1`
+- `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS=<n>`
 
 Behavior summary:
 
@@ -176,6 +177,7 @@ Behavior summary:
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1` also removes raw source files whose path and fingerprint are already marked current in SQLite. This defaults to on.
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` removes successfully consumed reconstructed TXT / JSON files.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1` also removes reconstructed TXT / JSON files whose path and fingerprint are already marked consumed in SQLite. This defaults to off.
+- `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS` caps concurrent archive compression jobs globally for import merges and background compaction. Default is `min(available_parallelism, 4)`.
 
 ## Ingestion Pipeline
 
@@ -406,7 +408,7 @@ If multiple matching files exist, imported and reconstructed messages are stable
 
 For large migrations, `POST /admin/import/raw` is the preferred path. It reuses the same raw-file classification, imports raw IRC files in bulk, merges affected channel-day archives immediately, refreshes related user-month archives, and returns a summary JSON payload.
 
-For large import folders, raw IRC imports are streamed line-by-line instead of buffering full files in memory. The module logs start, periodic progress, and completion summaries through tracing, writes an `importing` status before each raw-file import begins, and only treats a file as current when its fingerprint matches a terminal status (`imported` or `seen`). If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request. When the delete flags are enabled, consumed files are removed after successful raw import, already-current raw files can also be removed during preflight, and reconstructed files are removed after successful overlay parsing, then empty parent directories are pruned.
+For large import folders, raw IRC imports are streamed line-by-line instead of buffering full files in memory. The module logs start, periodic progress, and completion summaries through tracing, writes an `importing` status before each raw-file import begins, and only treats a file as current when its fingerprint matches a terminal status (`imported` or `seen`). If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request. Archive compression for imported-day merges and background compaction now runs in parallel across independent segment files, capped by `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS`. When the delete flags are enabled, consumed files are removed after successful raw import, already-current raw files can also be removed during preflight, and reconstructed files are removed after successful overlay parsing, then empty parent directories are pruned.
 
 Whenever the import folder is checked, the module also prunes empty directories below that root and removes empty parent layers upward when possible.
 
