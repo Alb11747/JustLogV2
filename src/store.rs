@@ -1,8 +1,12 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
+use std::{
+    cell::Cell,
+    ops::{Deref, DerefMut},
+};
 
 use anyhow::{Context, Result, anyhow};
 use brotli::{CompressorWriter, Decompressor};
@@ -17,6 +21,10 @@ use crate::model::{
     StoredEvent, UserLogFile, UserMonthKey, UserPartitionSummary,
 };
 
+thread_local! {
+    static STORE_DB_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Mutex<Connection>>,
@@ -24,6 +32,34 @@ pub struct Store {
     compression_quality: u32,
     compression_lgwin: u32,
     archive_enabled: bool,
+}
+
+struct StoreDbGuard<'a> {
+    guard: MutexGuard<'a, Connection>,
+}
+
+impl Deref for StoreDbGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for StoreDbGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for StoreDbGuard<'_> {
+    fn drop(&mut self) {
+        STORE_DB_LOCK_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "store db lock depth underflow");
+            depth.set(current.saturating_sub(1));
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +96,18 @@ pub struct ReconciliationOutcome {
 }
 
 impl Store {
+    fn lock_db(&self) -> StoreDbGuard<'_> {
+        STORE_DB_LOCK_DEPTH.with(|depth| {
+            assert!(
+                depth.get() == 0,
+                "re-entrant Store DB lock on the same thread; drop the outer db guard before calling another Store method"
+            );
+        });
+        let guard = self.db.lock().unwrap();
+        STORE_DB_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        StoreDbGuard { guard }
+    }
+
     pub fn open(config: &Config) -> Result<Self> {
         fs::create_dir_all(&config.logs_directory)?;
         let connection = Connection::open(&config.storage.sqlite_path)?;
@@ -80,7 +128,7 @@ impl Store {
     }
 
     fn initialize(&self) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS events (
@@ -170,7 +218,7 @@ impl Store {
     }
 
     pub fn insert_event(&self, event: &CanonicalEvent) -> Result<bool> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let inserted = db.execute(
             r#"
             INSERT OR IGNORE INTO events(
@@ -294,7 +342,7 @@ impl Store {
         channel_id: &str,
         user_id: &str,
     ) -> Result<Vec<UserLogFile>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut statement = db.prepare(
             r#"
             SELECT DISTINCT year, month FROM (
@@ -320,7 +368,7 @@ impl Store {
     }
 
     pub fn get_available_logs_for_channel(&self, channel_id: &str) -> Result<Vec<ChannelLogFile>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut statement = db.prepare(
             r#"
             SELECT DISTINCT year, month, day FROM (
@@ -375,7 +423,7 @@ impl Store {
 
     pub fn recover_pending_segments(&self) -> Result<()> {
         let pending = {
-            let db = self.db.lock().unwrap();
+            let db = self.lock_db();
             let mut statement = db.prepare(
                 "SELECT id, temp_path, final_path FROM pending_segments ORDER BY id ASC",
             )?;
@@ -388,7 +436,7 @@ impl Store {
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         for (id, temp_path, final_path) in pending {
             let _ = fs::remove_file(self.root_dir.join(&temp_path));
             let _ = fs::remove_file(self.root_dir.join(&final_path));
@@ -418,13 +466,13 @@ impl Store {
     }
 
     pub fn event_count(&self) -> Result<i64> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         Ok(db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
     }
 
     pub fn imported_raw_file_is_current(&self, path: &str, fingerprint: &str) -> Result<bool> {
         let lock_started = Instant::now();
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let lock_elapsed = lock_started.elapsed();
         let stored = db
             .query_row(
@@ -454,7 +502,7 @@ impl Store {
         status: &str,
     ) -> Result<()> {
         let lock_started = Instant::now();
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let lock_elapsed = lock_started.elapsed();
         db.execute(
             r#"
@@ -482,7 +530,7 @@ impl Store {
         &self,
         threshold: DateTime<Utc>,
     ) -> Result<Vec<ChannelPartitionSummary>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut statement = db.prepare(
             r#"
             SELECT room_id,
@@ -532,7 +580,7 @@ impl Store {
         compact_after_user_months: i64,
     ) -> Result<Vec<UserPartitionSummary>> {
         let cutoff = now - Duration::days(31 * compact_after_user_months);
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut statement = db.prepare(
             r#"
             SELECT room_id, user_ref,
@@ -603,7 +651,7 @@ impl Store {
             &final_path,
         )?;
         self.write_segment_file(&final_path, &temp_path, &events)?;
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.lock_db();
         let tx = db.transaction()?;
         tx.execute(
             r#"
@@ -671,7 +719,7 @@ impl Store {
             &final_path,
         )?;
         self.write_segment_file(&final_path, &temp_path, &events)?;
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.lock_db();
         let tx = db.transaction()?;
         tx.execute(
             r#"
@@ -731,7 +779,7 @@ impl Store {
             .unwrap_or(final_path)
             .to_string_lossy()
             .to_string();
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.execute(
             r#"
             INSERT INTO pending_segments(scope, channel_id, user_id, year, month, day, temp_path, final_path)
@@ -780,7 +828,7 @@ impl Store {
         segment_path: &str,
         scheduled_at: DateTime<Utc>,
     ) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.execute(
             r#"
             INSERT INTO reconciliation_jobs(
@@ -811,7 +859,7 @@ impl Store {
     }
 
     pub fn due_reconciliation_jobs(&self, now: DateTime<Utc>) -> Result<Vec<ReconciliationJob>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut statement = db.prepare(
             r#"
             SELECT id, channel_id, year, month, day, segment_path, scheduled_at, checked_at,
@@ -831,7 +879,7 @@ impl Store {
         job: &ReconciliationJob,
         outcome: &ReconciliationOutcome,
     ) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.execute(
             r#"
             UPDATE reconciliation_jobs
@@ -865,7 +913,7 @@ impl Store {
         segment_path: &str,
         outcome: &ReconciliationOutcome,
     ) -> Result<()> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.execute(
             r#"
             INSERT INTO reconciliation_jobs(
@@ -920,7 +968,7 @@ impl Store {
         month: u32,
         day: u32,
     ) -> Result<bool> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let unhealthy = db
             .query_row(
                 r#"
@@ -949,7 +997,7 @@ impl Store {
         let final_path = self.root_dir.join(&segment.path);
         let temp_path = self.root_dir.join(format!("{}.repair.tmp", segment.path));
         self.write_segment_file(&final_path, &temp_path, events)?;
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.execute(
             r#"
             UPDATE segments
@@ -987,7 +1035,7 @@ impl Store {
         let final_path = self.root_dir.join(&relative);
         let temp_path = self.root_dir.join(format!("{}.repair.tmp", relative));
         self.write_segment_file(&final_path, &temp_path, events)?;
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.execute(
             r#"
             INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
@@ -1022,7 +1070,7 @@ impl Store {
         let final_path = self.root_dir.join(&relative);
         let temp_path = self.root_dir.join(format!("{}.repair.tmp", relative));
         self.write_segment_file(&final_path, &temp_path, events)?;
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.execute(
             r#"
             INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
@@ -1090,7 +1138,7 @@ impl Store {
         month: u32,
         day: u32,
     ) -> Result<Option<SegmentRecord>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.query_row(
             r#"
             SELECT id, scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw
@@ -1111,7 +1159,7 @@ impl Store {
         year: i32,
         month: u32,
     ) -> Result<Option<SegmentRecord>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         db.query_row(
             r#"
             SELECT id, scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw
@@ -1162,7 +1210,7 @@ impl Store {
         month: u32,
     ) -> Result<Vec<StoredEvent>> {
         let mut events = Vec::new();
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut statement = db.prepare(
             r#"
             SELECT id, scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw
@@ -1247,7 +1295,7 @@ impl Store {
         month: u32,
         day: u32,
     ) -> Result<Vec<StoredEvent>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut statement = db.prepare(
             r#"
             SELECT seq, event_uid, room_id, channel_login, username, display_name, user_id, target_user_id,
@@ -1272,7 +1320,7 @@ impl Store {
         year: i32,
         month: u32,
     ) -> Result<Vec<StoredEvent>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut statement = db.prepare(
             r#"
             SELECT seq, event_uid, room_id, channel_login, username, display_name, user_id, target_user_id,
@@ -1323,7 +1371,7 @@ impl Store {
         start: Option<DateTime<Utc>>,
         channel_id: Option<&str>,
     ) -> Result<Vec<SegmentRecord>> {
-        let db = self.db.lock().unwrap();
+        let db = self.lock_db();
         let mut rows = Vec::new();
         if let Some(start) = start {
             if let Some(channel_id) = channel_id {
@@ -1561,4 +1609,26 @@ pub fn load_lines_from_text_file(path: &Path) -> Result<Vec<String>> {
         .lines()
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|error| anyhow!(error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(
+        expected = "re-entrant Store DB lock on the same thread; drop the outer db guard before calling another Store method"
+    )]
+    fn nested_db_lock_panics_instead_of_deadlocking() {
+        let store = Store {
+            db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            root_dir: PathBuf::new(),
+            compression_quality: 5,
+            compression_lgwin: 22,
+            archive_enabled: false,
+        };
+
+        let _outer = store.lock_db();
+        let _inner = store.lock_db();
+    }
 }

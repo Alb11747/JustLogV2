@@ -242,6 +242,11 @@ The store uses:
 - full sync mode
 - indexes by channel/time and user/time
 - `INSERT OR IGNORE` on `event_uid` to avoid duplicates
+- a single process-local `Arc<Mutex<rusqlite::Connection>>` shared by reads, writes, compaction, import bookkeeping, and reconciliation metadata
+
+Because the store uses one non-reentrant mutex around the SQLite connection, store methods must not call other store methods that also lock `self.db` while the first guard is still alive. If a method needs a follow-up store lookup after collecting query rows, it must drop the active `Statement` and mutex guard first.
+
+This is not hypothetical. A production HTTP/import stall on March 27, 2026 was caused by the compactor holding the DB mutex in `compactable_channel_days()` and `compactable_user_months()` while calling `segment_for_channel_day()` / `segment_for_user_month()`, which attempted to lock the same mutex again. The visible symptom was hanging request-time raw-import bookkeeping in `legacy_txt`, even though the true owner was background compaction.
 
 Reconstructed import-folder overlays do not enter SQLite hot storage. Raw IRC files from the import folder can be imported into SQLite because they already carry stable native message identities.
 
@@ -274,6 +279,13 @@ The compactor periodically:
 - writes a `.br` segment file
 - records segment metadata
 - deletes compacted rows from the `events` table
+
+Implementation guardrail:
+
+- treat `src/store.rs` methods as lock-scoped units of work
+- do not call `segment_for_*`, `read_*`, or other `Store` helpers from inside a block that still holds `let db = self.db.lock().unwrap()`
+- if a method needs two phases, collect rows first, then explicitly `drop(statement)` and `drop(db)` before phase two
+- when adding loops over query results, be careful that `query_map(...)` and prepared statements can keep the lock alive longer than expected
 
 If a channel-day query requests `raw` output and the entire partition is already archived with passthrough enabled, the API can stream the Brotli file directly without reconstructing the response.
 
@@ -391,6 +403,11 @@ If multiple matching files exist, imported and reconstructed messages are stable
 For large import folders, raw IRC imports are streamed line-by-line instead of buffering full files in memory. The module logs start, periodic progress, and completion summaries through tracing, writes an `importing` status before each raw-file import begins, and only treats a file as current when its fingerprint matches a terminal status (`imported` or `seen`). If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request. When the delete flags are enabled, consumed files are removed after successful raw import or successful reconstructed parsing, then empty parent directories are pruned.
 
 Whenever the import folder is checked, the module also prunes empty directories below that root and removes empty parent layers upward when possible.
+
+Debugging note:
+
+- if request logs reach `Checking raw import status for ...` but not `Completed raw import status check for ...`, the importer is usually waiting on the store mutex rather than parsing a file
+- in that situation, inspect `src/compact.rs`, reconciliation work, and any recent `src/store.rs` changes before assuming the raw importer is the root cause
 
 ### Admin and Opt-Out Routes
 

@@ -136,6 +136,38 @@ Large import folders are handled incrementally:
 - If `JUSTLOG_IMPORT_DELETE_RAW=1`, successfully imported raw files are deleted after completion.
 - If `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`, successfully parsed reconstructed TXT / JSON files are deleted after the request that consumed them.
 
+### Import stall troubleshooting
+
+If `/healthz` responds quickly but a real log route such as `/channelid/<id>/<year>/<month>/<day>` hangs, the problem may be outside the importer itself.
+
+Useful signals:
+
+- `HTTP request start: GET ...` confirms the request entered `src/api.rs`.
+- `Import-folder discovery completed ...` confirms recursive import-folder scanning finished.
+- `Checking raw import status for ...` without a matching `Completed raw import status check for ...` points at store lock contention before the actual file import starts.
+- `Starting raw import scan for ...` means preflight completed and the request is inside the file import loop.
+- `Completed raw import ...` plus `Deleted consumed import file ...` confirms the import and delete-after-success path both finished.
+
+One real failure pattern in this repo was a self-deadlock in the background compactor. The compactor held the `Store` SQLite mutex while asking the store another question that also tried to lock the same mutex. That blocked request-time calls such as `imported_raw_file_is_current(...)`, which made log routes appear to hang in the import layer even though the real owner was background compaction.
+
+Recommended debugging order:
+
+1. Confirm `GET /healthz` still returns immediately.
+2. Trigger one hanging log request with a short curl timeout.
+3. Read recent container logs and compare the last emitted line against the import progress markers above.
+4. If the last line is a store-status check, inspect background workers rather than only the import code.
+5. If needed, capture a thread dump while the route is hung to identify the mutex owner.
+
+On Linux hosts, a useful live snapshot is:
+
+```bash
+curl --max-time 25 http://127.0.0.1:8026/channelid/31062476/2024/2/24 >/dev/null 2>&1 &
+sleep 2
+gdb -batch -ex "info threads" -ex "thread apply all bt" -p "$(docker inspect justlog-v2 --format '{{.State.Pid}}')"
+```
+
+If several request threads are blocked in `Store::imported_raw_file_is_current()` or another small store read, look for another thread already inside `src/store.rs` while holding the mutex.
+
 ### Empty directory cleanup
 
 Whenever the import folder is checked, the compatibility layer prunes empty directories below that root and removes empty parent directories upward when possible, while leaving non-empty branches alone. This also runs after delete-after-success removes consumed import files.
@@ -195,6 +227,8 @@ docker compose down
 ```
 
 The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}` and forwards it to the app's in-container listener on `8026`, mounts `./data` to `/data`, mounts `${JUSTLOG_IMPORT_HOST_DIR:-./data/import-folder}` to `/import-folder`, keeps logs and SQLite state under the `/data` mount, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
+
+Keep the published Docker port and `listenAddress` aligned. A mismatched host mapping such as `8026 -> 8026` while the app still listens on `:8025` can look like an HTTP regression even when the app is otherwise healthy.
 
 ## Ubuntu Production Setup
 
