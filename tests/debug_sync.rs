@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::Request;
 use chrono::{Duration, Utc};
-use justlog::debug_sync::{DebugRuntime, process_due_reconciliation_jobs};
+use justlog::debug_sync::{DebugRuntime, process_due_reconciliation_jobs, run_startup_validation};
 use justlog::store::ReconciliationOutcome;
 use serde_json::json;
 use tempfile::TempDir;
@@ -42,6 +42,17 @@ fn compare_runtime(base_url: &str, log_dir: &Path) -> Arc<DebugRuntime> {
     vars.insert(
         "JUSTLOG_DEBUG_COMPARE_URL".to_string(),
         base_url.to_string(),
+    );
+    Arc::new(
+        DebugRuntime::from_summary(log_dir, DebugRuntime::summary_from_map(&vars)).unwrap(),
+    )
+}
+
+fn startup_runtime(log_dir: &Path, value: &str) -> Arc<DebugRuntime> {
+    let mut vars = std::collections::HashMap::new();
+    vars.insert(
+        "JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP".to_string(),
+        value.to_string(),
     );
     Arc::new(
         DebugRuntime::from_summary(log_dir, DebugRuntime::summary_from_map(&vars)).unwrap(),
@@ -326,4 +337,103 @@ async fn fallback_proxies_dated_range_random_and_user_reads() {
         )
         .await;
     assert!(user.contains("remote-user-1"));
+}
+
+#[tokio::test]
+async fn startup_validation_repairs_missing_user_month_data_and_updates_watermark() {
+    let log_dir = TempDir::new().unwrap();
+    let runtime = startup_runtime(log_dir.path(), "true");
+    let harness =
+        TestHarness::start_with_debug_runtime(vec!["1".to_string()], false, runtime.clone()).await;
+
+    let msg1 = justlog::model::CanonicalEvent::from_raw(&privmsg(
+        "startup-user-1",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_153_600_000,
+        "one",
+    ))
+    .unwrap()
+    .unwrap();
+    let msg2 = justlog::model::CanonicalEvent::from_raw(&privmsg(
+        "startup-user-2",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_153_601_000,
+        "two",
+    ))
+    .unwrap()
+    .unwrap();
+    harness.seed_channel_event(&msg1);
+    harness.seed_channel_event(&msg2);
+    harness.compact_channel_day("1", 2024, 1, 2);
+    harness.seed_channel_event(&msg1);
+    harness.compact_user_month("1", "200", 2024, 1);
+
+    run_startup_validation(runtime.clone(), harness.state.store.clone(), Utc::now())
+        .await
+        .unwrap();
+
+    let repaired_user = harness
+        .state
+        .store
+        .read_user_logs("1", "200", 2024, 1)
+        .unwrap();
+    assert_eq!(repaired_user.len(), 2);
+    assert!(runtime.read_last_validated_time().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn startup_validation_repairs_missing_channel_data_from_user_month() {
+    let log_dir = TempDir::new().unwrap();
+    let runtime = startup_runtime(log_dir.path(), "true");
+    let harness =
+        TestHarness::start_with_debug_runtime(vec!["1".to_string()], false, runtime.clone()).await;
+
+    let msg1 = justlog::model::CanonicalEvent::from_raw(&privmsg(
+        "startup-channel-1",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_153_600_000,
+        "one",
+    ))
+    .unwrap()
+    .unwrap();
+    let msg2 = justlog::model::CanonicalEvent::from_raw(&privmsg(
+        "startup-channel-2",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_153_601_000,
+        "two",
+    ))
+    .unwrap()
+    .unwrap();
+    harness.seed_channel_event(&msg1);
+    harness.compact_channel_day("1", 2024, 1, 2);
+    harness.seed_channel_event(&msg1);
+    harness.seed_channel_event(&msg2);
+    harness.compact_user_month("1", "200", 2024, 1);
+
+    run_startup_validation(runtime, harness.state.store.clone(), Utc::now())
+    .await
+    .unwrap();
+
+    let repaired_channel = harness
+        .state
+        .store
+        .read_channel_logs("1", 2024, 1, 2)
+        .unwrap();
+    assert_eq!(repaired_channel.len(), 2);
 }

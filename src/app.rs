@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 use crate::api;
 use crate::compact::spawn_compactor;
 use crate::config::{Config, SharedConfig};
-use crate::debug_sync::DebugRuntime;
+use crate::debug_sync::{DebugRuntime, run_startup_validation};
 use crate::helix::HelixClient;
 use crate::import::import_legacy_logs;
 use crate::ingest::{ChatCommandService, IngestManager};
@@ -56,6 +56,7 @@ pub async fn run_cli() -> Result<()> {
 
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let store = Store::open(&config)?;
+    run_startup_validation(debug_runtime.clone(), store.clone(), chrono::Utc::now()).await?;
 
     if let Some(Commands::ImportLegacy { source }) = cli.command {
         let imported = import_legacy_logs(&store, &source)?;

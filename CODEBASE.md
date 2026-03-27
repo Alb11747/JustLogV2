@@ -220,6 +220,8 @@ Older data is compacted into Brotli-compressed segment files under the logs dire
 
 Segment metadata is stored in the `segments` table, and in-progress writes are tracked in `pending_segments` so incomplete files can be cleaned up on restart.
 
+Channel-day archives and user-month archives are intended to represent the same underlying event set. If consistency validation or reconciliation repairs one side, it must update the affected counterpart archives too.
+
 ### Read Path
 
 When serving logs, the store merges:
@@ -240,6 +242,19 @@ The compactor periodically:
 - deletes compacted rows from the `events` table
 
 If a channel-day query requests `raw` output and the entire partition is already archived with passthrough enabled, the API can stream the Brotli file directly without reconstructing the response.
+
+### Reconciliation And Startup Validation
+
+The debug reconciliation layer can compare archived channel-day partitions against another JustLog instance, repair trusted mismatches, and log all checks to `reconciliation.log`.
+
+Startup validation can also run before the app starts serving traffic:
+
+- `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP=true` scans all archived data, subject to the cached watermark limit.
+- Relative values such as `24h`, `7d`, `3mo`, and `1y` scan recent archived data.
+- The last successful startup validation time is cached under the logs directory, and future startups reuse it with up to one day of overlap so stable data is not revalidated unnecessarily.
+- `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP_IGNORE_LAST_VALIDATED=1` disables that limit and rechecks the full requested scope.
+
+Startup validation performs a quick sanity check on archived lines, locally self-heals sane missing-data drift between channel-day and user-month archives, and only falls back to trusted remote data when local repair is not safe enough.
 
 ## HTTP API
 

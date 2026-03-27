@@ -786,6 +786,49 @@ impl Store {
         Ok(())
     }
 
+    pub fn upsert_reconciliation_status(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+        segment_path: &str,
+        outcome: &ReconciliationOutcome,
+    ) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            r#"
+            INSERT INTO reconciliation_jobs(
+                channel_id, year, month, day, segment_path, scheduled_at, checked_at, status,
+                conflict_count, repair_status, unhealthy, last_error
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(channel_id, year, month, day)
+            DO UPDATE SET
+                segment_path = excluded.segment_path,
+                checked_at = excluded.checked_at,
+                status = excluded.status,
+                conflict_count = excluded.conflict_count,
+                repair_status = excluded.repair_status,
+                unhealthy = excluded.unhealthy,
+                last_error = excluded.last_error
+            "#,
+            params![
+                channel_id,
+                year,
+                month,
+                day,
+                segment_path,
+                outcome.checked_at.timestamp(),
+                outcome.status,
+                outcome.conflict_count,
+                outcome.repair_status,
+                outcome.unhealthy,
+                outcome.last_error,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn mark_reconciliation_error(&self, job: &ReconciliationJob, error: &str) -> Result<()> {
         self.record_reconciliation_outcome(
             job,
@@ -857,6 +900,108 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn replace_or_create_channel_segment(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+        events: &[StoredEvent],
+    ) -> Result<String> {
+        let relative = format!("segments/channel/{}/{}/{}/{}.br", channel_id, year, month, day);
+        let final_path = self.root_dir.join(&relative);
+        let temp_path = self.root_dir.join(format!("{}.repair.tmp", relative));
+        self.write_segment_file(&final_path, &temp_path, events)?;
+        let db = self.db.lock().unwrap();
+        db.execute(
+            r#"
+            INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
+            VALUES('channel', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'brotli', 1)
+            "#,
+            params![
+                channel_id,
+                year,
+                month,
+                day,
+                relative,
+                events.len() as i64,
+                events.first().map(|event| event.timestamp.timestamp()).unwrap_or_default(),
+                events.last().map(|event| event.timestamp.timestamp()).unwrap_or_default(),
+            ],
+        )?;
+        Ok(relative)
+    }
+
+    pub fn replace_or_create_user_segment(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        year: i32,
+        month: u32,
+        events: &[StoredEvent],
+    ) -> Result<String> {
+        let relative = format!("segments/user/{}/{}/{}/{}.br", channel_id, user_id, year, month);
+        let final_path = self.root_dir.join(&relative);
+        let temp_path = self.root_dir.join(format!("{}.repair.tmp", relative));
+        self.write_segment_file(&final_path, &temp_path, events)?;
+        let db = self.db.lock().unwrap();
+        db.execute(
+            r#"
+            INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
+            VALUES('user', ?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, 'brotli', 1)
+            "#,
+            params![
+                channel_id,
+                user_id,
+                year,
+                month,
+                relative,
+                events.len() as i64,
+                events.first().map(|event| event.timestamp.timestamp()).unwrap_or_default(),
+                events.last().map(|event| event.timestamp.timestamp()).unwrap_or_default(),
+            ],
+        )?;
+        Ok(relative)
+    }
+
+    pub fn list_channel_segments_since(
+        &self,
+        start: Option<DateTime<Utc>>,
+    ) -> Result<Vec<SegmentRecord>> {
+        self.list_segments("channel", start, None)
+    }
+
+    pub fn list_user_segments_since(&self, start: Option<DateTime<Utc>>) -> Result<Vec<SegmentRecord>> {
+        self.list_segments("user", start, None)
+    }
+
+    pub fn read_archived_channel_segment_strict(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+    ) -> Result<Vec<StoredEvent>> {
+        let Some(segment) = self.segment_for_channel_day(channel_id, year, month, day)? else {
+            return Ok(Vec::new());
+        };
+        self.load_segment_events_strict(&segment)
+    }
+
+    pub fn read_archived_user_segment_strict(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        year: i32,
+        month: u32,
+    ) -> Result<Vec<StoredEvent>> {
+        let Some(segment) = self.segment_for_user_month(channel_id, user_id, year, month)? else {
+            return Ok(Vec::new());
+        };
+        self.load_segment_events_strict(&segment)
+            .map(|events| filter_user_events(events, user_id))
     }
 
     fn segment_for_channel_day(
@@ -931,6 +1076,18 @@ impl Store {
     }
 
     fn load_segment_events(&self, segment: &SegmentRecord) -> Result<Vec<StoredEvent>> {
+        self.load_segment_events_internal(segment, false)
+    }
+
+    fn load_segment_events_strict(&self, segment: &SegmentRecord) -> Result<Vec<StoredEvent>> {
+        self.load_segment_events_internal(segment, true)
+    }
+
+    fn load_segment_events_internal(
+        &self,
+        segment: &SegmentRecord,
+        strict: bool,
+    ) -> Result<Vec<StoredEvent>> {
         let file = File::open(self.root_dir.join(&segment.path))
             .with_context(|| format!("failed to open segment {}", segment.path))?;
         let mut decoder = Decompressor::new(file, 64 * 1024);
@@ -942,23 +1099,32 @@ impl Store {
                 continue;
             }
             let raw = String::from_utf8(line.to_vec())?;
-            if let Some(event) = CanonicalEvent::from_raw(&raw)? {
-                events.push(StoredEvent {
-                    seq: index as i64,
-                    event_uid: event.event_uid,
-                    room_id: event.room_id,
-                    channel_login: event.channel_login,
-                    username: event.username,
-                    display_name: event.display_name,
-                    user_id: event.user_id,
-                    target_user_id: event.target_user_id,
-                    text: event.text,
-                    system_text: event.system_text,
-                    timestamp: event.timestamp,
-                    raw: event.raw,
-                    tags: event.tags,
-                    kind: event.kind,
-                });
+            match CanonicalEvent::from_raw(&raw)? {
+                Some(event) => {
+                    events.push(StoredEvent {
+                        seq: index as i64,
+                        event_uid: event.event_uid,
+                        room_id: event.room_id,
+                        channel_login: event.channel_login,
+                        username: event.username,
+                        display_name: event.display_name,
+                        user_id: event.user_id,
+                        target_user_id: event.target_user_id,
+                        text: event.text,
+                        system_text: event.system_text,
+                        timestamp: event.timestamp,
+                        raw: event.raw,
+                        tags: event.tags,
+                        kind: event.kind,
+                    });
+                }
+                None if strict => {
+                    return Err(anyhow!(
+                        "segment {} contains a line that could not be parsed as a supported event",
+                        segment.path
+                    ));
+                }
+                None => {}
             }
         }
         Ok(events)
@@ -1039,6 +1205,76 @@ impl Store {
             )?);
         }
         Ok(events)
+    }
+
+    fn list_segments(
+        &self,
+        scope: &str,
+        start: Option<DateTime<Utc>>,
+        channel_id: Option<&str>,
+    ) -> Result<Vec<SegmentRecord>> {
+        let db = self.db.lock().unwrap();
+        let mut rows = Vec::new();
+        if let Some(start) = start {
+            if let Some(channel_id) = channel_id {
+                let mut statement = db.prepare(
+                    r#"
+                    SELECT id, scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw
+                    FROM segments
+                    WHERE scope = ?1 AND channel_id = ?2 AND end_ts >= ?3
+                    ORDER BY start_ts ASC
+                    "#,
+                )?;
+                rows.extend(
+                    statement
+                        .query_map(params![scope, channel_id, start.timestamp()], map_segment_row)?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                );
+            } else {
+                let mut statement = db.prepare(
+                    r#"
+                    SELECT id, scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw
+                    FROM segments
+                    WHERE scope = ?1 AND end_ts >= ?2
+                    ORDER BY start_ts ASC
+                    "#,
+                )?;
+                rows.extend(
+                    statement
+                        .query_map(params![scope, start.timestamp()], map_segment_row)?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                );
+            }
+        } else if let Some(channel_id) = channel_id {
+            let mut statement = db.prepare(
+                r#"
+                SELECT id, scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw
+                FROM segments
+                WHERE scope = ?1 AND channel_id = ?2
+                ORDER BY start_ts ASC
+                "#,
+            )?;
+            rows.extend(
+                statement
+                    .query_map(params![scope, channel_id], map_segment_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        } else {
+            let mut statement = db.prepare(
+                r#"
+                SELECT id, scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw
+                FROM segments
+                WHERE scope = ?1
+                ORDER BY start_ts ASC
+                "#,
+            )?;
+            rows.extend(
+                statement
+                    .query_map(params![scope], map_segment_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        Ok(rows)
     }
 }
 

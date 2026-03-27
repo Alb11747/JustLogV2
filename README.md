@@ -2,6 +2,8 @@
 
 JustLogV2 is a Twitch chat logger with an HTTP API for serving stored logs.
 
+Archived channel-day data and archived user-month data are expected to stay consistent. When reconciliation or startup consistency validation repairs one side, it also repairs the affected counterpart archives.
+
 ## Test suites
 
 This repo now uses a layered test strategy:
@@ -30,6 +32,19 @@ The app listens on port `8025` by default and expects a JSON config file. The mi
   "channels": ["123456789"]
 }
 ```
+
+## Debug Validation
+
+Optional env flags support reconciliation and startup consistency validation:
+
+- `JUSTLOG_DEBUG=1`
+- `JUSTLOG_DEBUG_COMPARE_URL=<justlog-base-url>`
+- `JUSTLOG_DEBUG_TRUSTED_COMPARE_URL=<justlog-base-url>`
+- `JUSTLOG_DEBUG_FALLBACK_TRUSTED_API=1`
+- `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP=true|24h|7d|3mo|1y`
+- `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP_IGNORE_LAST_VALIDATED=1`
+
+Startup validation caches the last successful validation time in the logs directory and, by default, only rechecks recent data plus up to one day of overlap. Setting `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP_IGNORE_LAST_VALIDATED=1` forces the full requested scope to be revalidated on every startup.
 
 ## Run with Docker
 
