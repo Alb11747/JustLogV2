@@ -26,7 +26,7 @@ use crate::model::{
     AllChannelsJson, ChannelInfo, ChannelLogList, ChatLog, ChatMessage, ErrorResponse, UserLogList,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponseType {
     Json,
     Text,
@@ -510,6 +510,9 @@ fn respond_with_channel_day_messages(
     legacy_mode: LegacyTxtMode,
 ) -> Result<Response> {
     let native_is_empty = native.is_empty();
+    let native_count = native.len();
+    let complete_count = complete_imported.len();
+    let simple_count = simple_imported.len();
     let with_complete = merge_messages(native, complete_imported);
     let mut messages = match legacy_mode {
         LegacyTxtMode::Off => with_complete,
@@ -525,6 +528,16 @@ fn respond_with_channel_day_messages(
     if request.reverse {
         messages.reverse();
     }
+    info!(
+        "Preparing channel-day response: type={:?}, native_messages={}, complete_imported={}, simple_imported={}, final_messages={}, reverse={}, brotli={}",
+        request.response_type,
+        native_count,
+        complete_count,
+        simple_count,
+        messages.len(),
+        request.reverse,
+        compress_brotli
+    );
     respond_with_events(messages, request.response_type, compress_brotli)
 }
 
@@ -761,12 +774,24 @@ fn respond_with_events(
     response_type: ResponseType,
     compress_brotli: bool,
 ) -> Result<Response> {
+    let render_started = Instant::now();
+    let message_count = messages.len();
+    info!(
+        "Starting response render: type={:?}, messages={}, brotli={}",
+        response_type, message_count, compress_brotli
+    );
     match response_type {
         ResponseType::Json => {
             let mut response = Json(ChatLog { messages }).into_response();
             response
                 .headers_mut()
                 .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            info!(
+                "Completed response render: type={:?}, messages={}, elapsed={:?}",
+                response_type,
+                message_count,
+                render_started.elapsed()
+            );
             Ok(response)
         }
         ResponseType::Raw => {
@@ -775,7 +800,14 @@ fn respond_with_events(
                 .map(|message| message.raw)
                 .collect::<Vec<_>>()
                 .join("\n");
-            bytes_response(rendered + "\n", compress_brotli)
+            let response = bytes_response(rendered + "\n", compress_brotli)?;
+            info!(
+                "Completed response render: type={:?}, messages={}, elapsed={:?}",
+                response_type,
+                message_count,
+                render_started.elapsed()
+            );
+            Ok(response)
         }
         ResponseType::Text => {
             let rendered = messages
@@ -783,21 +815,37 @@ fn respond_with_events(
                 .map(render_text_line)
                 .collect::<Vec<_>>()
                 .join("");
-            bytes_response(rendered, compress_brotli)
+            let response = bytes_response(rendered, compress_brotli)?;
+            info!(
+                "Completed response render: type={:?}, messages={}, elapsed={:?}",
+                response_type,
+                message_count,
+                render_started.elapsed()
+            );
+            Ok(response)
         }
     }
 }
 
 fn bytes_response(rendered: String, compress_brotli: bool) -> Result<Response> {
+    let render_bytes = rendered.len();
     let mut response = if compress_brotli {
+        let compression_started = Instant::now();
         let mut output = Vec::new();
         {
             let mut writer = brotli::CompressorWriter::new(&mut output, 16 * 1024, 5, 22);
             std::io::Write::write_all(&mut writer, rendered.as_bytes())?;
             std::io::Write::flush(&mut writer)?;
         }
+        info!(
+            "Completed Brotli compression: input_bytes={}, output_bytes={}, elapsed={:?}",
+            render_bytes,
+            output.len(),
+            compression_started.elapsed()
+        );
         Response::new(Body::from(output))
     } else {
+        info!("Response body ready without compression: bytes={render_bytes}");
         Response::new(Body::from(rendered))
     };
     *response.status_mut() = StatusCode::OK;

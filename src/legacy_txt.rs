@@ -482,10 +482,15 @@ impl LegacyTxtRuntime {
                     remove_empty_dir_and_parents(root, parent);
                 }
             }
-            info!("Deleted consumed import file {}", file.path.display());
+            info!(
+                "Deleted consumed {} import file {}",
+                if is_raw { "raw" } else { "reconstructed" },
+                file.path.display()
+            );
         } else {
             warn!(
-                "Failed to delete consumed import file {}",
+                "Failed to delete consumed {} import file {}",
+                if is_raw { "raw" } else { "reconstructed" },
                 file.path.display()
             );
         }
