@@ -11,6 +11,6 @@ services:
       - .env
     restart: unless-stopped
     ports:
-      - "${JUSTLOG_PUBLIC_PORT}:8025"
+      - "${JUSTLOG_PUBLIC_PORT}:8026"
     volumes:
       - ./data:/data

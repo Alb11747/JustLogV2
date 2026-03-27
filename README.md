@@ -150,7 +150,7 @@ Stop it again:
 docker compose down
 ```
 
-The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes `${JUSTLOG_PUBLIC_PORT}`, mounts `${JUSTLOG_DATA_DIR}` to `/data`, keeps logs and SQLite state under that mounted directory, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
+The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}`, mounts `${JUSTLOG_DATA_DIR}` to `/data`, keeps logs and SQLite state under that mounted directory, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
 
 ## Ubuntu Production Setup
 
