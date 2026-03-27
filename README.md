@@ -2,6 +2,8 @@
 
 JustLogV2 is a Twitch chat logger with an HTTP API for serving stored logs.
 
+The repo is intended to be platform agnostic. A common workflow is Windows for development and operator tooling, with Ubuntu/Linux as the production host.
+
 Archived channel-day data and archived user-month data are expected to stay consistent. When reconciliation or startup consistency validation repairs one side, it also repairs the affected counterpart archives.
 
 ## Test suites
@@ -17,6 +19,8 @@ This repo now uses a layered test strategy:
 Live network tests are gated and skip unless `JUSTLOG_RUN_LIVE_NETWORK_TESTS=1` is set. The optional Twitch Helix smoke test also requires `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET`.
 
 ## Run locally
+
+PowerShell examples are shown below, but the same commands work from any shell with equivalent path syntax.
 
 ```powershell
 cargo run -- --config config.json
@@ -46,21 +50,42 @@ Optional env flags support reconciliation and startup consistency validation:
 
 Startup validation caches the last successful validation time in the logs directory and, by default, only rechecks recent data plus up to one day of overlap. Setting `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP_IGNORE_LAST_VALIDATED=1` forces the full requested scope to be revalidated on every startup.
 
-## Run with Docker
+## Run with Docker Compose
 
-Build the image locally:
+Docker Compose is the standard container path for both local testing and Ubuntu production deployments.
 
-```powershell
-docker build -t justlogv2 .
-```
-
-Start the container with a persistent data directory:
+Create a persistent data directory and put your config at `./data/config.json`:
 
 ```powershell
-docker run --rm -p 8025:8025 -v ${PWD}/data:/data justlogv2
+New-Item -ItemType Directory -Force data | Out-Null
 ```
 
-Put your config at `./data/config.json`. Logs and SQLite data stay under `/data`.
+Start the service:
+
+```powershell
+docker compose up -d --build
+```
+
+Stop it again:
+
+```powershell
+docker compose down
+```
+
+The committed [`compose.yaml`](C:\Users\Albert\Sync\Projects\JustLogV2\compose.yaml) file builds from the local `Dockerfile`, publishes port `8025`, mounts `./data` to `/data`, keeps logs and SQLite state under `./data`, and uses `restart: unless-stopped`.
+
+## Ubuntu Production Setup
+
+Copy or sync the project to the Ubuntu host, make sure Docker Engine and the Docker Compose plugin are installed, then start the service from the project directory:
+
+```bash
+mkdir -p data
+docker compose up -d --build
+```
+
+The container expects `/data/config.json`, so the host-side file should be `./data/config.json`. Logs and SQLite state remain under that same `data/` directory.
+
+You can use personal scripts or sync helpers to move the repo onto the server, but those helpers are local workflow choices rather than part of the repository interface.
 
 ## Auto-published images
 

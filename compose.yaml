@@ -1,0 +1,10 @@
+services:
+  justlogv2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8025:8025"
+    restart: unless-stopped
+    volumes:
+      - ./data:/data

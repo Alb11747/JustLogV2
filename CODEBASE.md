@@ -14,6 +14,8 @@ The project is built as a library crate with a very small binary entry point. Ru
 - SQLite-backed hot storage plus Brotli-compressed archived segments
 - Axum HTTP routes for log retrieval and administration
 
+Operationally, the documented deployment path is Docker Compose on Ubuntu/Linux with `./data` mounted to `/data`. Windows is still a common development and operator environment, but any personal sync or deploy scripts remain local workflow tooling rather than a tracked repo interface.
+
 ## High-Level Architecture
 
 ```text
@@ -42,7 +44,8 @@ At runtime:
 ### Root
 
 - `Cargo.toml`: crate metadata and dependencies.
-- `README.md`: short usage guide for local and Docker runs.
+- `README.md`: short usage guide for local development and Docker Compose deployment.
+- `compose.yaml`: canonical container runtime setup for local Docker use and Ubuntu deployments.
 - `Dockerfile`: container image build for the service.
 - `tests/smoke.rs`: fast deterministic smoke tests for config, API basics, and archived reads.
 - `tests/integration.rs`: end-to-end style tests using mock Helix and IRC servers.
