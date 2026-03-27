@@ -66,6 +66,7 @@ JustLogV2 supports an optional recursive import folder for channel-day reads, `/
 Supported env flags:
 
 - `JUSTLOG_IMPORT_HOST_DIR=<host-path>`: Docker Compose host folder to mount. Default is `./data/import-folder`.
+- `JUSTLOG_UID=<uid>` / `JUSTLOG_GID=<gid>`: Docker Compose UID/GID for the container user. Both default to `1000`.
 - `JUSTLOG_IMPORT_FOLDER=<path>`: in-container or local folder to search recursively.
 - `JUSTLOG_LEGACY_TXT_MODE=missing_only|merge|off`: applies only to reconstructed data. Default is `missing_only`.
 - `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`: re-check reconstructed-file availability on each request.
@@ -275,7 +276,7 @@ docker compose down
 
 `docker stop` and `docker compose down` now trigger graceful shutdown handling so the HTTP listener stops accepting new work and ingest/background loops exit instead of immediately trying to reconnect.
 
-The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}` and forwards it to the app's in-container listener on `8026`, mounts `./data` to `/data`, mounts `${JUSTLOG_IMPORT_HOST_DIR:-./data/import-folder}` to `/import-folder`, keeps logs and SQLite state under the `/data` mount, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
+The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}` and forwards it to the app's in-container listener on `8026`, runs the process as `${JUSTLOG_UID:-1000}:${JUSTLOG_GID:-1000}`, mounts `./data` to `/data`, mounts `${JUSTLOG_IMPORT_HOST_DIR:-./data/import-folder}` to `/import-folder`, keeps logs and SQLite state under the `/data` mount, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
 
 Keep the published Docker port and `listenAddress` aligned. A mismatched host mapping such as `8026 -> 8026` while the app still listens on `:8025` can look like an HTTP regression even when the app is otherwise healthy.
 

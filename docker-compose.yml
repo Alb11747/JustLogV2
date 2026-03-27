@@ -7,12 +7,15 @@ services:
       dockerfile: Dockerfile
       args:
         RUST_VERSION: "1.85"
+        APP_UID: "${JUSTLOG_UID:-1000}"
+        APP_GID: "${JUSTLOG_GID:-1000}"
     env_file:
       - .env
     environment:
       JUSTLOG_IMPORT_FOLDER: ${JUSTLOG_IMPORT_FOLDER:-/import-folder}
       JUSTLOG_LEGACY_TXT_MODE: ${JUSTLOG_LEGACY_TXT_MODE:-missing_only}
       JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST: ${JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST:-0}
+    user: "${JUSTLOG_UID:-1000}:${JUSTLOG_GID:-1000}"
     restart: unless-stopped
     ports:
       - "${JUSTLOG_PUBLIC_PORT}:8026"

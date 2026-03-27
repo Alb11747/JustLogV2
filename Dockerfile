@@ -37,6 +37,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 
+ARG APP_UID=1000
+ARG APP_GID=1000
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
@@ -45,7 +48,12 @@ WORKDIR /app
 
 COPY --from=builder /tmp/justlog /usr/local/bin/justlog
 
-RUN mkdir -p /data/logs
+RUN groupadd --gid ${APP_GID} justlog \
+    && useradd --uid ${APP_UID} --gid ${APP_GID} --create-home --shell /usr/sbin/nologin justlog \
+    && mkdir -p /data/logs \
+    && chown -R ${APP_UID}:${APP_GID} /data /home/justlog
+
+USER justlog
 
 EXPOSE 8026
 
