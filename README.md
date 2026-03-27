@@ -1,6 +1,6 @@
 # JustLogV2
 
-JustLogV2 is a Twitch chat logger with an HTTP API for serving stored logs.
+JustLogV2 is a Twitch chat logger with an HTTP API for serving stored logs. Its primary mode is anonymous Twitch IRC ingest using a generated `justinfan<digits>` account.
 
 The repo is intended to be platform agnostic. A common workflow is Windows for development and operator tooling, with Ubuntu/Linux as the production host.
 
@@ -26,7 +26,7 @@ PowerShell examples are shown below, but the same commands work from any shell w
 cargo run -- --config config.json
 ```
 
-The app listens on port `8026` by default and expects a JSON config file. The minimum useful config looks like this:
+The app listens on port `8026` by default and expects a JSON config file. The default and recommended setup is anonymous chat ingest, and the minimum useful config looks like this:
 
 ```json
 {
@@ -35,7 +35,9 @@ The app listens on port `8026` by default and expects a JSON config file. The mi
 }
 ```
 
-`clientID` and `clientSecret` are optional unless you want Twitch Helix-backed features such as login/id resolution, `/channels` name resolution from stored IDs, or admin/chat commands that translate logins into channel IDs. If Helix credentials are omitted, startup ingestion can still join channels listed by login name directly, but numeric channel IDs cannot be resolved at startup.
+IRC auth is anonymous by default. If `oauth` is omitted or empty, JustLog connects with `PASS _` and a generated `NICK justinfan<digits>`. In that mode, `username` is ignored for the IRC session. If you provide `oauth`, JustLog switches to authenticated bot-style IRC auth and uses the configured `username`.
+
+`clientID` and `clientSecret` are optional unless you want Twitch Helix-backed features such as login/id resolution, `/channels` name resolution from stored IDs, or admin/chat commands that translate logins into channel IDs. Helix credentials are separate from IRC auth. If Helix credentials are omitted, startup ingestion can still join channels listed by login name directly, but numeric channel IDs cannot be resolved at startup.
 
 For the Docker and upload workflow in this repo, keep the runtime file at `./data/config.json` instead.
 
@@ -212,7 +214,7 @@ Copy-Item data/config.template.json data/config.json
 Then edit:
 
 - `.env` if you want to change the published port, data mount, or optional env-only feature flags
-- `data/config.json` for optional Twitch Helix credentials, admin API key, startup channels, and other JSON config
+- `data/config.json` for startup channels, admin API key, optional Twitch Helix credentials, and optional authenticated IRC bot settings
 
 `.env.template` exists as a clean starting point for a local `.env`.
 

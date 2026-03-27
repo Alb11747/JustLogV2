@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -44,6 +45,13 @@ enum OutboundCommand {
     Join(String),
     Part(String),
     Say(OutboundMessage),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IrcIdentity {
+    pass_line: String,
+    nick: String,
+    anonymous: bool,
 }
 
 impl IngestManager {
@@ -126,9 +134,10 @@ impl IngestManager {
         let (reader_half, mut writer_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader_half).lines();
         let mut outbound_rx = self.outbound.subscribe();
+        let identity = irc_identity(&config);
 
-        write_irc_line(&mut writer_half, &format!("PASS oauth:{}", config.oauth)).await?;
-        write_irc_line(&mut writer_half, &format!("NICK {}", config.username)).await?;
+        write_irc_line(&mut writer_half, &identity.pass_line).await?;
+        write_irc_line(&mut writer_half, &format!("NICK {}", identity.nick)).await?;
         write_irc_line(
             &mut writer_half,
             "CAP REQ :twitch.tv/commands twitch.tv/tags twitch.tv/membership",
@@ -139,8 +148,14 @@ impl IngestManager {
         for channel in desired_channels {
             write_irc_line(&mut writer_half, &format!("JOIN #{channel}")).await?;
         }
-
-        info!("ingest lane {lane_index} connected");
+        if identity.anonymous {
+            info!(
+                "ingest lane {lane_index} connected anonymously as {}",
+                identity.nick
+            );
+        } else {
+            info!("ingest lane {lane_index} connected");
+        }
 
         loop {
             tokio::select! {
@@ -243,6 +258,30 @@ async fn connect_stream(config: &Config) -> Result<BoxedStream> {
     }
 }
 
+fn irc_identity(config: &Config) -> IrcIdentity {
+    if config.oauth.trim().is_empty() {
+        IrcIdentity {
+            pass_line: "PASS _".to_string(),
+            nick: generate_justinfan_username(),
+            anonymous: true,
+        }
+    } else {
+        IrcIdentity {
+            pass_line: format!("PASS oauth:{}", config.oauth),
+            nick: config.username.clone(),
+            anonymous: false,
+        }
+    }
+}
+
+fn generate_justinfan_username() -> String {
+    let digits = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() % 1_000_000_000)
+        .unwrap_or(0);
+    format!("justinfan{digits}")
+}
+
 async fn write_irc_line<W>(writer: &mut W, line: &str) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -251,4 +290,55 @@ where
     writer.write_all(b"\r\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generate_justinfan_username, irc_identity};
+    use crate::config::Config;
+
+    #[test]
+    fn anonymous_identity_uses_placeholder_pass_and_generated_justinfan_nick() {
+        let mut config = serde_json::from_str::<Config>(
+            r#"{
+                "logsDirectory": "./logs",
+                "oauth": ""
+            }"#,
+        )
+        .unwrap();
+        config.normalize().unwrap();
+
+        let identity = irc_identity(&config);
+
+        assert_eq!(identity.pass_line, "PASS _");
+        assert!(identity.anonymous);
+        assert!(identity.nick.starts_with("justinfan"));
+        assert!(identity.nick[9..].chars().all(|ch| ch.is_ascii_digit()));
+    }
+
+    #[test]
+    fn authenticated_identity_preserves_existing_pass_and_username() {
+        let mut config = serde_json::from_str::<Config>(
+            r#"{
+                "logsDirectory": "./logs",
+                "username": "loggerbot",
+                "oauth": "oauth:test-token"
+            }"#,
+        )
+        .unwrap();
+        config.normalize().unwrap();
+
+        let identity = irc_identity(&config);
+
+        assert_eq!(identity.pass_line, "PASS oauth:test-token");
+        assert_eq!(identity.nick, "loggerbot");
+        assert!(!identity.anonymous);
+    }
+
+    #[test]
+    fn generated_justinfan_username_has_numeric_suffix() {
+        let nick = generate_justinfan_username();
+        assert!(nick.starts_with("justinfan"));
+        assert!(nick[9..].chars().all(|ch| ch.is_ascii_digit()));
+    }
 }

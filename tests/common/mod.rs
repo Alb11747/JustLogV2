@@ -316,6 +316,16 @@ impl TestHarness {
         Self::start_with_options(channel_ids, true, Arc::new(DebugRuntime::disabled())).await
     }
 
+    pub async fn start_anonymous(channel_ids: Vec<String>) -> Self {
+        Self::start_with_options_and_oauth(
+            channel_ids,
+            true,
+            Arc::new(DebugRuntime::disabled()),
+            "",
+        )
+        .await
+    }
+
     pub async fn start_without_ingest(channel_ids: Vec<String>) -> Self {
         Self::start_with_options(channel_ids, false, Arc::new(DebugRuntime::disabled())).await
     }
@@ -332,6 +342,21 @@ impl TestHarness {
         channel_ids: Vec<String>,
         start_ingest: bool,
         debug_runtime: Arc<DebugRuntime>,
+    ) -> Self {
+        Self::start_with_options_and_oauth(
+            channel_ids,
+            start_ingest,
+            debug_runtime,
+            "oauth:777777777",
+        )
+        .await
+    }
+
+    async fn start_with_options_and_oauth(
+        channel_ids: Vec<String>,
+        start_ingest: bool,
+        debug_runtime: Arc<DebugRuntime>,
+        oauth: &str,
     ) -> Self {
         let users = vec![
             user("1", "channelone"),
@@ -351,7 +376,7 @@ impl TestHarness {
                 "logsDirectory": logs_dir.to_string_lossy(),
                 "adminAPIKey": "secret",
                 "username": "justinfan777777",
-                "oauth": "oauth:777777777",
+                "oauth": oauth,
                 "botVerified": false,
                 "clientID": "client",
                 "clientSecret": "secret",

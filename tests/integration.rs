@@ -66,6 +66,29 @@ async fn mirrored_ingest_deduplicates_and_recovers_from_reconnect() {
 }
 
 #[tokio::test]
+async fn anonymous_ingest_uses_placeholder_pass_and_generated_justinfan_nick() {
+    let harness = TestHarness::start_anonymous(vec!["1".to_string()]).await;
+    harness.irc.wait_for_connections(2).await;
+    sleep(Duration::from_millis(250)).await;
+
+    let outgoing = harness.irc.client_lines().await.join("\n");
+    assert!(outgoing.contains("PASS _"));
+    assert!(outgoing.contains("JOIN #channelone"));
+
+    let nick_line = harness
+        .irc
+        .client_lines()
+        .await
+        .into_iter()
+        .find(|line| line.starts_with("NICK justinfan"))
+        .expect("anonymous ingest should send a generated justinfan nick");
+    let suffix = nick_line.trim_start_matches("NICK justinfan");
+    assert!(!suffix.is_empty());
+    assert!(suffix.chars().all(|ch| ch.is_ascii_digit()));
+    assert!(!outgoing.contains("PASS oauth:"));
+}
+
+#[tokio::test]
 async fn channels_list_and_lowercase_redirect_are_compatible() {
     let harness = TestHarness::start(vec!["1".to_string()]).await;
     harness.irc.wait_for_connections(2).await;

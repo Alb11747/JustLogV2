@@ -83,15 +83,14 @@ pub async fn run_cli() -> Result<()> {
     };
 
     if config.oauth.trim().is_empty() {
-        warn!("ingest startup skipped because oauth is not configured");
-    } else {
-        let command_service = Arc::new(CommandService::new(state.clone()));
-        let ingest = IngestManager::new(shared_config.clone(), store.clone(), command_service);
-        *ingest_slot.write().await = Some(ingest.clone());
-
-        let initial_channels = resolve_channel_logins(&helix, &config.channels).await?;
-        ingest.start(initial_channels).await;
+        info!("oauth not configured; starting ingest in anonymous justinfan mode");
     }
+    let command_service = Arc::new(CommandService::new(state.clone()));
+    let ingest = IngestManager::new(shared_config.clone(), store.clone(), command_service);
+    *ingest_slot.write().await = Some(ingest.clone());
+
+    let initial_channels = resolve_channel_logins(&helix, &config.channels).await?;
+    ingest.start(initial_channels).await;
     spawn_compactor(shared_config.clone(), store.clone(), debug_runtime);
 
     serve(state, &config.listen_address).await
