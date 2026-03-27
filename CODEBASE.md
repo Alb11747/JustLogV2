@@ -46,7 +46,9 @@ At runtime:
 
 - `Cargo.toml`: crate metadata and dependencies.
 - `README.md`: short usage guide for local development and Docker Compose deployment.
-- `compose.yaml`: canonical container runtime setup for local Docker use and Ubuntu deployments.
+- `docker-compose.yml`: canonical container runtime setup for local Docker use and Ubuntu deployments.
+- `.env.template`: starter compose env file for creating a local `.env` with optional env-only runtime flags.
+- `data/config.template.json`: starter JSON app config for creating an untracked `data/config.json`.
 - `Dockerfile`: container image build for the service.
 - `tests/smoke.rs`: fast deterministic smoke tests for config, API basics, and archived reads.
 - `tests/integration.rs`: end-to-end style tests using mock Helix and IRC servers.

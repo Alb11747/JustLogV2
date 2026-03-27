@@ -1,8 +1,15 @@
 .git
 .github
 target
+data
 logs
 *.sqlite3
 *.db
 *.log
 config.json
+.env
+.env.local
+README.md
+CODEBASE.md
+AGENTS.md
+tests

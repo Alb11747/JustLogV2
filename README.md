@@ -37,6 +37,8 @@ The app listens on port `8025` by default and expects a JSON config file. The mi
 }
 ```
 
+For the Docker and upload workflow in this repo, keep the runtime file at `./data/config.json` instead.
+
 ## Legacy TXT Compatibility
 
 JustLogV2 also has an optional read-only legacy TXT compatibility layer for sparse chat exports. This is intended as a backward-compatibility feature for API reads, not as part of the main ingest, storage, or compaction pipeline.
@@ -122,11 +124,19 @@ The last successful startup validation time is cached in `consistency-validation
 
 Docker Compose is the standard container path for both local testing and Ubuntu production deployments.
 
-Create a persistent data directory and put your config at `./data/config.json`:
+Start from the committed defaults:
 
 ```powershell
 New-Item -ItemType Directory -Force data | Out-Null
+Copy-Item data/config.template.json data/config.json
 ```
+
+Then edit:
+
+- `.env` if you want to change the published port, data mount, or optional env-only feature flags
+- `data/config.json` for Twitch credentials, admin API key, startup channels, and other JSON config
+
+`.env.template` exists as a clean starting point for a local `.env`.
 
 Start the service:
 
@@ -140,7 +150,7 @@ Stop it again:
 docker compose down
 ```
 
-The committed [`compose.yaml`](C:\Users\Albert\Sync\Projects\JustLogV2\compose.yaml) file builds from the local `Dockerfile`, publishes port `8025`, mounts `./data` to `/data`, keeps logs and SQLite state under `./data`, and uses `restart: unless-stopped`.
+The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes `${JUSTLOG_PUBLIC_PORT}`, mounts `${JUSTLOG_DATA_DIR}` to `/data`, keeps logs and SQLite state under that mounted directory, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
 
 ## Ubuntu Production Setup
 
@@ -148,12 +158,13 @@ Copy or sync the project to the Ubuntu host, make sure Docker Engine and the Doc
 
 ```bash
 mkdir -p data
+cp data/config.template.json data/config.json
 docker compose up -d --build
 ```
 
-The container expects `/data/config.json`, so the host-side file should be `./data/config.json`. Logs and SQLite state remain under that same `data/` directory.
+The container expects `/data/config.json`, so the host-side file should be `./data/config.json`. Logs and SQLite state remain under that same `data/` directory. Review `.env` before the first deployment if you want to change the host port or enable any optional env-driven features.
 
-You can use personal scripts or sync helpers to move the repo onto the server, but those helpers are local workflow choices rather than part of the repository interface.
+`upload-project-to-server.cmd` now checks for both `.env` and `data/config.json` before syncing so it does not push an incomplete deployment by accident.
 
 ## Auto-published images
 

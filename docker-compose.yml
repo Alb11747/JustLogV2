@@ -1,0 +1,16 @@
+services:
+  justlogv2:
+    container_name: justlogv2
+    image: justlogv2:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RUST_VERSION: "1.85"
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "${JUSTLOG_PUBLIC_PORT}:8025"
+    volumes:
+      - ./data:/data

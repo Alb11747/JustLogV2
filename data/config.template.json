@@ -1,0 +1,12 @@
+{
+  "clientID": "replace-with-twitch-client-id",
+  "clientSecret": "replace-with-twitch-client-secret",
+  "adminAPIKey": "replace-with-a-long-random-admin-key",
+  "channels": [],
+  "admins": [],
+  "listenAddress": ":8025",
+  "logsDirectory": "/data/logs",
+  "storage": {
+    "sqlitePath": "/data/justlog.sqlite3"
+  }
+}
