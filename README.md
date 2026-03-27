@@ -53,6 +53,7 @@ Supported env flags:
 Behavior summary:
 
 - Raw IRC `.txt` and `.txt.gz` files are imported into the native store when found.
+- Wrapped debug logs that contain embedded IRC payloads such as `... FROM SERVER: @badge-info=... PRIVMSG ...` are also treated as raw IRC sources. Other log lines in those files are ignored.
 - Simple sparse TXT files like `[0:04:26] user: msg` stay separate and are controlled by `JUSTLOG_LEGACY_TXT_MODE`.
 - JSON `.json` and `.json.gz` chat exports stay separate and are merged at read time.
 - `off` only disables reconstructed overlays. It does not disable raw IRC imports.
@@ -104,6 +105,7 @@ Supported file types:
 TXT files are classified per file:
 
 - Raw IRC text with stable Twitch metadata is imported into native storage and keeps all parsed fields.
+- Debug-style wrapper logs are accepted when they contain embedded raw IRC lines; unrelated wrapper/debug lines are skipped.
 - Simple sparse text is reconstructed into overlay messages.
 
 JSON exports are reconstructed into overlay messages using fields such as:
@@ -117,6 +119,17 @@ JSON exports are reconstructed into overlay messages using fields such as:
 - `comments[].message.body`
 
 Useful extra JSON metadata is preserved in message tags when available, such as user color, badges, emoticons, content id, video id/title, streamer name, and commenter logo.
+
+### Large import behavior
+
+Large import folders are handled incrementally:
+
+- Raw IRC imports are streamed line-by-line instead of loading full files into memory.
+- The importer logs start, periodic progress, and completion summaries through normal tracing output.
+- Progress logs are emitted every `100000` scanned lines for long-running raw imports.
+- Raw-file bookkeeping records an `importing` state before work starts and only marks a file complete when it finishes.
+- If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request.
+- Re-importing an already completed raw file is skipped when its fingerprint is unchanged.
 
 ### Empty directory cleanup
 

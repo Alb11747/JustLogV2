@@ -164,6 +164,7 @@ Supported flags:
 Behavior summary:
 
 - Raw IRC `.txt` and `.txt.gz` files found under the import folder are imported into native storage.
+- Wrapped debug-log TXT files are also accepted when they contain embedded raw IRC payloads, such as `FROM SERVER: @badge-info=... PRIVMSG ...`. Non-IRC wrapper lines are ignored.
 - Simple sparse TXT and JSON exports stay separate and are merged at read time.
 - `JUSTLOG_LEGACY_TXT_MODE` only controls reconstructed overlays.
 - `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1` only affects reconstructed-file discovery freshness.
@@ -377,10 +378,13 @@ The module searches recursively under `JUSTLOG_IMPORT_FOLDER` for files whose tr
 Supported import families:
 
 - raw IRC TXT or TXT.GZ: inserted into native storage with full parsed metadata
+- debug-wrapper TXT or TXT.GZ with embedded raw IRC lines: inserted into native storage using only extracted IRC payloads
 - simple sparse TXT: reconstructed overlay messages
 - JSON chat exports: reconstructed overlay messages with useful metadata preserved in tags
 
 If multiple matching files exist, imported and reconstructed messages are stable-sorted by timestamp. Parse failures are ignored and do not fail requests.
+
+For large import folders, raw IRC imports are streamed line-by-line instead of buffering full files in memory. The module logs start, periodic progress, and completion summaries through tracing, writes an `importing` status before each raw-file import begins, and only treats a file as current when its fingerprint matches a terminal status (`imported` or `seen`). If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request.
 
 Whenever the import folder is checked, the module also prunes empty directories below that root and removes empty parent layers upward when possible.
 
