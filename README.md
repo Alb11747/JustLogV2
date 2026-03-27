@@ -76,10 +76,13 @@ Supported env flags:
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=0|1`: delete reconstructed TXT / JSON source files that are already marked consumed with the same fingerprint. Default is `0`.
 - `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS=<n>`: global cap for concurrent archive compression jobs. Default is `min(available_parallelism, 4)`.
 - `JUSTLOG_IMPORT_MAX_RAW_WORKERS=<n>`: global cap for concurrent raw-file parsing workers during bulk raw import. Default is `min(available_parallelism, 8)`.
+- `JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION=0|1`: enable or disable the month-level numeric shard skip optimization for v1-style raw layouts. Default is `1`.
+- `JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES=<n>`: number of raw IRC lines to sample from a month-level numeric shard before it can be skipped as redundant. Default is `5`.
 
 Behavior summary:
 
 - Raw IRC `.txt` and `.txt.gz` files are imported into the native store when found.
+- Today’s live/raw `.txt` files and older `.txt.gz` files are both supported; the importer does not require gzip.
 - Wrapped debug logs that contain embedded IRC payloads such as `... FROM SERVER: @badge-info=... PRIVMSG ...` are also treated as raw IRC sources. Other log lines in those files are ignored.
 - Simple sparse TXT files like `[0:04:26] user: msg` stay separate and are controlled by `JUSTLOG_LEGACY_TXT_MODE`.
 - JSON `.json` and `.json.gz` chat exports stay separate and are merged at read time.
@@ -130,11 +133,18 @@ Example host paths:
 
 The service recurses under the import folder, so only the trailing `.../<channel_id>/<year>/<month>/<day>.*` suffix matters.
 
-It also supports v1-style raw layouts such as:
+It also supports v1-style raw layouts by trailing folder shape, regardless of the exact ancestor folder name, such as:
 
 ```text
 ./data/import-folder/v1/<channel_id>/<year>/<month>/<day>/channel.txt.gz
 ./data/import-folder/v1/<channel_id>/<year>/<month>/<user_id>.txt.gz
+```
+
+The exact top-level folder name does not matter. These also match:
+
+```text
+./data/import-folder/old-backup/759086284/2024/5/9/channel.txt
+./data/import-folder/migrate/raw/759086284/2024/5/157175714.txt.gz
 ```
 
 ### Supported file families
@@ -169,7 +179,10 @@ Useful extra JSON metadata is preserved in message tags when available, such as 
 Large import folders are handled incrementally:
 
 - Raw IRC imports are streamed line-by-line instead of loading full files into memory.
-- Bulk raw import now prefers v1 day-level `channel.txt(.gz)` files over same-day numeric shard files, so a canonical day file can skip redundant shard work before status checks and worker scheduling.
+- Bulk raw import recognizes v1-style raw layouts by trailing folder structure, not by a literal `v1` directory name.
+- Month-level numeric shard files like `.../<channel>/<year>/<month>/<user_id>.txt(.gz)` are only skipped when `JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION=1`.
+- When that optimization is enabled, a shard is skipped only after a sanity check proves its sampled IRC `id` values already exist in that month’s `.../<channel>/<year>/<month>/<day>/channel.txt(.gz)` data.
+- If a sampled raw line does not parse, lacks a real IRC `id`, or its sampled id is missing from the month channel data, the shard is kept and imported.
 - The importer logs start, periodic progress, and completion summaries through normal tracing output.
 - Progress logs are emitted every `100000` scanned lines for long-running raw imports.
 - Archive compression now runs in parallel across independent segment files, capped by `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS`.
@@ -181,6 +194,7 @@ Large import folders are handled incrementally:
 - If `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`, successfully parsed reconstructed TXT / JSON files are deleted after the request that consumed them.
 - If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1`, reconstructed TXT / JSON files that were already consumed successfully and are still unchanged are deleted during later discovery before reparsing.
 - `POST /admin/import/raw` can bulk-import raw IRC files under `JUSTLOG_IMPORT_FOLDER`, optionally filtered by `channel_id`, limited by file count, or run as `dry_run`.
+- Bulk import summaries now include `files_skipped_v1_preferred`, which counts month-level numeric shards skipped by the optimization.
 
 ### Import stall troubleshooting
 

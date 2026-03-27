@@ -435,12 +435,12 @@ async fn admin_bulk_import_raw_imports_v1_channel_tree() {
 }
 
 #[tokio::test]
-async fn admin_bulk_import_raw_prefers_v1_channel_day_file_over_same_day_user_shard() {
+async fn admin_bulk_import_raw_prefers_month_user_shard_skip_by_suffix_shape() {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();
     let import_root = temp.path().join("imports");
-    let channel_file = import_root.join("v1/1/2024/1/2/channel.txt.gz");
-    let user_file = import_root.join("v1/1/2024/1/2/200.txt.gz");
+    let channel_file = import_root.join("arbitrary/root/name/1/2024/1/2/channel.txt.gz");
+    let user_file = import_root.join("arbitrary/root/name/1/2024/1/200.txt.gz");
     fs::create_dir_all(channel_file.parent().unwrap()).unwrap();
     write_gzip(
         &channel_file,
@@ -458,18 +458,19 @@ async fn admin_bulk_import_raw_prefers_v1_channel_day_file_over_same_day_user_sh
     write_gzip(
         &user_file,
         &privmsg(
-            "bulk-import-pref-user",
+            "bulk-import-pref-channel",
             "1",
             "200",
             "viewer",
             "viewer",
             "channelone",
-            1_704_153_605_000,
-            "same day user shard",
+            1_704_153_604_000,
+            "preferred channel file",
         ),
     );
     unsafe {
         std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES", "1");
     }
 
     let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
@@ -518,6 +519,138 @@ async fn admin_bulk_import_raw_prefers_v1_channel_day_file_over_same_day_user_sh
 
     unsafe {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES");
+    }
+}
+
+#[tokio::test]
+async fn admin_bulk_import_raw_keeps_month_user_shard_when_sample_id_missing_from_channel_data() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let channel_file = import_root.join("other/prefix/1/2024/1/2/channel.txt");
+    let user_file = import_root.join("other/prefix/1/2024/1/200.txt.gz");
+    fs::create_dir_all(channel_file.parent().unwrap()).unwrap();
+    fs::write(
+        &channel_file,
+        privmsg(
+            "bulk-import-keep-channel",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "channel day line",
+        ),
+    )
+    .unwrap();
+    write_gzip(
+        &user_file,
+        &privmsg(
+            "bulk-import-keep-user",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_605_000,
+            "user shard unique line",
+        ),
+    );
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let response = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1","dry_run":true}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["summary"]["raw_candidates"], 2);
+    assert_eq!(json["summary"]["files_selected"], 2);
+    assert_eq!(json["summary"]["files_skipped_v1_preferred"], 0);
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES");
+    }
+}
+
+#[tokio::test]
+async fn admin_bulk_import_raw_can_disable_v1_month_shard_skip_optimization() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let channel_file = import_root.join("any/root/1/2024/1/2/channel.txt.gz");
+    let user_file = import_root.join("any/root/1/2024/1/200.txt.gz");
+    fs::create_dir_all(channel_file.parent().unwrap()).unwrap();
+    write_gzip(
+        &channel_file,
+        &privmsg(
+            "bulk-import-disable-skip",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "same line",
+        ),
+    );
+    write_gzip(
+        &user_file,
+        &privmsg(
+            "bulk-import-disable-skip",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "same line",
+        ),
+    );
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES", "1");
+        std::env::set_var("JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION", "0");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let response = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1","dry_run":true}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["summary"]["raw_candidates"], 2);
+    assert_eq!(json["summary"]["files_selected"], 2);
+    assert_eq!(json["summary"]["files_skipped_v1_preferred"], 0);
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES");
+        std::env::remove_var("JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION");
     }
 }
 

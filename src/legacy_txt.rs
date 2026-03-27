@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
@@ -1217,30 +1217,138 @@ struct V1ChannelDayKey {
     day: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct V1ChannelMonthKey {
+    channel_id: String,
+    year: i32,
+    month: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V1RawPathKind {
     ChannelDay,
-    DayUserShard,
-    Other,
+    MonthUserShard,
 }
 
 fn prune_v1_preferred_raw_files(files: Vec<ImportFile>) -> (Vec<ImportFile>, usize) {
-    let mut preferred_days = HashSet::new();
-    for file in &files {
-        if let Some((key, V1RawPathKind::ChannelDay)) = infer_v1_raw_layout(&file.path) {
-            preferred_days.insert(key);
+    if !is_v1_shard_skip_enabled() {
+        let mut files = files;
+        files.sort_by(|left, right| {
+            v1_raw_sort_rank(&left.path)
+                .cmp(&v1_raw_sort_rank(&right.path))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        info!("Month shard skip optimization disabled by env; keeping all candidate raw files");
+        return (files, 0);
+    }
+    let sample_lines = read_v1_skip_sample_lines_from_env();
+    let mut kept = Vec::with_capacity(files.len());
+    let mut skipped = 0usize;
+    let mut channel_files_by_month = BTreeMap::<V1ChannelMonthKey, Vec<ImportFile>>::new();
+    let mut month_user_shards = Vec::<(V1ChannelMonthKey, ImportFile)>::new();
+
+    for file in files {
+        match infer_v1_raw_layout(&file.path) {
+            Some((layout, V1RawPathKind::ChannelDay)) => {
+                channel_files_by_month
+                    .entry(layout.month_key())
+                    .or_default()
+                    .push(file);
+            }
+            Some((layout, V1RawPathKind::MonthUserShard)) => {
+                month_user_shards.push((layout.month_key(), file));
+            }
+            None => kept.push(file),
         }
     }
 
-    let mut skipped = 0usize;
-    let mut kept = Vec::with_capacity(files.len());
-    for file in files {
-        match infer_v1_raw_layout(&file.path) {
-            Some((key, V1RawPathKind::DayUserShard)) if preferred_days.contains(&key) => {
+    for channel_files in channel_files_by_month.values_mut() {
+        channel_files.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+
+    let mut month_channel_id_cache = HashMap::<V1ChannelMonthKey, HashSet<String>>::new();
+    let mut month_reason_summary = BTreeMap::<V1ChannelMonthKey, MonthShardDecisionSummary>::new();
+
+    for (month_key, file) in month_user_shards {
+        let Some(channel_files) = channel_files_by_month.get(&month_key) else {
+            month_reason_summary
+                .entry(month_key.clone())
+                .or_default()
+                .kept_no_channel_files += 1;
+            kept.push(file);
+            continue;
+        };
+
+        let month_ids = month_channel_id_cache
+            .entry(month_key.clone())
+            .or_insert_with(|| collect_month_channel_event_ids(channel_files));
+
+        match should_skip_month_user_shard(&file.path, month_ids, sample_lines) {
+            MonthShardDecision::Skip => {
                 skipped += 1;
+                month_reason_summary
+                    .entry(month_key.clone())
+                    .or_default()
+                    .skipped += 1;
             }
-            _ => kept.push(file),
+            MonthShardDecision::KeepNoChannelFiles => {
+                month_reason_summary
+                    .entry(month_key.clone())
+                    .or_default()
+                    .kept_no_channel_files += 1;
+                kept.push(file);
+            }
+            MonthShardDecision::KeepParseFailure => {
+                month_reason_summary
+                    .entry(month_key.clone())
+                    .or_default()
+                    .kept_parse_failure += 1;
+                kept.push(file);
+            }
+            MonthShardDecision::KeepMissingId => {
+                month_reason_summary
+                    .entry(month_key.clone())
+                    .or_default()
+                    .kept_missing_id += 1;
+                kept.push(file);
+            }
+            MonthShardDecision::KeepMissingMonthId => {
+                month_reason_summary
+                    .entry(month_key.clone())
+                    .or_default()
+                    .kept_missing_month_id += 1;
+                kept.push(file);
+            }
+            MonthShardDecision::KeepInsufficientSample => {
+                month_reason_summary
+                    .entry(month_key.clone())
+                    .or_default()
+                    .kept_insufficient_sample += 1;
+                kept.push(file);
+            }
         }
+    }
+
+    for (month_key, channel_files) in channel_files_by_month {
+        let summary = month_reason_summary
+            .get(&month_key)
+            .cloned()
+            .unwrap_or_default();
+        info!(
+            "Month shard skip summary {}/{}/{}: channel_files={}, skipped={}, kept_no_channel_files={}, kept_missing_id={}, kept_parse_failure={}, kept_missing_month_id={}, kept_insufficient_sample={}, sample_lines={}",
+            month_key.channel_id,
+            month_key.year,
+            month_key.month,
+            channel_files.len(),
+            summary.skipped,
+            summary.kept_no_channel_files,
+            summary.kept_missing_id,
+            summary.kept_parse_failure,
+            summary.kept_missing_month_id,
+            summary.kept_insufficient_sample,
+            sample_lines
+        );
+        kept.extend(channel_files);
     }
 
     kept.sort_by(|left, right| {
@@ -1254,8 +1362,8 @@ fn prune_v1_preferred_raw_files(files: Vec<ImportFile>) -> (Vec<ImportFile>, usi
 fn v1_raw_sort_rank(path: &Path) -> u8 {
     match infer_v1_raw_layout(path) {
         Some((_, V1RawPathKind::ChannelDay)) => 0,
-        Some((_, V1RawPathKind::DayUserShard)) => 1,
-        Some((_, V1RawPathKind::Other)) | None => 2,
+        Some((_, V1RawPathKind::MonthUserShard)) => 1,
+        None => 2,
     }
 }
 
@@ -1264,17 +1372,15 @@ fn infer_v1_raw_layout(path: &Path) -> Option<(V1ChannelDayKey, V1RawPathKind)> 
         .components()
         .map(|component| component.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()?;
-    let v1_index = components.iter().position(|component| *component == "v1")?;
-    let rest = components.get(v1_index + 1..)?;
-    if rest.len() < 4 {
+    if components.len() < 4 {
         return None;
     }
-    let channel_id = rest[0].to_string();
-    let year = rest[1].parse::<i32>().ok()?;
-    let month = rest[2].parse::<u32>().ok()?;
-
-    if rest.len() >= 5 && is_channel_day_filename(rest[4]) {
-        let day = rest[3].parse::<u32>().ok()?;
+    let file_name = *components.last()?;
+    if components.len() >= 5 && is_channel_day_filename(file_name) {
+        let day = components[components.len() - 2].parse::<u32>().ok()?;
+        let month = components[components.len() - 3].parse::<u32>().ok()?;
+        let year = components[components.len() - 4].parse::<i32>().ok()?;
+        let channel_id = components[components.len() - 5].to_string();
         return Some((
             V1ChannelDayKey {
                 channel_id,
@@ -1285,19 +1391,10 @@ fn infer_v1_raw_layout(path: &Path) -> Option<(V1ChannelDayKey, V1RawPathKind)> 
             V1RawPathKind::ChannelDay,
         ));
     }
-    if rest.len() >= 5 && is_v1_user_shard_filename(rest[4]) {
-        let day = rest[3].parse::<u32>().ok()?;
-        return Some((
-            V1ChannelDayKey {
-                channel_id,
-                year,
-                month,
-                day,
-            },
-            V1RawPathKind::DayUserShard,
-        ));
-    }
-    if rest.len() >= 4 && is_v1_user_shard_filename(rest[3]) {
+    if is_v1_user_shard_filename(file_name) && components.len() >= 4 {
+        let month = components[components.len() - 2].parse::<u32>().ok()?;
+        let year = components[components.len() - 3].parse::<i32>().ok()?;
+        let channel_id = components[components.len() - 4].to_string();
         return Some((
             V1ChannelDayKey {
                 channel_id,
@@ -1305,10 +1402,112 @@ fn infer_v1_raw_layout(path: &Path) -> Option<(V1ChannelDayKey, V1RawPathKind)> 
                 month,
                 day: 0,
             },
-            V1RawPathKind::Other,
+            V1RawPathKind::MonthUserShard,
         ));
     }
     None
+}
+
+impl V1ChannelDayKey {
+    fn month_key(&self) -> V1ChannelMonthKey {
+        V1ChannelMonthKey {
+            channel_id: self.channel_id.clone(),
+            year: self.year,
+            month: self.month,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MonthShardDecisionSummary {
+    skipped: usize,
+    kept_no_channel_files: usize,
+    kept_missing_id: usize,
+    kept_parse_failure: usize,
+    kept_missing_month_id: usize,
+    kept_insufficient_sample: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonthShardDecision {
+    Skip,
+    KeepNoChannelFiles,
+    KeepMissingId,
+    KeepParseFailure,
+    KeepMissingMonthId,
+    KeepInsufficientSample,
+}
+
+fn collect_month_channel_event_ids(files: &[ImportFile]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for file in files {
+        let _ = for_each_line_in_supported_file(&file.path, |line| {
+            let Some(raw) = extract_raw_irc_line(&line) else {
+                return Ok(());
+            };
+            let Ok(Some(event)) = CanonicalEvent::from_raw(&raw) else {
+                return Ok(());
+            };
+            if let Some(event_uid) = skip_proof_event_uid(&event) {
+                ids.insert(event_uid.to_string());
+            }
+            Ok(())
+        });
+    }
+    ids
+}
+
+fn should_skip_month_user_shard(
+    path: &Path,
+    month_channel_ids: &HashSet<String>,
+    sample_lines: usize,
+) -> MonthShardDecision {
+    if month_channel_ids.is_empty() {
+        return MonthShardDecision::KeepNoChannelFiles;
+    }
+
+    let mut sampled = 0usize;
+    let result = for_each_line_in_supported_file(path, |line| {
+        let Some(raw) = extract_raw_irc_line(&line) else {
+            return Ok(());
+        };
+        let Ok(Some(event)) = CanonicalEvent::from_raw(&raw) else {
+            return Err(anyhow!("sample-parse-failure"));
+        };
+        let Some(event_uid) = skip_proof_event_uid(&event) else {
+            return Err(anyhow!("sample-missing-id"));
+        };
+        if !month_channel_ids.contains(event_uid) {
+            return Err(anyhow!("sample-missing-month-id"));
+        }
+        sampled += 1;
+        if sampled >= sample_lines {
+            return Err(anyhow!("sample-skip"));
+        }
+        Ok(())
+    });
+
+    match result {
+        Err(error) if error.to_string() == "sample-skip" => MonthShardDecision::Skip,
+        Err(error) if error.to_string() == "sample-parse-failure" => {
+            MonthShardDecision::KeepParseFailure
+        }
+        Err(error) if error.to_string() == "sample-missing-id" => MonthShardDecision::KeepMissingId,
+        Err(error) if error.to_string() == "sample-missing-month-id" => {
+            MonthShardDecision::KeepMissingMonthId
+        }
+        Ok(()) if sampled < sample_lines => MonthShardDecision::KeepInsufficientSample,
+        Ok(()) => MonthShardDecision::Skip,
+        Err(_) => MonthShardDecision::KeepParseFailure,
+    }
+}
+
+fn skip_proof_event_uid<'a>(event: &'a CanonicalEvent) -> Option<&'a str> {
+    event
+        .tags
+        .get("id")
+        .filter(|value| !value.is_empty())
+        .and_then(|_| (!event.event_uid.is_empty()).then_some(event.event_uid.as_str()))
 }
 
 fn is_channel_day_filename(name: &str) -> bool {
@@ -1345,6 +1544,18 @@ fn default_max_raw_workers() -> usize {
         .unwrap_or(2)
         .min(8)
         .max(1)
+}
+
+fn read_v1_skip_sample_lines_from_env() -> usize {
+    std::env::var("JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5)
+}
+
+fn is_v1_shard_skip_enabled() -> bool {
+    env_flag("JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION", true)
 }
 
 fn raw_file_matches_channel(file: &ImportFile, channel_id: &str) -> bool {
