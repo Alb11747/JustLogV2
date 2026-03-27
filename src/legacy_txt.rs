@@ -100,6 +100,14 @@ impl LegacyTxtRuntime {
         day: u32,
     ) -> Result<()> {
         let files = self.discover_import_files()?;
+        let (raw_count, simple_count, json_count) = import_kind_counts(&files);
+        info!(
+            "Import-folder scan for channel-day {channel_id}/{year}/{month}/{day}: {} candidate file(s), raw={}, simple={}, json={}",
+            files.len(),
+            raw_count,
+            simple_count,
+            json_count
+        );
         self.import_raw_files(
             store,
             files,
@@ -110,6 +118,14 @@ impl LegacyTxtRuntime {
 
     pub fn import_raw_channel(&self, store: &Store, channel_id: &str) -> Result<()> {
         let files = self.discover_import_files()?;
+        let (raw_count, simple_count, json_count) = import_kind_counts(&files);
+        info!(
+            "Import-folder scan for channel {channel_id}: {} candidate file(s), raw={}, simple={}, json={}",
+            files.len(),
+            raw_count,
+            simple_count,
+            json_count
+        );
         self.import_raw_files(store, files, &format!("channel {channel_id}"))?;
         Ok(())
     }
@@ -123,7 +139,11 @@ impl LegacyTxtRuntime {
         day: u32,
     ) -> Result<ChannelDayImport> {
         let mut result = ChannelDayImport::default();
-        for file in self.discover_import_files()? {
+        let files = self.discover_import_files()?;
+        let (raw_count, simple_count, json_count) = import_kind_counts(&files);
+        let mut matched_simple_files = 0usize;
+        let mut matched_json_files = 0usize;
+        for file in files {
             match file.kind {
                 ImportKind::RawIrc => {}
                 ImportKind::SimpleText => {
@@ -144,6 +164,7 @@ impl LegacyTxtRuntime {
                         parse_sparse_txt_file(&file.path, channel_login, year, month, day)
                     {
                         if !messages.is_empty() {
+                            matched_simple_files += 1;
                             result.simple_messages.extend(messages);
                             self.delete_import_file_if_configured(&file, false);
                         }
@@ -160,6 +181,7 @@ impl LegacyTxtRuntime {
                             })
                             .collect::<Vec<_>>();
                         if !matching.is_empty() {
+                            matched_json_files += 1;
                             result.complete_messages.extend(matching);
                             self.delete_import_file_if_configured(&file, false);
                         }
@@ -173,13 +195,25 @@ impl LegacyTxtRuntime {
         result
             .simple_messages
             .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        info!(
+            "Overlay scan for channel-day {channel_id}/{year}/{month}/{day}: candidate file(s) raw={}, simple={}, json={}; matched file(s) simple={}, json={}; message(s) simple={}, complete={}",
+            raw_count,
+            simple_count,
+            json_count,
+            matched_simple_files,
+            matched_json_files,
+            result.simple_messages.len(),
+            result.complete_messages.len()
+        );
         Ok(result)
     }
 
     pub fn available_channel_logs(&self, channel_id: &str) -> Result<Vec<ChannelLogFile>> {
         let mut logs = Vec::new();
         let mut seen = HashSet::new();
-        for file in self.discover_import_files()? {
+        let files = self.discover_import_files()?;
+        let (raw_count, simple_count, json_count) = import_kind_counts(&files);
+        for file in files {
             match file.kind {
                 ImportKind::RawIrc => {}
                 ImportKind::SimpleText => {
@@ -230,6 +264,13 @@ impl LegacyTxtRuntime {
                 .then_with(|| right.month.cmp(&left.month))
                 .then_with(|| right.day.cmp(&left.day))
         });
+        info!(
+            "Import-folder availability scan for channel {channel_id}: candidate file(s) raw={}, simple={}, json={}; discovered day(s)={}",
+            raw_count,
+            simple_count,
+            json_count,
+            logs.len()
+        );
         Ok(logs)
     }
 
@@ -290,6 +331,7 @@ impl LegacyTxtRuntime {
             .filter(|file| file.kind == ImportKind::RawIrc)
             .collect::<Vec<_>>();
         if pending.is_empty() {
+            info!("Raw import scan for {scope}: no raw candidate files found");
             return Ok(());
         }
 
@@ -306,6 +348,7 @@ impl LegacyTxtRuntime {
             remaining.push(file);
         }
         if remaining.is_empty() {
+            info!("Raw import scan for {scope}: all raw candidate files already current");
             return Ok(());
         }
 
@@ -354,6 +397,20 @@ impl LegacyTxtRuntime {
             );
         }
     }
+}
+
+fn import_kind_counts(files: &[ImportFile]) -> (usize, usize, usize) {
+    let mut raw = 0usize;
+    let mut simple = 0usize;
+    let mut json = 0usize;
+    for file in files {
+        match file.kind {
+            ImportKind::RawIrc => raw += 1,
+            ImportKind::SimpleText => simple += 1,
+            ImportKind::JsonExport => json += 1,
+        }
+    }
+    (raw, simple, json)
 }
 
 pub fn merge_messages(
