@@ -78,6 +78,14 @@ async fn uppercase_log_paths_redirect_to_lowercase() {
 
 #[tokio::test]
 async fn seeded_archived_raw_route_returns_brotli_payload() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_RAW");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED");
+    }
     let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
     let event = CanonicalEvent::from_raw(&privmsg(
         "smoke-archive-1",
@@ -112,6 +120,14 @@ async fn seeded_archived_raw_route_returns_brotli_payload() {
     use std::io::Read as _;
     decoder.read_to_string(&mut output).unwrap();
     assert!(output.contains("archived smoke"));
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_RAW");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED");
+    }
 }
 
 #[test]
@@ -377,6 +393,54 @@ async fn import_folder_can_delete_reconstructed_files_after_read() {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
         std::env::remove_var("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED");
+    }
+}
+
+#[tokio::test]
+async fn import_folder_can_import_log_files_from_arbitrary_subdirs() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("logs.2/debug.1.log");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(
+        &import_file,
+        format!(
+            "2024-03-21 14:09:30.126 irc.client 333 DEBUG: FROM SERVER: {}\n2024-03-21 14:09:30.127 irc.client 1221 DEBUG: _dispatcher: all_raw_messages\n",
+            privmsg(
+                "import-log-anywhere-1",
+                "1",
+                "200",
+                "viewer",
+                "viewer",
+                "channelone",
+                1_710_990_570_007,
+                "log import anywhere",
+            )
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/3/21")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert!(body.contains("log import anywhere"));
+    assert_eq!(harness.state.store.event_count().unwrap(), 1);
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
     }
 }
 

@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use flate2::read::GzDecoder;
 use regex::Regex;
 use serde::Deserialize;
@@ -44,9 +44,6 @@ struct ImportFile {
     path: PathBuf,
     fingerprint: String,
     kind: ImportKind,
-    year: i32,
-    month: u32,
-    day: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -102,7 +99,7 @@ impl LegacyTxtRuntime {
         month: u32,
         day: u32,
     ) -> Result<()> {
-        let files = self.discover_channel_day_files(channel_id, year, month, day)?;
+        let files = self.discover_import_files()?;
         self.import_raw_files(
             store,
             files,
@@ -112,7 +109,7 @@ impl LegacyTxtRuntime {
     }
 
     pub fn import_raw_channel(&self, store: &Store, channel_id: &str) -> Result<()> {
-        let files = self.discover_channel_files(channel_id)?;
+        let files = self.discover_import_files()?;
         self.import_raw_files(store, files, &format!("channel {channel_id}"))?;
         Ok(())
     }
@@ -126,24 +123,46 @@ impl LegacyTxtRuntime {
         day: u32,
     ) -> Result<ChannelDayImport> {
         let mut result = ChannelDayImport::default();
-        for file in self.discover_channel_day_files(channel_id, year, month, day)? {
+        for file in self.discover_import_files()? {
             match file.kind {
                 ImportKind::RawIrc => {}
                 ImportKind::SimpleText => {
                     if self.mode == LegacyTxtMode::Off {
                         continue;
                     }
+                    if !simple_text_file_matches_request(
+                        &file.path,
+                        channel_id,
+                        channel_login,
+                        year,
+                        month,
+                        day,
+                    ) {
+                        continue;
+                    }
                     if let Ok(messages) =
                         parse_sparse_txt_file(&file.path, channel_login, year, month, day)
                     {
-                        result.simple_messages.extend(messages);
-                        self.delete_import_file_if_configured(&file, false);
+                        if !messages.is_empty() {
+                            result.simple_messages.extend(messages);
+                            self.delete_import_file_if_configured(&file, false);
+                        }
                     }
                 }
                 ImportKind::JsonExport => {
                     if let Ok(messages) = parse_json_export_file(&file.path, channel_login) {
-                        result.complete_messages.extend(messages);
-                        self.delete_import_file_if_configured(&file, false);
+                        let matching = messages
+                            .into_iter()
+                            .filter(|message| {
+                                chat_message_matches_channel_day(
+                                    message, channel_id, year, month, day,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if !matching.is_empty() {
+                            result.complete_messages.extend(matching);
+                            self.delete_import_file_if_configured(&file, false);
+                        }
                     }
                 }
             }
@@ -160,17 +179,48 @@ impl LegacyTxtRuntime {
     pub fn available_channel_logs(&self, channel_id: &str) -> Result<Vec<ChannelLogFile>> {
         let mut logs = Vec::new();
         let mut seen = HashSet::new();
-        for file in self.discover_channel_files(channel_id)? {
-            if file.kind == ImportKind::SimpleText && self.mode == LegacyTxtMode::Off {
-                continue;
-            }
-            let key = (file.year, file.month, file.day);
-            if seen.insert(key) {
-                logs.push(ChannelLogFile {
-                    year: file.year.to_string(),
-                    month: file.month.to_string(),
-                    day: file.day.to_string(),
-                });
+        for file in self.discover_import_files()? {
+            match file.kind {
+                ImportKind::RawIrc => {}
+                ImportKind::SimpleText => {
+                    if self.mode == LegacyTxtMode::Off {
+                        continue;
+                    }
+                    if let Some((year, month, day)) =
+                        infer_simple_text_channel_day(&file.path, channel_id, None)
+                    {
+                        let key = (year, month, day);
+                        if seen.insert(key) {
+                            logs.push(ChannelLogFile {
+                                year: year.to_string(),
+                                month: month.to_string(),
+                                day: day.to_string(),
+                            });
+                        }
+                    }
+                }
+                ImportKind::JsonExport => {
+                    if let Ok(messages) = parse_json_export_file(&file.path, "") {
+                        for message in messages {
+                            let room_id = message.tags.get("room-id").cloned().unwrap_or_default();
+                            if room_id != channel_id {
+                                continue;
+                            }
+                            let key = (
+                                message.timestamp.year(),
+                                message.timestamp.month(),
+                                message.timestamp.day(),
+                            );
+                            if seen.insert(key) {
+                                logs.push(ChannelLogFile {
+                                    year: key.0.to_string(),
+                                    month: key.1.to_string(),
+                                    day: key.2.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
         logs.sort_by(|left, right| {
@@ -183,13 +233,7 @@ impl LegacyTxtRuntime {
         Ok(logs)
     }
 
-    fn discover_channel_day_files(
-        &self,
-        channel_id: &str,
-        year: i32,
-        month: u32,
-        day: u32,
-    ) -> Result<Vec<ImportFile>> {
+    fn discover_import_files(&self) -> Result<Vec<ImportFile>> {
         let Some(root) = self.import_folder_path() else {
             return Ok(Vec::new());
         };
@@ -199,14 +243,7 @@ impl LegacyTxtRuntime {
                 continue;
             }
             let path = entry.into_path();
-            let Some(details) = match_import_path(&root, &path) else {
-                continue;
-            };
-            if details.0 != channel_id
-                || details.1 != year
-                || details.2 != month
-                || details.3 != day
-            {
+            if !is_supported_import_path(&path) {
                 continue;
             }
             let kind = match classify_import_file(&path) {
@@ -221,48 +258,6 @@ impl LegacyTxtRuntime {
                     path: path.clone(),
                     fingerprint: file_fingerprint(&path)?,
                     kind,
-                    year,
-                    month,
-                    day,
-                });
-            }
-        }
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(files)
-    }
-
-    fn discover_channel_files(&self, channel_id: &str) -> Result<Vec<ImportFile>> {
-        let Some(root) = self.import_folder_path() else {
-            return Ok(Vec::new());
-        };
-        let mut files = Vec::new();
-        for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.into_path();
-            let Some((matched_channel_id, year, month, day)) = match_import_path(&root, &path)
-            else {
-                continue;
-            };
-            if matched_channel_id != channel_id {
-                continue;
-            }
-            let kind = match classify_import_file(&path) {
-                Ok(kind) => kind,
-                Err(error) => {
-                    warn!("Skipping import candidate {}: {error:#}", path.display());
-                    None
-                }
-            };
-            if let Some(kind) = kind {
-                files.push(ImportFile {
-                    path: path.clone(),
-                    fingerprint: file_fingerprint(&path)?,
-                    kind,
-                    year,
-                    month,
-                    day,
                 });
             }
         }
@@ -379,7 +374,11 @@ fn classify_import_file(path: &Path) -> Result<Option<ImportKind>> {
     if name.ends_with(".json") || name.ends_with(".json.gz") {
         return Ok(Some(ImportKind::JsonExport));
     }
-    if !(name.ends_with(".txt") || name.ends_with(".txt.gz")) {
+    if !(name.ends_with(".txt")
+        || name.ends_with(".txt.gz")
+        || name.ends_with(".log")
+        || name.ends_with(".log.gz"))
+    {
         return Ok(None);
     }
     if behaves_like_raw_irc_path(path)? {
@@ -804,34 +803,111 @@ fn file_fingerprint(path: &Path) -> Result<String> {
     Ok(format!("{}:{modified}", metadata.len()))
 }
 
-fn match_import_path(root: &Path, path: &Path) -> Option<(String, i32, u32, u32)> {
-    let suffix = path
-        .strip_prefix(root)
-        .ok()?
+fn is_supported_import_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".txt")
+        || name.ends_with(".txt.gz")
+        || name.ends_with(".json")
+        || name.ends_with(".json.gz")
+        || name.ends_with(".log")
+        || name.ends_with(".log.gz")
+}
+
+fn infer_filename_channel_day(path: &Path, channel_login: Option<&str>) -> Option<(i32, u32, u32)> {
+    let file_name = path.file_name()?.to_string_lossy();
+    let regex = Regex::new(r"\[(\d{1,2})-(\d{1,2})-(\d{2,4})\]").ok()?;
+    let captures = regex.captures(&file_name)?;
+    let month = captures.get(1)?.as_str().parse::<u32>().ok()?;
+    let day = captures.get(2)?.as_str().parse::<u32>().ok()?;
+    let mut year = captures.get(3)?.as_str().parse::<i32>().ok()?;
+    if year < 100 {
+        year += 2000;
+    }
+    if let Some(channel_login) = channel_login {
+        let channel_login = channel_login.trim().to_ascii_lowercase();
+        if !channel_login.is_empty() && !file_name.to_ascii_lowercase().contains(&channel_login) {
+            return None;
+        }
+    }
+    Some((year, month, day))
+}
+
+fn infer_legacy_path_channel_day(path: &Path) -> Option<(String, i32, u32, u32)> {
+    let components = path
         .components()
         .map(|component| component.as_os_str().to_string_lossy().to_string())
         .collect::<Vec<_>>();
-    if suffix.len() < 4 {
+    if components.len() < 4 {
         return None;
     }
-    let len = suffix.len();
-    let channel_id = suffix[len - 4].clone();
-    let year = suffix[len - 3].parse::<i32>().ok()?;
-    let month = suffix[len - 2].parse::<u32>().ok()?;
-    let file_name = &suffix[len - 1];
-    let day_stem = if let Some(stripped) = file_name.strip_suffix(".txt.gz") {
-        stripped
-    } else if let Some(stripped) = file_name.strip_suffix(".json.gz") {
-        stripped
-    } else if let Some(stripped) = file_name.strip_suffix(".txt") {
-        stripped
-    } else if let Some(stripped) = file_name.strip_suffix(".json") {
-        stripped
-    } else {
-        return None;
-    };
-    let day = day_stem.parse::<u32>().ok()?;
+    let len = components.len();
+    let channel_id = components[len - 4].clone();
+    let year = components[len - 3].parse::<i32>().ok()?;
+    let month = components[len - 2].parse::<u32>().ok()?;
+    let file_name = &components[len - 1];
+    let stem = file_name
+        .strip_suffix(".txt.gz")
+        .or_else(|| file_name.strip_suffix(".log.gz"))
+        .or_else(|| file_name.strip_suffix(".json.gz"))
+        .or_else(|| file_name.strip_suffix(".txt"))
+        .or_else(|| file_name.strip_suffix(".log"))
+        .or_else(|| file_name.strip_suffix(".json"))?;
+    let day = stem.parse::<u32>().ok()?;
     Some((channel_id, year, month, day))
+}
+
+fn infer_simple_text_channel_day(
+    path: &Path,
+    channel_id: &str,
+    channel_login: Option<&str>,
+) -> Option<(i32, u32, u32)> {
+    if let Some((matched_channel_id, year, month, day)) = infer_legacy_path_channel_day(path) {
+        if !channel_id.is_empty() && matched_channel_id == channel_id {
+            return Some((year, month, day));
+        }
+    }
+    infer_filename_channel_day(path, channel_login)
+}
+
+fn simple_text_file_matches_request(
+    path: &Path,
+    channel_id: &str,
+    channel_login: &str,
+    year: i32,
+    month: u32,
+    day: u32,
+) -> bool {
+    matches!(
+        infer_simple_text_channel_day(
+            path,
+            channel_id,
+            if channel_login.trim().is_empty() {
+                None
+            } else {
+                Some(channel_login)
+            }
+        ),
+        Some((matched_year, matched_month, matched_day))
+            if matched_year == year && matched_month == month && matched_day == day
+    )
+}
+
+fn chat_message_matches_channel_day(
+    message: &ChatMessage,
+    channel_id: &str,
+    year: i32,
+    month: u32,
+    day: u32,
+) -> bool {
+    let room_id = message.tags.get("room-id").cloned().unwrap_or_default();
+    room_id == channel_id
+        && message.timestamp.year() == year
+        && message.timestamp.month() == month
+        && message.timestamp.day() == day
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
@@ -970,10 +1046,10 @@ mod tests {
     fn recursive_lookup_and_prune_work() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("imports");
-        fs::create_dir_all(root.join("nested/copy/1/2024/1")).unwrap();
+        fs::create_dir_all(root.join("nested/copy")).unwrap();
         fs::create_dir_all(root.join("nested/empty/a/b")).unwrap();
         fs::write(
-            root.join("nested/copy/1/2024/1/2.txt"),
+            root.join("nested/copy/[1-2-24] channelone - Chat.txt"),
             "[0:00:04] User: hello",
         )
         .unwrap();
@@ -985,7 +1061,7 @@ mod tests {
             delete_reconstructed_after_read: false,
             import_folder_exists_at_startup: true,
         };
-        let files = runtime.discover_channel_day_files("1", 2024, 1, 2).unwrap();
+        let files = runtime.discover_import_files().unwrap();
         assert_eq!(files.len(), 1);
         assert!(!root.join("nested/empty/a/b").exists());
     }
