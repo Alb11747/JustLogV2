@@ -47,6 +47,12 @@ Agents should normally commit:
 - build/config changes such as `Cargo.toml`, `Cargo.lock`, `Dockerfile`, or workflow updates
 - documentation when it materially helps future work
 
+### Documentation Expectations
+
+- When adding a new meaningful feature, update the relevant documentation in the same change when practical.
+- Treat user-visible behavior, new endpoints, config changes, and operational workflow changes as documentation-sensitive by default.
+- If a feature does not need a docs update, agents should make that a conscious decision rather than silently skipping docs.
+
 Agents should normally avoid committing:
 
 - `target/`
