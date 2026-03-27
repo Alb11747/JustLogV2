@@ -14,8 +14,14 @@ use common::{MockJustLogServer, TestHarness, privmsg};
 
 fn recent_messages_runtime(base_url: &str) -> RecentMessagesRuntime {
     let mut vars = HashMap::new();
-    vars.insert("JUSTLOG_RECENT_MESSAGES_ENABLED".to_string(), "1".to_string());
-    vars.insert("JUSTLOG_RECENT_MESSAGES_URL".to_string(), base_url.to_string());
+    vars.insert(
+        "JUSTLOG_RECENT_MESSAGES_ENABLED".to_string(),
+        "1".to_string(),
+    );
+    vars.insert(
+        "JUSTLOG_RECENT_MESSAGES_URL".to_string(),
+        base_url.to_string(),
+    );
     RecentMessagesRuntime::from_summary(RecentMessagesRuntime::summary_from_map(&vars))
 }
 
@@ -97,7 +103,10 @@ async fn reconnect_backfill_loads_missed_messages_from_robotty() {
     let harness = TestHarness::start_with_recent_messages_runtime(
         vec!["1".to_string()],
         true,
-        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+        Arc::new(recent_messages_runtime(&format!(
+            "{}/api/v2/recent-messages",
+            remote.base_url()
+        ))),
     )
     .await;
     harness.irc.wait_for_connections(2).await;
@@ -158,7 +167,10 @@ async fn runtime_join_triggers_recent_message_backfill() {
     let harness = TestHarness::start_with_recent_messages_runtime(
         vec!["1".to_string()],
         true,
-        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+        Arc::new(recent_messages_runtime(&format!(
+            "{}/api/v2/recent-messages",
+            remote.base_url()
+        ))),
     )
     .await;
     harness.irc.wait_for_connections(2).await;
@@ -198,7 +210,10 @@ async fn robotty_backfill_does_not_duplicate_existing_events() {
     let harness = TestHarness::start_with_recent_messages_runtime(
         vec!["1".to_string()],
         true,
-        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+        Arc::new(recent_messages_runtime(&format!(
+            "{}/api/v2/recent-messages",
+            remote.base_url()
+        ))),
     )
     .await;
     harness.irc.wait_for_connections(2).await;
@@ -233,7 +248,10 @@ async fn robotty_api_errors_do_not_break_live_ingest() {
     let harness = TestHarness::start_with_recent_messages_runtime(
         vec!["1".to_string()],
         true,
-        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+        Arc::new(recent_messages_runtime(&format!(
+            "{}/api/v2/recent-messages",
+            remote.base_url()
+        ))),
     )
     .await;
     harness.irc.wait_for_connections(2).await;
@@ -283,7 +301,10 @@ async fn malformed_robotty_payload_lines_are_ignored_without_crashing_ingest() {
     let harness = TestHarness::start_with_recent_messages_runtime(
         vec!["1".to_string()],
         true,
-        Arc::new(recent_messages_runtime(&format!("{}/api/v2/recent-messages", remote.base_url()))),
+        Arc::new(recent_messages_runtime(&format!(
+            "{}/api/v2/recent-messages",
+            remote.base_url()
+        ))),
     )
     .await;
     harness.irc.wait_for_connections(2).await;

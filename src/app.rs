@@ -12,6 +12,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HyperServerBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, watch};
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -106,17 +107,31 @@ pub async fn run_cli() -> Result<()> {
         shutdown_rx.clone(),
     );
 
+    let state_for_server = state.clone();
+    let listen_address = config.listen_address.clone();
+    let mut server =
+        tokio::spawn(async move { serve(state_for_server, &listen_address, shutdown_rx).await });
+
     tokio::select! {
-        result = serve(state, &config.listen_address, shutdown_rx) => {
-            result?;
+        result = &mut server => {
+            result.map_err(|error| anyhow::anyhow!("server join error: {error}"))??;
         }
         _ = wait_for_shutdown_signal() => {
             info!("shutdown signal received");
+            store.request_shutdown();
+            let _ = shutdown_tx.send(true);
+            ingest.stop();
+            match tokio::time::timeout(Duration::from_secs(25), server).await {
+                Ok(result) => {
+                    result.map_err(|error| anyhow::anyhow!("server join error: {error}"))??;
+                }
+                Err(_) => {
+                    warn!("graceful shutdown timeout reached; exiting with in-flight work cancelled");
+                }
+            }
         }
     }
 
-    let _ = shutdown_tx.send(true);
-    ingest.stop();
     Ok(())
 }
 
@@ -129,15 +144,20 @@ async fn serve(
     let listener = TcpListener::bind(bind_address).await?;
     let local_address = listener.local_addr()?;
     info!("Listening on {local_address}");
+    let mut connections = JoinSet::new();
     loop {
         let accept = listener.accept();
         tokio::pin!(accept);
-        let (stream, remote_address) = tokio::select! {
-            result = &mut accept => result?,
-            _ = shutdown.changed() => return Ok(()),
+        let maybe_connection = tokio::select! {
+            result = &mut accept => Some(result?),
+            _ = shutdown.changed() => None,
+        };
+        let Some((stream, remote_address)) = maybe_connection else {
+            info!("HTTP server stopping accepts; draining active connections");
+            break;
         };
         let state = state.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let io = TokioIo::new(stream);
             let service = service_fn(move |request| {
                 let state = state.clone();
@@ -153,6 +173,12 @@ async fn serve(
             }
         });
     }
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            warn!("connection task join error during shutdown: {error}");
+        }
+    }
+    Ok(())
 }
 
 async fn wait_for_shutdown_signal() {

@@ -3,6 +3,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -571,6 +572,10 @@ impl LegacyTxtRuntime {
         let mut remaining = Vec::new();
         let mut total_bytes = 0u64;
         for file in pending {
+            if store.shutdown_requested() {
+                info!("store shutdown requested; stopping raw import candidate scan for {scope}");
+                break;
+            }
             let path_key = file.path.to_string_lossy().to_string();
             let status_check_started = Instant::now();
             info!("Checking raw import status for {}", file.path.display());
@@ -618,6 +623,10 @@ impl LegacyTxtRuntime {
         let total_files = remaining.len();
         let mut outcome = RawImportOutcome::default();
         for (index, file) in remaining.into_iter().enumerate() {
+            if store.shutdown_requested() {
+                info!("store shutdown requested; stopping raw import loop for {scope}");
+                break;
+            }
             match import_raw_file_with_progress(store, &file, index + 1, total_files) {
                 Ok(file_outcome) => outcome.extend(file_outcome),
                 Err(error) => {
@@ -648,6 +657,12 @@ impl LegacyTxtRuntime {
 
         let mut discovery = BulkRawDiscovery::default();
         for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+            if limit_files.is_some_and(|limit| discovery.selected.len() >= limit)
+                || channel_id.is_some()
+                    && discovery.selected.len() >= limit_files.unwrap_or(usize::MAX)
+            {
+                break;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -710,35 +725,44 @@ impl LegacyTxtRuntime {
         files: &[ImportFile],
         summary: &mut BulkRawImportSummary,
     ) -> Result<()> {
-        let total_files = files.len();
-        if total_files == 0 {
+        let planned_files = files.len();
+        if planned_files == 0 {
             return Ok(());
         }
-        let worker_count = default_bulk_raw_worker_count().min(total_files.max(1));
+        let worker_count = default_bulk_raw_worker_count().min(planned_files.max(1));
         info!(
             "Starting parallel bulk raw import with {} worker(s) for {} pending file(s)",
-            worker_count, total_files
+            worker_count, planned_files
         );
 
         let (work_tx, work_rx) =
             mpsc::sync_channel::<Option<(usize, ImportFile)>>(worker_count * 2);
         let (result_tx, result_rx) = mpsc::sync_channel::<RawWorkerMessage>(worker_count * 4);
+        let shutdown = Arc::new(AtomicBool::new(store.shutdown_requested()));
 
         let mut workers = Vec::new();
         let shared_rx = Arc::new(Mutex::new(work_rx));
         for _ in 0..worker_count {
             let sender = result_tx.clone();
             let receiver = Arc::clone(&shared_rx);
+            let shutdown = Arc::clone(&shutdown);
             workers.push(thread::spawn(move || {
-                raw_import_worker_loop(receiver, sender)
+                raw_import_worker_loop(receiver, sender, shutdown)
             }));
         }
         drop(result_tx);
 
+        let mut scheduled_files = 0usize;
         for (index, file) in files.iter().cloned().enumerate() {
+            if store.shutdown_requested() {
+                shutdown.store(true, Ordering::SeqCst);
+                info!("store shutdown requested; stopping bulk raw import job scheduling");
+                break;
+            }
             let path_key = file.path.to_string_lossy().to_string();
             store.record_imported_raw_file(&path_key, &file.fingerprint, "importing")?;
             work_tx.send(Some((index, file)))?;
+            scheduled_files += 1;
         }
         for _ in 0..worker_count {
             work_tx.send(None)?;
@@ -749,7 +773,10 @@ impl LegacyTxtRuntime {
         let mut all_channel_days = BTreeSet::new();
         let mut all_user_months = BTreeSet::new();
         let mut finished = 0usize;
-        while finished < total_files {
+        while finished < scheduled_files {
+            if store.shutdown_requested() {
+                shutdown.store(true, Ordering::SeqCst);
+            }
             let message = result_rx
                 .recv()
                 .map_err(|_| anyhow!("bulk raw import worker channel closed unexpectedly"))?;
@@ -764,7 +791,7 @@ impl LegacyTxtRuntime {
                     info!(
                         "Committed raw batch for file {}/{} in {:?}: batch_events={}, imported={}, skipped={}",
                         chunk.file_index + 1,
-                        total_files,
+                        scheduled_files,
                         batch_started.elapsed(),
                         chunk.events.len(),
                         state.imported,
@@ -834,7 +861,7 @@ impl LegacyTxtRuntime {
                     info!(
                         "Completed bulk raw import {}/{} {}: scanned {}, raw_candidates {}, imported {}, skipped {}, parse_errors {}",
                         file_index + 1,
-                        total_files,
+                        scheduled_files,
                         file.path.display(),
                         state.scanned_lines,
                         state.candidate_lines,
@@ -842,10 +869,11 @@ impl LegacyTxtRuntime {
                         state.skipped_events + state.parse_skipped,
                         state.parse_errors
                     );
-                    if finished % BULK_IMPORT_SUMMARY_FILE_INTERVAL == 0 || finished == total_files
+                    if finished % BULK_IMPORT_SUMMARY_FILE_INTERVAL == 0
+                        || finished == scheduled_files
                     {
                         info!(
-                            "Bulk raw import summary: finished={finished}/{total_files}, imported_files={}, failed_files={}, deleted_files={}, channel_days={}, user_months={}",
+                            "Bulk raw import summary: finished={finished}/{scheduled_files}, imported_files={}, failed_files={}, deleted_files={}, channel_days={}, user_months={}",
                             summary.files_imported,
                             summary.files_failed,
                             summary.files_deleted,
@@ -1073,8 +1101,12 @@ fn merge_state_archives(
 fn raw_import_worker_loop(
     receiver: Arc<Mutex<Receiver<Option<(usize, ImportFile)>>>>,
     sender: SyncSender<RawWorkerMessage>,
+    shutdown: Arc<AtomicBool>,
 ) {
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
         let received = {
             let guard = receiver.lock().unwrap();
             guard.recv()
@@ -1085,7 +1117,7 @@ fn raw_import_worker_loop(
         let Some((file_index, file)) = job else {
             return;
         };
-        let _ = parse_raw_file_into_chunks(file_index, &file, &sender);
+        let _ = parse_raw_file_into_chunks(file_index, &file, &sender, &shutdown);
     }
 }
 
@@ -1417,6 +1449,7 @@ fn parse_raw_file_into_chunks(
     file_index: usize,
     file: &ImportFile,
     sender: &SyncSender<RawWorkerMessage>,
+    shutdown: &AtomicBool,
 ) -> Result<()> {
     let file_size = fs::metadata(&file.path)
         .map(|metadata| metadata.len())
@@ -1435,6 +1468,9 @@ fn parse_raw_file_into_chunks(
     let mut chunk = Vec::with_capacity(RAW_IMPORT_CHUNK_EVENTS);
 
     let parse_result = for_each_line_in_supported_file(&file.path, |line| {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(anyhow!("shutdown requested"));
+        }
         scanned_lines += 1;
         let Some(raw) = extract_raw_irc_line(&line) else {
             if scanned_lines % IMPORT_PROGRESS_LINE_INTERVAL == 0 {

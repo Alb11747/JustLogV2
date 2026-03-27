@@ -189,7 +189,12 @@ impl IngestManager {
             write_irc_line(&mut writer_half, &format!("JOIN #{channel}")).await?;
         }
         self.trigger_recent_messages_fetch(
-            self.desired_channels.read().await.iter().cloned().collect::<Vec<_>>(),
+            self.desired_channels
+                .read()
+                .await
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
             "connect",
         );
         if identity.anonymous {
@@ -306,7 +311,9 @@ impl IngestManager {
             match CanonicalEvent::from_raw(&raw) {
                 Ok(Some(event)) => {
                     if let Err(error) = self.persist_canonical_event(event, false).await {
-                        warn!("failed to store recent-message backfill event for {channel}: {error}");
+                        warn!(
+                            "failed to store recent-message backfill event for {channel}: {error}"
+                        );
                     }
                 }
                 Ok(None) => {}

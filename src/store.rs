@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -35,6 +36,7 @@ pub struct Store {
     archive_enabled: bool,
     compression_executor: Arc<CompressionExecutor>,
     compression_paths: Arc<CompressionPathLocks>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 struct StoreDbGuard<'a> {
@@ -233,6 +235,7 @@ impl Store {
                 config.compression.lgwin,
             )),
             compression_paths: Arc::new(CompressionPathLocks::default()),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         };
         store.initialize()?;
         store.recover_pending_segments()?;
@@ -632,6 +635,10 @@ impl Store {
             .into_iter()
             .map(|partition| partition.key)
             .collect::<Vec<_>>();
+        if self.shutdown_requested() {
+            tracing::info!("store shutdown requested; stopping channel compaction scheduling");
+            return Ok(());
+        }
         self.compact_channel_partitions_parallel(&channel_keys)?;
 
         let user_keys = self
@@ -639,6 +646,10 @@ impl Store {
             .into_iter()
             .map(|partition| partition.key)
             .collect::<Vec<_>>();
+        if self.shutdown_requested() {
+            tracing::info!("store shutdown requested; stopping user compaction scheduling");
+            return Ok(());
+        }
         self.compact_user_partitions_parallel(&user_keys)?;
         Ok(())
     }
@@ -650,6 +661,10 @@ impl Store {
         if !self.archive_enabled {
             return Ok(());
         }
+        if self.shutdown_requested() {
+            tracing::info!("store shutdown requested; skipping imported archive merge");
+            return Ok(());
+        }
         self.merge_imported_channel_days_into_archives_parallel(day_keys)?;
         Ok(())
     }
@@ -657,6 +672,14 @@ impl Store {
     pub fn event_count(&self) -> Result<i64> {
         let db = self.lock_db();
         Ok(db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
     }
 
     pub fn imported_raw_file_is_current(&self, path: &str, fingerprint: &str) -> Result<bool> {
@@ -1405,6 +1428,10 @@ impl Store {
     ) -> Result<()> {
         let mut prepared_days = Vec::new();
         for key in day_keys {
+            if self.shutdown_requested() {
+                tracing::info!("store shutdown requested; stopping channel-day merge preparation");
+                break;
+            }
             let mut day_events =
                 self.read_channel_logs(&key.channel_id, key.year, key.month, key.day)?;
             if day_events.is_empty() {
@@ -1433,6 +1460,10 @@ impl Store {
 
         let mut user_months = BTreeSet::new();
         for (key, relative, day_events, prepared) in prepared_days {
+            if self.shutdown_requested() {
+                tracing::info!("store shutdown requested; stopping channel-day merge installs");
+                break;
+            }
             self.install_channel_segment_write(
                 prepared,
                 &key.channel_id,
@@ -1467,6 +1498,10 @@ impl Store {
     fn compact_channel_partitions_parallel(&self, keys: &[ChannelDayKey]) -> Result<()> {
         let mut prepared = Vec::new();
         for key in keys {
+            if self.shutdown_requested() {
+                tracing::info!("store shutdown requested; stopping channel compaction preparation");
+                break;
+            }
             let events =
                 self.read_hot_channel_events(&key.channel_id, key.year, key.month, key.day)?;
             if events.is_empty() {
@@ -1492,6 +1527,10 @@ impl Store {
             prepared.push((key.clone(), relative, prepared_write));
         }
         for (key, relative, prepared_write) in prepared {
+            if self.shutdown_requested() {
+                tracing::info!("store shutdown requested; stopping channel compaction installs");
+                break;
+            }
             self.install_channel_segment_write(
                 prepared_write,
                 &key.channel_id,
@@ -1507,6 +1546,10 @@ impl Store {
     fn compact_user_partitions_parallel(&self, keys: &[UserMonthKey]) -> Result<()> {
         let mut prepared = Vec::new();
         for key in keys {
+            if self.shutdown_requested() {
+                tracing::info!("store shutdown requested; stopping user compaction preparation");
+                break;
+            }
             let events =
                 self.read_hot_user_events(&key.channel_id, &key.user_id, key.year, key.month)?;
             if events.is_empty() {
@@ -1532,6 +1575,10 @@ impl Store {
             prepared.push((key.clone(), relative, prepared_write));
         }
         for (key, relative, prepared_write) in prepared {
+            if self.shutdown_requested() {
+                tracing::info!("store shutdown requested; stopping user compaction installs");
+                break;
+            }
             self.install_user_segment_write(
                 prepared_write,
                 &key.channel_id,
@@ -2169,6 +2216,7 @@ mod tests {
             archive_enabled: false,
             compression_executor: Arc::new(CompressionExecutor::new(1, 5, 22)),
             compression_paths: Arc::new(CompressionPathLocks::default()),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         };
 
         let _outer = store.lock_db();

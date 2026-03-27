@@ -4,7 +4,8 @@ use std::env;
 use reqwest::Url;
 use tracing::warn;
 
-const DEFAULT_RECENT_MESSAGES_URL: &str = "https://recent-messages.robotty.de/api/v2/recent-messages";
+const DEFAULT_RECENT_MESSAGES_URL: &str =
+    "https://recent-messages.robotty.de/api/v2/recent-messages";
 const DEFAULT_RECENT_MESSAGES_LIMIT: usize = 800;
 
 #[derive(Clone)]
@@ -48,7 +49,10 @@ impl RecentMessagesRuntime {
     }
 
     pub fn summary_from_map(vars: &HashMap<String, String>) -> RecentMessagesRuntimeSummary {
-        let enabled = env_flag(vars.get("JUSTLOG_RECENT_MESSAGES_ENABLED").map(String::as_str));
+        let enabled = env_flag(
+            vars.get("JUSTLOG_RECENT_MESSAGES_ENABLED")
+                .map(String::as_str),
+        );
         let configured_url = vars
             .get("JUSTLOG_RECENT_MESSAGES_URL")
             .cloned()
@@ -131,12 +135,18 @@ mod tests {
     #[test]
     fn summary_normalizes_url_and_limit() {
         let mut vars = HashMap::new();
-        vars.insert("JUSTLOG_RECENT_MESSAGES_ENABLED".to_string(), "1".to_string());
+        vars.insert(
+            "JUSTLOG_RECENT_MESSAGES_ENABLED".to_string(),
+            "1".to_string(),
+        );
         vars.insert(
             "JUSTLOG_RECENT_MESSAGES_URL".to_string(),
             " https://example.test/api/v2/recent-messages/ ".to_string(),
         );
-        vars.insert("JUSTLOG_RECENT_MESSAGES_LIMIT".to_string(), "25".to_string());
+        vars.insert(
+            "JUSTLOG_RECENT_MESSAGES_LIMIT".to_string(),
+            "25".to_string(),
+        );
 
         let summary = RecentMessagesRuntime::summary_from_map(&vars);
         assert!(summary.enabled);
@@ -150,8 +160,14 @@ mod tests {
     #[test]
     fn invalid_url_disables_runtime_with_warning() {
         let mut vars = HashMap::new();
-        vars.insert("JUSTLOG_RECENT_MESSAGES_ENABLED".to_string(), "1".to_string());
-        vars.insert("JUSTLOG_RECENT_MESSAGES_URL".to_string(), "notaurl".to_string());
+        vars.insert(
+            "JUSTLOG_RECENT_MESSAGES_ENABLED".to_string(),
+            "1".to_string(),
+        );
+        vars.insert(
+            "JUSTLOG_RECENT_MESSAGES_URL".to_string(),
+            "notaurl".to_string(),
+        );
 
         let summary = RecentMessagesRuntime::summary_from_map(&vars);
         assert!(summary.enabled);
