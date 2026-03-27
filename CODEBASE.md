@@ -163,6 +163,7 @@ Supported flags:
 - `JUSTLOG_IMPORT_DELETE_RAW=1`
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=0|1`
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`
+- `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=0|1`
 
 Behavior summary:
 
@@ -174,6 +175,7 @@ Behavior summary:
 - `JUSTLOG_IMPORT_DELETE_RAW=1` removes successfully imported raw source files.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1` also removes raw source files whose path and fingerprint are already marked current in SQLite. This defaults to on.
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` removes successfully consumed reconstructed TXT / JSON files.
+- `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1` also removes reconstructed TXT / JSON files whose path and fingerprint are already marked consumed in SQLite. This defaults to off.
 
 ## Ingestion Pipeline
 

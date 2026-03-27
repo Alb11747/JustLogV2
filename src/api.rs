@@ -184,10 +184,13 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
                 .await?;
         if state.legacy_txt.is_import_enabled() {
             let legacy_txt = state.legacy_txt.clone();
+            let store = state.store.clone();
             let channel_id_for_available = channel_id.clone();
             logs.extend(
-                run_blocking(move || legacy_txt.available_channel_logs(&channel_id_for_available))
-                    .await?,
+                run_blocking(move || {
+                    legacy_txt.available_channel_logs(&store, &channel_id_for_available)
+                })
+                .await?,
             );
             logs.sort_by(|left, right| {
                 right
@@ -440,9 +443,11 @@ async fn dated_response(
                 .await?;
         let channel_login = resolve_channel_login(&state, &request.channel_id).await;
         let legacy_txt = state.legacy_txt.clone();
+        let store = state.store.clone();
         let channel_id_for_import = request.channel_id.clone();
         let imported = run_blocking(move || {
             legacy_txt.load_channel_day_import(
+                &store,
                 &channel_id_for_import,
                 &channel_login,
                 year,

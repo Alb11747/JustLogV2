@@ -54,6 +54,7 @@ Supported env flags:
 - `JUSTLOG_IMPORT_DELETE_RAW=1`: delete raw IRC source files after they are successfully imported into native storage.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=0|1`: delete raw IRC source files that are already marked current in native storage. Default is `1`.
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`: delete reconstructed TXT / JSON source files after they are successfully consumed on read.
+- `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=0|1`: delete reconstructed TXT / JSON source files that are already marked consumed with the same fingerprint. Default is `0`.
 
 Behavior summary:
 
@@ -85,7 +86,7 @@ The easiest workflow is:
 
 1. Set `JUSTLOG_IMPORT_FOLDER=/import-folder` in `.env`.
 2. Choose `JUSTLOG_LEGACY_TXT_MODE` for reconstructed simple TXT and JSON overlays.
-3. Optionally set `JUSTLOG_IMPORT_DELETE_RAW=1`, adjust `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW`, and/or set `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` if you want consumed source files removed automatically.
+3. Optionally set `JUSTLOG_IMPORT_DELETE_RAW=1`, adjust `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW`, and/or set `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` plus `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1` if you want consumed source files removed automatically.
 4. Copy files anywhere under `./data/import-folder`.
 5. Restart the service with `docker compose up -d --build` or `docker compose restart`.
 
@@ -139,6 +140,7 @@ Large import folders are handled incrementally:
 - If `JUSTLOG_IMPORT_DELETE_RAW=1`, successfully imported raw files are deleted after completion.
 - If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1`, raw files that are already current in native storage are also deleted during the preflight scan. This flag defaults to `1`.
 - If `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`, successfully parsed reconstructed TXT / JSON files are deleted after the request that consumed them.
+- If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1`, reconstructed TXT / JSON files that were already consumed successfully and are still unchanged are deleted during later discovery before reparsing.
 
 ### Import stall troubleshooting
 

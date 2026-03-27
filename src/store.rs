@@ -212,6 +212,13 @@ impl Store {
                 imported_at INTEGER NOT NULL,
                 status TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS imported_reconstructed_files (
+                path TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                imported_at INTEGER NOT NULL,
+                status TEXT NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -518,6 +525,66 @@ impl Store {
         if lock_elapsed > std::time::Duration::from_secs(1) {
             tracing::warn!(
                 "Waited {:?} for imported_raw_files write lock: path={}, status={}",
+                lock_elapsed,
+                path,
+                status
+            );
+        }
+        Ok(())
+    }
+
+    pub fn imported_reconstructed_file_is_current(
+        &self,
+        path: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        let lock_started = Instant::now();
+        let db = self.lock_db();
+        let lock_elapsed = lock_started.elapsed();
+        let stored = db
+            .query_row(
+                "SELECT fingerprint, status FROM imported_reconstructed_files WHERE path = ?1",
+                params![path],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let is_current = matches!(
+            stored.as_ref(),
+            Some((stored_fingerprint, status))
+                if stored_fingerprint == fingerprint && status == "consumed"
+        );
+        if lock_elapsed > std::time::Duration::from_secs(1) {
+            tracing::warn!(
+                "Waited {:?} for imported_reconstructed_files status lock: path={path}",
+                lock_elapsed
+            );
+        }
+        Ok(is_current)
+    }
+
+    pub fn record_imported_reconstructed_file(
+        &self,
+        path: &str,
+        fingerprint: &str,
+        status: &str,
+    ) -> Result<()> {
+        let lock_started = Instant::now();
+        let db = self.lock_db();
+        let lock_elapsed = lock_started.elapsed();
+        db.execute(
+            r#"
+            INSERT INTO imported_reconstructed_files(path, fingerprint, imported_at, status)
+            VALUES(?1, ?2, ?3, ?4)
+            ON CONFLICT(path) DO UPDATE SET
+                fingerprint = excluded.fingerprint,
+                imported_at = excluded.imported_at,
+                status = excluded.status
+            "#,
+            params![path, fingerprint, Utc::now().timestamp(), status],
+        )?;
+        if lock_elapsed > std::time::Duration::from_secs(1) {
+            tracing::warn!(
+                "Waited {:?} for imported_reconstructed_files write lock: path={}, status={}",
                 lock_elapsed,
                 path,
                 status

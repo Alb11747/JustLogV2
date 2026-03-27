@@ -31,6 +31,7 @@ pub struct LegacyTxtRuntime {
     delete_raw_after_import: bool,
     delete_current_raw_on_discovery: bool,
     delete_reconstructed_after_read: bool,
+    delete_current_reconstructed_on_discovery: bool,
     import_folder_exists_at_startup: bool,
 }
 
@@ -85,6 +86,10 @@ impl LegacyTxtRuntime {
                 true,
             ),
             delete_reconstructed_after_read: env_flag("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED", false),
+            delete_current_reconstructed_on_discovery: env_flag(
+                "JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED",
+                false,
+            ),
             import_folder_exists_at_startup,
         }
     }
@@ -138,6 +143,7 @@ impl LegacyTxtRuntime {
 
     pub fn load_channel_day_import(
         &self,
+        store: &Store,
         channel_id: &str,
         channel_login: &str,
         year: i32,
@@ -166,17 +172,24 @@ impl LegacyTxtRuntime {
                     ) {
                         continue;
                     }
+                    if self.handle_already_consumed_reconstructed_file(store, &file)? {
+                        continue;
+                    }
                     if let Ok(messages) =
                         parse_sparse_txt_file(&file.path, channel_login, year, month, day)
                     {
                         if !messages.is_empty() {
                             matched_simple_files += 1;
                             result.simple_messages.extend(messages);
+                            self.record_consumed_reconstructed_file(store, &file)?;
                             self.delete_import_file_if_configured(&file, false);
                         }
                     }
                 }
                 ImportKind::JsonExport => {
+                    if self.handle_already_consumed_reconstructed_file(store, &file)? {
+                        continue;
+                    }
                     if let Ok(messages) = parse_json_export_file(&file.path, channel_login) {
                         let matching = messages
                             .into_iter()
@@ -189,6 +202,7 @@ impl LegacyTxtRuntime {
                         if !matching.is_empty() {
                             matched_json_files += 1;
                             result.complete_messages.extend(matching);
+                            self.record_consumed_reconstructed_file(store, &file)?;
                             self.delete_import_file_if_configured(&file, false);
                         }
                     }
@@ -214,7 +228,11 @@ impl LegacyTxtRuntime {
         Ok(result)
     }
 
-    pub fn available_channel_logs(&self, channel_id: &str) -> Result<Vec<ChannelLogFile>> {
+    pub fn available_channel_logs(
+        &self,
+        store: &Store,
+        channel_id: &str,
+    ) -> Result<Vec<ChannelLogFile>> {
         let mut logs = Vec::new();
         let mut seen = HashSet::new();
         let files = self.discover_import_files()?;
@@ -224,6 +242,9 @@ impl LegacyTxtRuntime {
                 ImportKind::RawIrc => {}
                 ImportKind::SimpleText => {
                     if self.mode == LegacyTxtMode::Off {
+                        continue;
+                    }
+                    if self.handle_already_consumed_reconstructed_file(store, &file)? {
                         continue;
                     }
                     if let Some((year, month, day)) =
@@ -237,10 +258,15 @@ impl LegacyTxtRuntime {
                                 day: day.to_string(),
                             });
                         }
+                        self.record_consumed_reconstructed_file(store, &file)?;
                     }
                 }
                 ImportKind::JsonExport => {
+                    if self.handle_already_consumed_reconstructed_file(store, &file)? {
+                        continue;
+                    }
                     if let Ok(messages) = parse_json_export_file(&file.path, "") {
+                        let mut file_contributed = false;
                         for message in messages {
                             let room_id = message.tags.get("room-id").cloned().unwrap_or_default();
                             if room_id != channel_id {
@@ -258,6 +284,10 @@ impl LegacyTxtRuntime {
                                     day: key.2.to_string(),
                                 });
                             }
+                            file_contributed = true;
+                        }
+                        if file_contributed {
+                            self.record_consumed_reconstructed_file(store, &file)?;
                         }
                     }
                 }
@@ -443,6 +473,69 @@ impl LegacyTxtRuntime {
         } else {
             warn!(
                 "Failed to delete already-imported raw file {}",
+                file.path.display()
+            );
+        }
+    }
+
+    fn handle_already_consumed_reconstructed_file(
+        &self,
+        store: &Store,
+        file: &ImportFile,
+    ) -> Result<bool> {
+        let path_key = file.path.to_string_lossy().to_string();
+        let status_check_started = Instant::now();
+        info!(
+            "Checking reconstructed import status for {}",
+            file.path.display()
+        );
+        let is_current =
+            store.imported_reconstructed_file_is_current(&path_key, &file.fingerprint)?;
+        info!(
+            "Completed reconstructed import status check for {} in {:?}: current={is_current}",
+            file.path.display(),
+            status_check_started.elapsed()
+        );
+        if is_current {
+            self.delete_current_reconstructed_if_configured(file);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn record_consumed_reconstructed_file(&self, store: &Store, file: &ImportFile) -> Result<()> {
+        let path_key = file.path.to_string_lossy().to_string();
+        let record_started = Instant::now();
+        info!(
+            "Recording reconstructed import completion for {}",
+            file.path.display()
+        );
+        store.record_imported_reconstructed_file(&path_key, &file.fingerprint, "consumed")?;
+        info!(
+            "Recorded reconstructed import completion for {} in {:?}",
+            file.path.display(),
+            record_started.elapsed()
+        );
+        Ok(())
+    }
+
+    fn delete_current_reconstructed_if_configured(&self, file: &ImportFile) {
+        if !self.delete_current_reconstructed_on_discovery {
+            return;
+        }
+        if fs::remove_file(&file.path).is_ok() {
+            if let Some(root) = self.import_folder.as_deref() {
+                if let Some(parent) = file.path.parent() {
+                    remove_empty_dir_and_parents(root, parent);
+                }
+            }
+            info!(
+                "Deleted already-consumed reconstructed file {}",
+                file.path.display()
+            );
+        } else {
+            warn!(
+                "Failed to delete already-consumed reconstructed file {}",
                 file.path.display()
             );
         }
@@ -1184,6 +1277,7 @@ mod tests {
             delete_raw_after_import: false,
             delete_current_raw_on_discovery: true,
             delete_reconstructed_after_read: false,
+            delete_current_reconstructed_on_discovery: false,
             import_folder_exists_at_startup: true,
         };
         let files = runtime.discover_import_files().unwrap();

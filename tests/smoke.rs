@@ -397,6 +397,106 @@ async fn import_folder_can_delete_reconstructed_files_after_read() {
 }
 
 #[tokio::test]
+async fn import_folder_can_delete_already_consumed_reconstructed_files_on_later_request() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("overlay/1/2024/1/2.json");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(
+        &import_file,
+        r##"{"streamer":{"name":"channelone","id":1},"video":{"title":"vod title","id":"vod-1"},"comments":[{"_id":"json-delete-later-1","created_at":"2024-01-02T00:00:04Z","channel_id":"1","content_id":"vod-1","commenter":{"display_name":"JsonDeleteLaterUser","_id":"300","name":"jsondeletelateruser","logo":"https://example.com/logo.png"},"message":{"body":"json deleted later","user_color":"#FF0000","user_badges":[],"emoticons":[]}}]}"##,
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
+        std::env::set_var("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED", "0");
+        std::env::set_var("JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let first_body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert!(first_body.contains("json deleted later"));
+    assert!(import_file.exists());
+
+    let second_body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert!(!second_body.contains("json deleted later"));
+    assert!(!import_file.exists());
+    assert!(!import_root.join("overlay/1/2024/1").exists());
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_RECONSTRUCTED");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED");
+    }
+}
+
+#[tokio::test]
+async fn import_folder_reprocesses_changed_reconstructed_files() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("overlay/1/2024/1/2.txt");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(&import_file, "[0:00:04] FirstUser: first value").unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "merge");
+        std::env::set_var("JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let first_body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(first_body.contains("first value"));
+    assert!(import_file.exists());
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    fs::write(&import_file, "[0:00:05] SecondUser: second value").unwrap();
+
+    let second_body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(second_body.contains("second value"));
+    assert!(import_file.exists());
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED");
+    }
+}
+
+#[tokio::test]
 async fn import_folder_can_import_log_files_from_arbitrary_subdirs() {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();
