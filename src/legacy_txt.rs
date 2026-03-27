@@ -615,9 +615,9 @@ impl LegacyTxtRuntime {
         }
 
         info!(
-            "Starting raw import scan for {scope}: {} file(s), {:.2} MiB pending",
+            "Starting raw import scan for {scope}: {} file(s), {} pending",
             remaining.len(),
-            total_bytes as f64 / (1024.0 * 1024.0)
+            human_readable_bytes(total_bytes)
         );
 
         let total_files = remaining.len();
@@ -1341,9 +1341,9 @@ fn import_raw_file_with_progress(
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     info!(
-        "Importing raw file {index}/{total_files}: {} ({:.2} MiB)",
+        "Importing raw file {index}/{total_files}: {} ({})",
         file.path.display(),
-        file_size as f64 / (1024.0 * 1024.0)
+        human_readable_bytes(file_size)
     );
 
     let mut scanned_lines = 0usize;
@@ -1455,10 +1455,10 @@ fn parse_raw_file_into_chunks(
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     info!(
-        "Worker parsing raw file {}: {} ({:.2} MiB)",
+        "Worker parsing raw file {}: {} ({})",
         file_index + 1,
         file.path.display(),
-        file_size as f64 / (1024.0 * 1024.0)
+        human_readable_bytes(file_size)
     );
 
     let mut scanned_lines = 0usize;
@@ -1767,6 +1767,22 @@ fn file_fingerprint(path: &Path) -> Result<String> {
         .map(|value| value.as_secs())
         .unwrap_or_default();
     Ok(format!("{}:{modified}", metadata.len()))
+}
+
+fn human_readable_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if (bytes as f64) < MIB {
+        format!("{:.2} KiB", bytes as f64 / KIB)
+    } else if (bytes as f64) < GIB {
+        format!("{:.2} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{:.2} GiB", bytes as f64 / GIB)
+    }
 }
 
 fn is_supported_import_path(path: &Path) -> bool {
