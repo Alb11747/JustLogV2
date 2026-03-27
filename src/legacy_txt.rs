@@ -104,7 +104,8 @@ impl LegacyTxtRuntime {
                 continue;
             }
             let mut imported = 0usize;
-            for line in load_lines_from_supported_file(&file.path)? {
+            let lines = load_lines_from_supported_file(&file.path)?;
+            for line in extract_raw_irc_lines(&lines) {
                 match CanonicalEvent::from_raw(&line) {
                     Ok(Some(event)) => {
                         if store.insert_event(&event)? {
@@ -131,7 +132,8 @@ impl LegacyTxtRuntime {
                 continue;
             }
             let mut imported = 0usize;
-            for line in load_lines_from_supported_file(&file.path)? {
+            let lines = load_lines_from_supported_file(&file.path)?;
+            for line in extract_raw_irc_lines(&lines) {
                 match CanonicalEvent::from_raw(&line) {
                     Ok(Some(event)) => {
                         if store.insert_event(&event)? {
@@ -332,15 +334,37 @@ fn classify_import_file(path: &Path) -> Result<Option<ImportKind>> {
 }
 
 fn behaves_like_raw_irc(lines: &[String]) -> bool {
+    let raw_lines = extract_raw_irc_lines(lines);
     let mut saw_supported = false;
-    for line in lines.iter().filter(|line| !line.trim().is_empty()) {
+    for line in &raw_lines {
         match CanonicalEvent::from_raw(line) {
             Ok(Some(_)) => saw_supported = true,
             Ok(None) => {}
             Err(_) => return false,
         }
     }
-    saw_supported
+    saw_supported && !raw_lines.is_empty()
+}
+
+fn extract_raw_irc_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| extract_raw_irc_line(line))
+        .collect()
+}
+
+fn extract_raw_irc_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('@') || trimmed.starts_with(':') {
+        return Some(trimmed.to_string());
+    }
+    let (_, raw) = trimmed.split_once("FROM SERVER: ")?;
+    let raw = raw.trim();
+    if raw.starts_with('@') || raw.starts_with(':') {
+        Some(raw.to_string())
+    } else {
+        None
+    }
 }
 
 fn load_lines_from_supported_file(path: &Path) -> Result<Vec<String>> {
@@ -786,5 +810,18 @@ mod tests {
         let files = runtime.discover_channel_day_files("1", 2024, 1, 2).unwrap();
         assert_eq!(files.len(), 1);
         assert!(!root.join("nested/empty/a/b").exists());
+    }
+
+    #[test]
+    fn debug_log_lines_extract_raw_irc_messages() {
+        let lines = vec![
+            "2024-03-21 14:08:32.304 irc.client 402 DEBUG: command: pubmsg, source: kochayuyo!kochayuyo@kochayuyo.tmi.twitch.tv, target: #fobm4ster, arguments: ['annytfErmDying'], tags: [...]".to_string(),
+            "2024-03-21 14:09:30.126 irc.client 333 DEBUG: FROM SERVER: @badge-info=;badges=twitch-recap-2023/1;color=#008000;display-name=FireflyHairOrnament;emotes=;first-msg=0;flags=;id=669ecf91-aa9f-4f7c-bdef-a5d51d190b81;mod=0;returning-chatter=0;room-id=79202256;subscriber=0;tmi-sent-ts=1711030170007;turbo=0;user-id=716048414;user-type= :fireflyhairornament!fireflyhairornament@fireflyhairornament.tmi.twitch.tv PRIVMSG #zy0xxx :ZlAY".to_string(),
+            "2024-03-21 14:10:08.534 twitchbot.autosongrequest 363 INFO: Checking Song Queue".to_string(),
+        ];
+        let extracted = extract_raw_irc_lines(&lines);
+        assert_eq!(extracted.len(), 1);
+        assert!(extracted[0].contains("PRIVMSG #zy0xxx :ZlAY"));
+        assert!(behaves_like_raw_irc(&lines));
     }
 }
