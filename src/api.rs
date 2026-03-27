@@ -3,14 +3,14 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use axum::Json;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, LOCATION, VARY};
 use axum::http::{HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use axum::Json;
-use axum::Router;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use regex::Regex;
 use serde::Deserialize;
@@ -180,7 +180,8 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
         let store = state.store.clone();
         let channel_id_for_logs = channel_id.clone();
         let mut logs =
-            run_blocking(move || store.get_available_logs_for_channel(&channel_id_for_logs)).await?;
+            run_blocking(move || store.get_available_logs_for_channel(&channel_id_for_logs))
+                .await?;
         if state.legacy_txt.is_import_enabled() {
             let legacy_txt = state.legacy_txt.clone();
             let channel_id_for_available = channel_id.clone();
@@ -427,8 +428,10 @@ async fn dated_response(
         let legacy_txt = state.legacy_txt.clone();
         let store = state.store.clone();
         let channel_id = request.channel_id.clone();
-        run_blocking(move || legacy_txt.import_raw_channel_day(&store, &channel_id, year, month, day))
-            .await?;
+        run_blocking(move || {
+            legacy_txt.import_raw_channel_day(&store, &channel_id, year, month, day)
+        })
+        .await?;
 
         let store = state.store.clone();
         let channel_id_for_native = request.channel_id.clone();
@@ -962,9 +965,14 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_route_returns_ok_in_process() {
-        let response =
-            dispatch(test_state(), Request::builder().uri("/healthz").body(Body::empty()).unwrap())
-                .await;
+        let response = dispatch(
+            test_state(),
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -972,8 +980,14 @@ mod tests {
     async fn healthz_route_returns_ok_over_tcp_with_ingest_started() {
         let state = test_state();
         start_test_ingest(&state).await;
-        let response =
-            dispatch(state, Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await;
+        let response = dispatch(
+            state,
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 }

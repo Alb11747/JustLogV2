@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use brotli::{CompressorWriter, Decompressor};
@@ -422,7 +423,9 @@ impl Store {
     }
 
     pub fn imported_raw_file_is_current(&self, path: &str, fingerprint: &str) -> Result<bool> {
+        let lock_started = Instant::now();
         let db = self.db.lock().unwrap();
+        let lock_elapsed = lock_started.elapsed();
         let stored = db
             .query_row(
                 "SELECT fingerprint, status FROM imported_raw_files WHERE path = ?1",
@@ -430,11 +433,18 @@ impl Store {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        Ok(matches!(
+        let is_current = matches!(
             stored.as_ref(),
             Some((stored_fingerprint, status))
                 if stored_fingerprint == fingerprint && matches!(status.as_str(), "imported" | "seen")
-        ))
+        );
+        if lock_elapsed > std::time::Duration::from_secs(1) {
+            tracing::warn!(
+                "Waited {:?} for imported_raw_files status lock: path={path}",
+                lock_elapsed
+            );
+        }
+        Ok(is_current)
     }
 
     pub fn record_imported_raw_file(
@@ -443,7 +453,9 @@ impl Store {
         fingerprint: &str,
         status: &str,
     ) -> Result<()> {
+        let lock_started = Instant::now();
         let db = self.db.lock().unwrap();
+        let lock_elapsed = lock_started.elapsed();
         db.execute(
             r#"
             INSERT INTO imported_raw_files(path, fingerprint, imported_at, status)
@@ -455,6 +467,14 @@ impl Store {
             "#,
             params![path, fingerprint, Utc::now().timestamp(), status],
         )?;
+        if lock_elapsed > std::time::Duration::from_secs(1) {
+            tracing::warn!(
+                "Waited {:?} for imported_raw_files write lock: path={}, status={}",
+                lock_elapsed,
+                path,
+                status
+            );
+        }
         Ok(())
     }
 
@@ -488,6 +508,8 @@ impl Store {
             })
         })?;
         let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        drop(db);
         Ok(rows
             .into_iter()
             .filter(|summary| {
@@ -541,6 +563,8 @@ impl Store {
             })
         })?;
         let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        drop(db);
         Ok(rows
             .into_iter()
             .filter(|summary| {

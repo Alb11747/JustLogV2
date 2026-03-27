@@ -3,6 +3,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
@@ -278,6 +279,7 @@ impl LegacyTxtRuntime {
         let Some(root) = self.import_folder_path() else {
             return Ok(Vec::new());
         };
+        let scan_started = Instant::now();
         let mut files = Vec::new();
         for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() {
@@ -303,6 +305,12 @@ impl LegacyTxtRuntime {
             }
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
+        info!(
+            "Import-folder discovery completed for {}: {} supported file(s) in {:?}",
+            root.display(),
+            files.len(),
+            scan_started.elapsed()
+        );
         Ok(files)
     }
 
@@ -326,6 +334,7 @@ impl LegacyTxtRuntime {
     }
 
     fn import_raw_files(&self, store: &Store, files: Vec<ImportFile>, scope: &str) -> Result<()> {
+        info!("Preparing raw import candidates for {scope}");
         let pending = files
             .into_iter()
             .filter(|file| file.kind == ImportKind::RawIrc)
@@ -339,12 +348,28 @@ impl LegacyTxtRuntime {
         let mut total_bytes = 0u64;
         for file in pending {
             let path_key = file.path.to_string_lossy().to_string();
-            if store.imported_raw_file_is_current(&path_key, &file.fingerprint)? {
+            let status_check_started = Instant::now();
+            info!("Checking raw import status for {}", file.path.display());
+            let is_current = store.imported_raw_file_is_current(&path_key, &file.fingerprint)?;
+            info!(
+                "Completed raw import status check for {} in {:?}: current={is_current}",
+                file.path.display(),
+                status_check_started.elapsed()
+            );
+            if is_current {
                 continue;
             }
-            total_bytes += fs::metadata(&file.path)
+            let metadata_started = Instant::now();
+            let file_size = fs::metadata(&file.path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
+            info!(
+                "Read raw import metadata for {} in {:?}: {} bytes",
+                file.path.display(),
+                metadata_started.elapsed(),
+                file_size
+            );
+            total_bytes += file_size;
             remaining.push(file);
         }
         if remaining.is_empty() {
@@ -556,7 +581,14 @@ fn import_raw_file_with_progress(
     total_files: usize,
 ) -> Result<()> {
     let path_key = file.path.to_string_lossy().to_string();
+    let import_marker_started = Instant::now();
+    info!("Recording raw import start for {}", file.path.display());
     store.record_imported_raw_file(&path_key, &file.fingerprint, "importing")?;
+    info!(
+        "Recorded raw import start for {} in {:?}",
+        file.path.display(),
+        import_marker_started.elapsed()
+    );
 
     let file_size = fs::metadata(&file.path)
         .map(|metadata| metadata.len())
@@ -621,7 +653,17 @@ fn import_raw_file_with_progress(
     })?;
 
     let status = if imported > 0 { "imported" } else { "seen" };
+    let completion_marker_started = Instant::now();
+    info!(
+        "Recording raw import completion for {} with status {status}",
+        file.path.display()
+    );
     store.record_imported_raw_file(&path_key, &file.fingerprint, status)?;
+    info!(
+        "Recorded raw import completion for {} in {:?}",
+        file.path.display(),
+        completion_marker_started.elapsed()
+    );
     info!(
         "Completed raw import {}: scanned {} lines, raw_candidates {}, imported {}, skipped {}, parse_errors {}",
         file.path.display(),
