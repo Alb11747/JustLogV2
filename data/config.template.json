@@ -4,7 +4,7 @@
   "adminAPIKey": "replace-with-a-long-random-admin-key",
   "channels": ["channel_login_here"],
   "admins": [],
-  "listenAddress": ":8025",
+  "listenAddress": ":8026",
   "logsDirectory": "/data/logs",
   "storage": {
     "sqlitePath": "/data/justlog.sqlite3"

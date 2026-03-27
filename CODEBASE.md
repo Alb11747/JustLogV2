@@ -122,7 +122,7 @@ The config file is JSON-based and modeled in `src/config.rs`.
 - `clientID`, `clientSecret`: required for Helix user resolution and token creation.
 - `channels`: Twitch channel IDs to ingest on startup.
 - `logsDirectory`: root directory for archived logs and the SQLite file.
-- `listenAddress`: HTTP bind address; `:8025` becomes `0.0.0.0:8025`.
+- `listenAddress`: HTTP bind address; `:8026` becomes `0.0.0.0:8026`.
 - `adminAPIKey`: required for `/admin/channels`.
 - `admins`: usernames allowed to use privileged `!justlog` chat commands.
 - `optOut`: map of opted-out user IDs.

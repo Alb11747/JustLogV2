@@ -26,7 +26,7 @@ PowerShell examples are shown below, but the same commands work from any shell w
 cargo run -- --config config.json
 ```
 
-The app listens on port `8025` by default and expects a JSON config file. The minimum useful config looks like this:
+The app listens on port `8026` by default and expects a JSON config file. The minimum useful config looks like this:
 
 ```json
 {
@@ -194,7 +194,7 @@ Stop it again:
 docker compose down
 ```
 
-The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}`, mounts `./data` to `/data`, mounts `${JUSTLOG_IMPORT_HOST_DIR:-./data/import-folder}` to `/import-folder`, keeps logs and SQLite state under the `/data` mount, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
+The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}` and forwards it to the app's in-container listener on `8026`, mounts `./data` to `/data`, mounts `${JUSTLOG_IMPORT_HOST_DIR:-./data/import-folder}` to `/import-folder`, keeps logs and SQLite state under the `/data` mount, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
 
 ## Ubuntu Production Setup
 

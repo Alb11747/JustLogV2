@@ -326,7 +326,7 @@ fn default_oauth() -> String {
 }
 
 fn default_listen_address() -> String {
-    ":8025".to_string()
+    ":8026".to_string()
 }
 
 fn default_admins() -> Vec<String> {
