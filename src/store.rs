@@ -28,11 +28,13 @@ use crate::model::{
 
 thread_local! {
     static STORE_DB_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static STORE_IMPORT_DB_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Mutex<Connection>>,
+    import_db: Arc<Mutex<Connection>>,
     root_dir: PathBuf,
     archive_enabled: bool,
     compression_executor: Arc<CompressionExecutor>,
@@ -42,6 +44,7 @@ pub struct Store {
 
 struct StoreDbGuard<'a> {
     guard: MutexGuard<'a, Connection>,
+    depth: &'static std::thread::LocalKey<Cell<usize>>,
 }
 
 impl Deref for StoreDbGuard<'_> {
@@ -60,7 +63,7 @@ impl DerefMut for StoreDbGuard<'_> {
 
 impl Drop for StoreDbGuard<'_> {
     fn drop(&mut self) {
-        STORE_DB_LOCK_DEPTH.with(|depth| {
+        self.depth.with(|depth| {
             let current = depth.get();
             debug_assert!(current > 0, "store db lock depth underflow");
             depth.set(current.saturating_sub(1));
@@ -80,6 +83,12 @@ pub struct InsertEventsBatchOutcome {
     pub skipped: usize,
     pub affected_channel_days: BTreeSet<ChannelDayKey>,
     pub affected_user_months: BTreeSet<UserMonthKey>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IndexedInsertEventsBatchOutcome {
+    pub totals: InsertEventsBatchOutcome,
+    pub per_file: HashMap<usize, InsertEventsBatchOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,7 +224,25 @@ impl Store {
         });
         let guard = self.db.lock().unwrap();
         STORE_DB_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        StoreDbGuard { guard }
+        StoreDbGuard {
+            guard,
+            depth: &STORE_DB_LOCK_DEPTH,
+        }
+    }
+
+    fn lock_import_db(&self) -> StoreDbGuard<'_> {
+        STORE_IMPORT_DB_LOCK_DEPTH.with(|depth| {
+            assert!(
+                depth.get() == 0,
+                "re-entrant Store import DB lock on the same thread; drop the outer import db guard before calling another Store method"
+            );
+        });
+        let guard = self.import_db.lock().unwrap();
+        STORE_IMPORT_DB_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        StoreDbGuard {
+            guard,
+            depth: &STORE_IMPORT_DB_LOCK_DEPTH,
+        }
     }
 
     pub fn open(config: &Config) -> Result<Self> {
@@ -224,10 +251,15 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.busy_timeout(std::time::Duration::from_secs(30))?;
+        let import_connection = Connection::open(&config.storage.sqlite_path)?;
+        import_connection.pragma_update(None, "journal_mode", "WAL")?;
+        import_connection.pragma_update(None, "synchronous", "FULL")?;
+        import_connection.busy_timeout(std::time::Duration::from_secs(30))?;
         let compression_threads = read_max_compress_threads_from_env();
 
         let store = Self {
             db: Arc::new(Mutex::new(connection)),
+            import_db: Arc::new(Mutex::new(import_connection)),
             root_dir: config.logs_directory.clone(),
             archive_enabled: config.archive,
             compression_executor: Arc::new(CompressionExecutor::new(
@@ -377,7 +409,7 @@ impl Store {
             return Ok(InsertEventsBatchOutcome::default());
         }
 
-        let mut db = self.lock_db();
+        let mut db = self.lock_import_db();
         let tx = db.transaction()?;
         let mut statement = tx.prepare(
             r#"
@@ -416,6 +448,64 @@ impl Store {
                 }
             } else {
                 outcome.skipped += 1;
+            }
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn insert_indexed_events_batch(
+        &self,
+        events: &[(usize, CanonicalEvent)],
+    ) -> Result<IndexedInsertEventsBatchOutcome> {
+        if events.is_empty() {
+            return Ok(IndexedInsertEventsBatchOutcome::default());
+        }
+
+        let mut db = self.lock_import_db();
+        let tx = db.transaction()?;
+        let mut statement = tx.prepare(
+            r#"
+            INSERT OR IGNORE INTO events(
+                event_uid, kind, room_id, channel_login, username, display_name, user_id,
+                target_user_id, text, system_text, raw, timestamp_unix, timestamp_rfc3339, tags_json
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+        )?;
+
+        let mut outcome = IndexedInsertEventsBatchOutcome::default();
+        for (file_index, event) in events {
+            let inserted = statement.execute(params![
+                event.event_uid,
+                event.kind,
+                event.room_id,
+                event.channel_login,
+                event.username,
+                event.display_name,
+                event.user_id,
+                event.target_user_id,
+                event.text,
+                event.system_text,
+                event.raw,
+                event.timestamp.timestamp(),
+                event.timestamp.to_rfc3339(),
+                serde_json::to_string(&event.tags)?
+            ])?;
+            let file_outcome = outcome.per_file.entry(*file_index).or_default();
+            if inserted > 0 {
+                outcome.totals.inserted += 1;
+                file_outcome.inserted += 1;
+                let day_key = event.channel_day_key();
+                outcome.totals.affected_channel_days.insert(day_key.clone());
+                file_outcome.affected_channel_days.insert(day_key);
+                for key in event.user_month_keys() {
+                    outcome.totals.affected_user_months.insert(key.clone());
+                    file_outcome.affected_user_months.insert(key);
+                }
+            } else {
+                outcome.totals.skipped += 1;
+                file_outcome.skipped += 1;
             }
         }
         drop(statement);
@@ -717,7 +807,7 @@ impl Store {
         }
 
         let lock_started = Instant::now();
-        let db = self.lock_db();
+        let db = self.lock_import_db();
         let lock_elapsed = lock_started.elapsed();
         let mut stored = HashMap::<String, (String, String)>::new();
 
@@ -778,7 +868,7 @@ impl Store {
         status: &str,
     ) -> Result<()> {
         let lock_started = Instant::now();
-        let db = self.lock_db();
+        let db = self.lock_import_db();
         let lock_elapsed = lock_started.elapsed();
         db.execute(
             r#"
@@ -800,6 +890,17 @@ impl Store {
             );
         }
         Ok(())
+    }
+
+    pub fn imported_raw_file_status(&self, path: &str) -> Result<Option<String>> {
+        let db = self.lock_import_db();
+        Ok(db
+            .query_row(
+                "SELECT status FROM imported_raw_files WHERE path = ?1",
+                params![path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
     }
 
     pub fn imported_reconstructed_file_is_current(
@@ -2276,6 +2377,7 @@ mod tests {
     fn nested_db_lock_panics_instead_of_deadlocking() {
         let store = Store {
             db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            import_db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             root_dir: PathBuf::new(),
             archive_enabled: false,
             compression_executor: Arc::new(CompressionExecutor::new(1, 5, 22)),

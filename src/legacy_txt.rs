@@ -61,6 +61,12 @@ struct ParsedRawChunk {
     events: Vec<CanonicalEvent>,
 }
 
+#[derive(Debug, Default)]
+struct PendingIndexedRawBatch {
+    entries: Vec<(usize, CanonicalEvent)>,
+    file_indexes: HashSet<usize>,
+}
+
 #[derive(Debug)]
 struct ParsedRawProgress {
     file_index: usize,
@@ -143,6 +149,8 @@ impl RawImportOutcome {
 
 const IMPORT_PROGRESS_LINE_INTERVAL: usize = 100_000;
 const RAW_IMPORT_CHUNK_EVENTS: usize = 4_000;
+const BULK_IMPORT_COMMIT_EVENTS: usize = 20_000;
+const BULK_IMPORT_COMMIT_FILES: usize = 32;
 const BULK_IMPORT_DISCOVERY_LOG_INTERVAL: usize = 500;
 const BULK_IMPORT_SUMMARY_FILE_INTERVAL: usize = 10;
 const BULK_IMPORT_CHANNEL_WARN_THRESHOLD: usize = 200;
@@ -764,8 +772,12 @@ impl LegacyTxtRuntime {
             .filter(|value| *value > 0)
             .unwrap_or(4);
         info!(
-            "Starting parallel bulk raw import with {} raw worker(s), {} compression worker(s) for {} pending file(s)",
-            worker_count, compression_threads, planned_files
+            "Starting parallel bulk raw import with {} raw worker(s), {} compression worker(s) for {} pending file(s); coalesced_commit_events={}, coalesced_commit_files={}; SQLite progress writes disabled",
+            worker_count,
+            compression_threads,
+            planned_files,
+            BULK_IMPORT_COMMIT_EVENTS,
+            BULK_IMPORT_COMMIT_FILES
         );
 
         let (work_tx, work_rx) =
@@ -805,6 +817,7 @@ impl LegacyTxtRuntime {
         let mut states = HashMap::new();
         let mut all_channel_days = BTreeSet::new();
         let mut all_user_months = BTreeSet::new();
+        let mut pending_batch = PendingIndexedRawBatch::default();
         let mut finished = 0usize;
         while finished < scheduled_files {
             if store.shutdown_requested() {
@@ -815,21 +828,23 @@ impl LegacyTxtRuntime {
                 .map_err(|_| anyhow!("bulk raw import worker channel closed unexpectedly"))?;
             match message {
                 RawWorkerMessage::Chunk(chunk) => {
-                    let batch_started = Instant::now();
-                    let outcome = store.insert_events_batch(&chunk.events)?;
-                    let state = states
-                        .entry(chunk.file_index)
-                        .or_insert_with(RawFileImportState::default);
-                    accumulate_insert_outcome(state, outcome);
-                    info!(
-                        "Committed raw batch for file {}/{} in {:?}: batch_events={}, imported={}, skipped={}",
-                        chunk.file_index + 1,
-                        scheduled_files,
-                        batch_started.elapsed(),
-                        chunk.events.len(),
-                        state.imported,
-                        state.skipped_events
+                    pending_batch.file_indexes.insert(chunk.file_index);
+                    pending_batch.entries.extend(
+                        chunk
+                            .events
+                            .into_iter()
+                            .map(|event| (chunk.file_index, event)),
                     );
+                    if pending_batch.entries.len() >= BULK_IMPORT_COMMIT_EVENTS
+                        || pending_batch.file_indexes.len() >= BULK_IMPORT_COMMIT_FILES
+                    {
+                        flush_pending_indexed_raw_batch(
+                            store,
+                            &mut pending_batch,
+                            &mut states,
+                            scheduled_files,
+                        )?;
+                    }
                 }
                 RawWorkerMessage::Progress(progress) => {
                     let state = states
@@ -840,17 +855,8 @@ impl LegacyTxtRuntime {
                     state.parse_errors = progress.parse_errors;
                     state.parse_skipped = progress.parse_skipped;
                     let file = &files[progress.file_index];
-                    let status = format!(
-                        "importing:{}:{}:{}",
-                        state.scanned_lines, state.imported, state.parse_errors
-                    );
-                    let _ = store.record_imported_raw_file(
-                        &file.path.to_string_lossy(),
-                        &file.fingerprint,
-                        &status,
-                    );
                     info!(
-                        "Bulk raw import progress {}: scanned {} lines, imported {}, parse_errors {}",
+                        "Bulk raw import progress {}: scanned {} lines, imported {}, parse_errors {} (SQLite progress writes disabled)",
                         file.path.display(),
                         state.scanned_lines,
                         state.imported,
@@ -864,6 +870,12 @@ impl LegacyTxtRuntime {
                     parse_errors,
                     parse_skipped,
                 } => {
+                    flush_pending_indexed_raw_batch(
+                        store,
+                        &mut pending_batch,
+                        &mut states,
+                        scheduled_files,
+                    )?;
                     finished += 1;
                     let file = &files[file_index];
                     let state = states
@@ -923,6 +935,12 @@ impl LegacyTxtRuntime {
                     parse_skipped,
                     error,
                 } => {
+                    flush_pending_indexed_raw_batch(
+                        store,
+                        &mut pending_batch,
+                        &mut states,
+                        scheduled_files,
+                    )?;
                     finished += 1;
                     let file = &files[file_index];
                     let state = states
@@ -951,6 +969,8 @@ impl LegacyTxtRuntime {
                 }
             }
         }
+
+        flush_pending_indexed_raw_batch(store, &mut pending_batch, &mut states, scheduled_files)?;
 
         summary.affected_channel_days = all_channel_days.len();
         summary.affected_user_months = all_user_months.len();
@@ -1125,6 +1145,54 @@ fn merge_state_archives(
         file.path.display(),
         started.elapsed()
     );
+    Ok(())
+}
+
+fn flush_pending_indexed_raw_batch(
+    store: &Store,
+    pending_batch: &mut PendingIndexedRawBatch,
+    states: &mut HashMap<usize, RawFileImportState>,
+    scheduled_files: usize,
+) -> Result<()> {
+    if pending_batch.entries.is_empty() {
+        return Ok(());
+    }
+
+    let file_indexes = pending_batch
+        .file_indexes
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let batch_events = pending_batch.entries.len();
+    let batch_started = Instant::now();
+    let outcome = store.insert_indexed_events_batch(&pending_batch.entries)?;
+    for (file_index, file_outcome) in outcome.per_file {
+        let state = states
+            .entry(file_index)
+            .or_insert_with(RawFileImportState::default);
+        accumulate_insert_outcome(state, file_outcome);
+    }
+    info!(
+        "Committed coalesced raw batch in {:?}: batch_events={}, files_covered={}, imported={}, skipped={}",
+        batch_started.elapsed(),
+        batch_events,
+        file_indexes.len(),
+        outcome.totals.inserted,
+        outcome.totals.skipped
+    );
+    for file_index in file_indexes {
+        if let Some(state) = states.get(&file_index) {
+            info!(
+                "Coalesced batch state for file {}/{}: imported={}, skipped={}",
+                file_index + 1,
+                scheduled_files,
+                state.imported,
+                state.skipped_events
+            );
+        }
+    }
+    pending_batch.entries.clear();
+    pending_batch.file_indexes.clear();
     Ok(())
 }
 
@@ -1739,10 +1807,8 @@ fn import_raw_file_with_progress(
         scanned_lines += 1;
         let Some(raw) = extract_raw_irc_line(&line) else {
             if scanned_lines % IMPORT_PROGRESS_LINE_INTERVAL == 0 {
-                let status = format!("importing:{scanned_lines}:{imported}:{parse_errors}");
-                let _ = store.record_imported_raw_file(&path_key, &file.fingerprint, &status);
                 info!(
-                    "Raw import progress {}: scanned {} lines, imported {}, parse_errors {}",
+                    "Raw import progress {}: scanned {} lines, imported {}, parse_errors {} (SQLite progress writes disabled)",
                     file.path.display(),
                     scanned_lines,
                     imported,
@@ -1778,10 +1844,8 @@ fn import_raw_file_with_progress(
         }
 
         if scanned_lines % IMPORT_PROGRESS_LINE_INTERVAL == 0 {
-            let status = format!("importing:{scanned_lines}:{imported}:{parse_errors}");
-            let _ = store.record_imported_raw_file(&path_key, &file.fingerprint, &status);
             info!(
-                "Raw import progress {}: scanned {} lines, imported {}, parse_errors {}",
+                "Raw import progress {}: scanned {} lines, imported {}, parse_errors {} (SQLite progress writes disabled)",
                 file.path.display(),
                 scanned_lines,
                 imported,

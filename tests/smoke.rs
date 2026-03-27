@@ -58,7 +58,8 @@ async fn openapi_route_serves_checked_in_spec() {
     );
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let expected = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml")).unwrap();
+    let expected =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml")).unwrap();
     assert_eq!(String::from_utf8(body.to_vec()).unwrap(), expected);
 }
 
@@ -67,12 +68,7 @@ async fn docs_route_points_at_served_openapi_spec() {
     let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
 
     let response = harness
-        .request(
-            Request::builder()
-                .uri("/docs")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .request(Request::builder().uri("/docs").body(Body::empty()).unwrap())
         .await;
 
     assert_eq!(response.status(), http::StatusCode::OK);
@@ -81,8 +77,13 @@ async fn docs_route_points_at_served_openapi_spec() {
         "text/html; charset=utf-8"
     );
 
-    let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
-        .unwrap();
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     assert!(body.contains("spec-url=\"/openapi.yaml\""));
     assert!(body.contains("rapidoc"));
 }

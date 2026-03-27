@@ -197,13 +197,14 @@ Large import folders are handled incrementally:
 - When that optimization is enabled, a shard is skipped only after a sanity check proves its sampled IRC `id` values already exist in that month’s `.../<channel>/<year>/<month>/<day>/channel.txt(.gz)` data.
 - If a sampled raw line does not parse, lacks a real IRC `id`, or its sampled id is missing from the month channel data, the shard is kept and imported.
 - The importer logs start, periodic progress, and completion summaries through normal tracing output.
+- Raw progress remains in logs only; intermediate progress checkpoints are no longer written into SQLite.
 - Progress logs are emitted every `100000` scanned lines for long-running raw imports.
 - Archive compression now runs in parallel across independent segment files, capped by `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS`.
 - Raw-file bookkeeping records an `importing` state before work starts and only marks a file complete when it finishes.
 - If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request.
 - Re-importing an already completed raw file is skipped when its fingerprint is unchanged.
 - If `JUSTLOG_IMPORT_DELETE_RAW=1`, successfully imported raw files are deleted after completion.
-- If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1`, raw files that are already current in native storage are also deleted during the preflight scan. This flag defaults to `1`.
+- If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1`, raw files that are already current in native storage are also deleted during the preflight scan. This also applies to files you refetched and re-imported successfully once their current fingerprint is already in native storage. This flag defaults to `1`.
 - If `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`, successfully parsed reconstructed TXT / JSON files are deleted after the request that consumed them.
 - If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1`, reconstructed TXT / JSON files that were already consumed successfully and are still unchanged are deleted during later discovery before reparsing.
 - `POST /admin/import/raw` can bulk-import raw IRC files under `JUSTLOG_IMPORT_FOLDER`, optionally filtered by `channel_id`, limited by file count, or run as `dry_run`.
