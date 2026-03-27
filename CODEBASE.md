@@ -67,6 +67,7 @@ At runtime:
 - `src/model.rs`: canonical event model, API response structs, and raw IRC parsing helpers.
 - `src/compact.rs`: background loop that periodically archives old partitions.
 - `src/import.rs`: CLI import path for legacy plain-text or gzip-compressed log files.
+- `src/legacy_txt.rs`: isolated read-only compatibility layer for sparse legacy TXT files used during API reads.
 
 ## Startup and Lifecycle
 
@@ -102,6 +103,7 @@ The binary supports:
 - `config`: shared mutable config behind `Arc<RwLock<Config>>`
 - `store`: cloned handle to the SQLite/segment storage layer
 - `helix`: cached Twitch API client
+- `legacy_txt`: env-driven compatibility runtime for optional legacy TXT reads
 - `ingest`: optional ingest manager handle used for runtime join/part/say actions
 - `start_time`: used for uptime reporting
 - `optout_codes`: temporary one-minute confirmation codes for self-service opt-out
@@ -143,6 +145,24 @@ On load, config normalization:
 - requires `clientID` to be present
 
 `Config::persist()` writes the normalized config back to disk after admin/chat command changes.
+
+### Env-Only Legacy TXT Compatibility
+
+Legacy TXT support is intentionally not part of the JSON config schema. It is controlled only through env flags so it stays operationally optional and architecturally separate from the main ingest/store path.
+
+Supported flags:
+
+- `JUSTLOG_LEGACY_TXT_ENABLED=1`
+- `JUSTLOG_LEGACY_TXT_ROOT=<path>`
+- `JUSTLOG_LEGACY_TXT_MODE=missing_only|merge|off`
+- `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`
+
+Behavior summary:
+
+- `missing_only` is the default and only uses TXT when native channel-day data is absent.
+- `merge` combines native and TXT messages by timestamp with stable ordering.
+- `off` disables the compatibility layer entirely.
+- Per-request root checks are only done when `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`.
 
 ## Ingestion Pipeline
 
@@ -213,6 +233,8 @@ The store uses:
 - full sync mode
 - indexes by channel/time and user/time
 - `INSERT OR IGNORE` on `event_uid` to avoid duplicates
+
+Legacy TXT compatibility data does not enter SQLite hot storage. It is kept out of the main storage model on purpose so future runtime/storage features do not need to account for legacy data unless they are explicitly working on API response composition.
 
 ### Archived Storage
 
@@ -295,6 +317,50 @@ Behavior notes:
 - missing date segments redirect to a canonical path using the latest/default period
 - opted-out users and channels return `403`
 - Brotli can be used either as direct file passthrough or on-the-fly response compression
+- channel-day reads can optionally consult the legacy TXT compatibility layer, depending on env mode
+- `/list` can include channel-days discovered from legacy TXT files when the compatibility layer is enabled
+
+### Legacy TXT Compatibility Reads
+
+`src/legacy_txt.rs` is deliberately separate from `store.rs`, `ingest.rs`, and compaction. It exists as a compatibility edge around API reads rather than as a core data source.
+
+Current scope:
+
+- channel-day responses
+- channel-day discovery in `/list`
+
+Current non-scope:
+
+- user-month reads
+- random reads
+- range reads
+- ingest/import into SQLite
+- archive generation
+
+The module searches recursively under the configured root for files that end in a JustLog-style suffix:
+
+```text
+.../<channel_id>/<year>/<month>/<day>.txt
+```
+
+This lets operators copy large legacy trees anywhere under the configured root without flattening them first.
+
+The parser targets sparse lines such as:
+
+```text
+[0:00:04] SomeUser: hello
+```
+
+It generates response-compatible messages with:
+
+- absolute timestamps derived from the requested day plus the line offset
+- normalized usernames
+- stable fallback ids
+- empty tags for unsupported metadata
+
+If multiple matching TXT files exist under the recursive root, all parseable files are read and merged by timestamp. Parse failures are ignored and do not fail requests.
+
+Whenever the legacy root is checked, the module also prunes empty directories below that root and removes empty parent layers upward when possible.
 
 ### Admin and Opt-Out Routes
 
@@ -346,6 +412,11 @@ It:
 - parses each line as raw IRC
 - converts supported messages into `CanonicalEvent`
 - inserts unique events into the store
+
+This import path is distinct from the legacy TXT compatibility layer:
+
+- `src/import.rs` imports raw IRC-style history into normal storage
+- `src/legacy_txt.rs` is a read-only fallback/merge layer for sparse TXT exports
 
 ## Testing Strategy
 

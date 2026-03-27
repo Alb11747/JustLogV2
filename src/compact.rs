@@ -27,12 +27,9 @@ pub fn spawn_compactor(config: SharedConfig, store: Store, debug_runtime: Arc<De
     });
     tokio::spawn(async move {
         loop {
-            if let Err(error) = process_due_reconciliation_jobs(
-                debug_runtime.clone(),
-                store.clone(),
-                Utc::now(),
-            )
-            .await
+            if let Err(error) =
+                process_due_reconciliation_jobs(debug_runtime.clone(), store.clone(), Utc::now())
+                    .await
             {
                 error!("reconciliation iteration failed: {error}");
             }

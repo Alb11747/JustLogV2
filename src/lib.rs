@@ -6,6 +6,7 @@ pub mod debug_sync;
 pub mod helix;
 pub mod import;
 pub mod ingest;
+pub mod legacy_txt;
 pub mod model;
 pub mod store;
 

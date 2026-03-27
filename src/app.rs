@@ -20,6 +20,7 @@ use crate::debug_sync::{DebugRuntime, run_startup_validation};
 use crate::helix::HelixClient;
 use crate::import::import_legacy_logs;
 use crate::ingest::{ChatCommandService, IngestManager};
+use crate::legacy_txt::LegacyTxtRuntime;
 use crate::model::CanonicalEvent;
 use crate::store::Store;
 
@@ -42,6 +43,7 @@ pub struct AppState {
     pub config: SharedConfig,
     pub store: Store,
     pub helix: HelixClient,
+    pub legacy_txt: Arc<LegacyTxtRuntime>,
     pub debug_runtime: Arc<DebugRuntime>,
     pub ingest: Arc<RwLock<Option<IngestManager>>>,
     pub start_time: Instant,
@@ -53,6 +55,7 @@ pub async fn run_cli() -> Result<()> {
     let config = Config::load(&cli.config)?;
     init_tracing(&config.log_level);
     let debug_runtime = Arc::new(DebugRuntime::from_env(&config.logs_directory)?);
+    let legacy_txt = Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory));
 
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let store = Store::open(&config)?;
@@ -70,6 +73,7 @@ pub async fn run_cli() -> Result<()> {
         config: shared_config.clone(),
         store: store.clone(),
         helix: helix.clone(),
+        legacy_txt,
         debug_runtime: debug_runtime.clone(),
         ingest: ingest_slot.clone(),
         start_time: Instant::now(),

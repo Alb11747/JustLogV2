@@ -37,6 +37,63 @@ The app listens on port `8025` by default and expects a JSON config file. The mi
 }
 ```
 
+## Legacy TXT Compatibility
+
+JustLogV2 also has an optional read-only legacy TXT compatibility layer for sparse chat exports. This is intended as a backward-compatibility feature for API reads, not as part of the main ingest, storage, or compaction pipeline.
+
+Supported env flags:
+
+- `JUSTLOG_LEGACY_TXT_ENABLED=1`: turn the compatibility layer on.
+- `JUSTLOG_LEGACY_TXT_ROOT=<path>`: root folder to search for legacy TXT files.
+- `JUSTLOG_LEGACY_TXT_MODE=missing_only|merge|off`: request behavior. Default is `missing_only`.
+- `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`: re-check the legacy root on every request instead of only trusting startup availability.
+
+Mode behavior:
+
+- `missing_only`: use legacy TXT only when native JustLog data for that channel-day is missing.
+- `merge`: merge native and TXT messages by timestamp using a stable sort.
+- `off`: completely ignore TXT data.
+
+The current compatibility scope is channel-day reads and `/list` channel-day discovery. User-month, random, and range reads still use native data only.
+
+### Legacy TXT layout
+
+The legacy reader looks for files matching:
+
+```text
+.../<channel_id>/<year>/<month>/<day>.txt
+```
+
+The search is recursive under `JUSTLOG_LEGACY_TXT_ROOT`, so you can copy an existing JustLog-style folder tree anywhere under that root and the API will still find matching days.
+
+Example:
+
+```text
+D:\legacy-root\copied\justlog\31062476\2024\1\2.txt
+```
+
+If the requested route is `/channelid/31062476/2024/1/2`, that file is eligible.
+
+### TXT parsing behavior
+
+The parser is intentionally minimal and targets response compatibility for lines like:
+
+```text
+[0:00:04] SomeUser: hello
+```
+
+It derives:
+
+- absolute timestamps from the requested channel-day plus the per-line offset
+- normalized usernames from the visible name
+- stable fallback ids from timestamp, username, and message text
+
+Unsupported metadata is left empty, and TXT parse failures never fail the request.
+
+### Empty directory cleanup
+
+Whenever the legacy root is checked, the compatibility layer prunes empty directories under that root and removes empty parent directories upward when possible. This helps clean up copied legacy trees after files are moved or deleted, while leaving non-empty branches untouched.
+
 ## Debug Validation
 
 Optional env flags support reconciliation and startup consistency validation:

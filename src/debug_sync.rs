@@ -117,9 +117,7 @@ impl DebugRuntime {
         for warning in &summary.warnings {
             warn!("{warning}");
         }
-        if summary.enabled
-            && summary.compare_url.is_some()
-            && summary.trusted_compare_url.is_some()
+        if summary.enabled && summary.compare_url.is_some() && summary.trusted_compare_url.is_some()
         {
             info!("JUSTLOG_DEBUG_TRUSTED_COMPARE_URL is set; trusted reconciliation mode wins");
         }
@@ -151,8 +149,10 @@ impl DebugRuntime {
         let compare_url = normalize_base_url(vars.get("JUSTLOG_DEBUG_COMPARE_URL").cloned());
         let trusted_compare_url =
             normalize_base_url(vars.get("JUSTLOG_DEBUG_TRUSTED_COMPARE_URL").cloned());
-        let fallback_requested =
-            env_flag(vars.get("JUSTLOG_DEBUG_FALLBACK_TRUSTED_API").map(String::as_str));
+        let fallback_requested = env_flag(
+            vars.get("JUSTLOG_DEBUG_FALLBACK_TRUSTED_API")
+                .map(String::as_str),
+        );
         let startup_validation_mode = parse_startup_validation_mode(
             vars.get("JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP")
                 .map(String::as_str),
@@ -450,7 +450,11 @@ pub async fn process_reconciliation_job(
 
     if !diff.missing_local.is_empty() || !diff.extra_local.is_empty() {
         status = "conflict".to_string();
-        unhealthy = if mode == ReconciliationMode::Trusted { 0 } else { 1 };
+        unhealthy = if mode == ReconciliationMode::Trusted {
+            0
+        } else {
+            1
+        };
         let summary = build_conflict_summary(&diff);
         runtime.log_check(
             "WARN",
@@ -509,12 +513,8 @@ async fn validate_single_day(
     let mut authoritative = BTreeMap::new();
     let mut corruption_detected = false;
 
-    match store.read_archived_channel_segment_strict(
-        &key.channel_id,
-        key.year,
-        key.month,
-        key.day,
-    ) {
+    match store.read_archived_channel_segment_strict(&key.channel_id, key.year, key.month, key.day)
+    {
         Ok(events) => {
             for event in events {
                 authoritative.insert(event_identity(&event), event);
@@ -582,27 +582,28 @@ async fn validate_single_day(
     let channel_mismatch =
         !local_channel_diff.missing_local.is_empty() || !local_channel_diff.extra_local.is_empty();
 
-    let repaired_any = if corruption_detected && runtime.reconciliation_mode() == ReconciliationMode::Trusted {
-        let remote_events = fetch_remote_day_events(
-            &runtime.client,
-            runtime
-                .compare_base_url()
-                .ok_or_else(|| anyhow!("compare URL is not configured"))?,
-            &key.channel_id,
-            key.year,
-            key.month,
-            key.day,
-        )
-        .await?;
-        sync_channel_and_users_from_events(&store, &remote_events)?;
-        true
-    } else if corruption_detected || channel_mismatch {
-        sync_channel_and_users_from_events(&store, &authoritative_events)?;
-        true
-    } else {
-        sync_user_months_from_authoritative(&store, &channel_key, &authoritative_events)?;
-        false
-    };
+    let repaired_any =
+        if corruption_detected && runtime.reconciliation_mode() == ReconciliationMode::Trusted {
+            let remote_events = fetch_remote_day_events(
+                &runtime.client,
+                runtime
+                    .compare_base_url()
+                    .ok_or_else(|| anyhow!("compare URL is not configured"))?,
+                &key.channel_id,
+                key.year,
+                key.month,
+                key.day,
+            )
+            .await?;
+            sync_channel_and_users_from_events(&store, &remote_events)?;
+            true
+        } else if corruption_detected || channel_mismatch {
+            sync_channel_and_users_from_events(&store, &authoritative_events)?;
+            true
+        } else {
+            sync_user_months_from_authoritative(&store, &channel_key, &authoritative_events)?;
+            false
+        };
 
     let segment_path = format!(
         "segments/channel/{}/{}/{}/{}.br",
@@ -678,7 +679,10 @@ fn collect_candidate_days(store: &Store, start: Option<DateTime<Utc>>) -> Result
     Ok(keys.into_iter().collect())
 }
 
-fn sync_channel_and_users_from_events(store: &Store, authoritative_events: &[StoredEvent]) -> Result<()> {
+fn sync_channel_and_users_from_events(
+    store: &Store,
+    authoritative_events: &[StoredEvent],
+) -> Result<()> {
     let Some(first) = authoritative_events.first() else {
         return Ok(());
     };
@@ -793,7 +797,10 @@ fn build_conflict_summary(diff: &ReconciliationDiff) -> String {
         ));
     }
     if !diff.extra_local.is_empty() {
-        parts.push(format!("extra locally: {}", summarize_events(&diff.extra_local)));
+        parts.push(format!(
+            "extra locally: {}",
+            summarize_events(&diff.extra_local)
+        ));
     }
     parts.join("; ")
 }
@@ -888,9 +895,7 @@ async fn fetch_remote_day_events(
         .send()
         .await
         .with_context(|| {
-            format!(
-                "failed to fetch remote logs for channel-day {channel_id}/{year}/{month}/{day}"
-            )
+            format!("failed to fetch remote logs for channel-day {channel_id}/{year}/{month}/{day}")
         })?
         .error_for_status()?;
     let body = response.json::<RemoteChatLog>().await?;
@@ -899,7 +904,9 @@ async fn fetch_remote_day_events(
         .enumerate()
         .map(|(index, message)| {
             let Some(event) = crate::model::CanonicalEvent::from_raw(&message.raw)? else {
-                return Err(anyhow!("remote message could not be parsed as a canonical event"));
+                return Err(anyhow!(
+                    "remote message could not be parsed as a canonical event"
+                ));
             };
             Ok(StoredEvent {
                 seq: index as i64,
@@ -989,7 +996,10 @@ mod tests {
         assert!(summary.compare_url.is_none());
         assert!(summary.trusted_compare_url.is_none());
         assert!(!summary.fallback_trusted_api);
-        assert_eq!(summary.startup_validation_mode, StartupValidationMode::Disabled);
+        assert_eq!(
+            summary.startup_validation_mode,
+            StartupValidationMode::Disabled
+        );
     }
 
     #[test]
@@ -1081,11 +1091,8 @@ mod tests {
             "JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP".to_string(),
             "7d".to_string(),
         );
-        let runtime = DebugRuntime::from_summary(
-            temp.path(),
-            DebugRuntime::summary_from_map(&vars),
-        )
-        .unwrap();
+        let runtime =
+            DebugRuntime::from_summary(temp.path(), DebugRuntime::summary_from_map(&vars)).unwrap();
         let now = Utc::now();
         runtime
             .persist_last_validated_time(now - Duration::hours(12))

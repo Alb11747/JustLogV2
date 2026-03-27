@@ -17,6 +17,7 @@ use justlog::config::Config;
 use justlog::debug_sync::DebugRuntime;
 use justlog::helix::{HelixClient, UserData};
 use justlog::ingest::IngestManager;
+use justlog::legacy_txt::LegacyTxtRuntime;
 use justlog::model::CanonicalEvent;
 use justlog::store::Store;
 use serde_json::json;
@@ -167,7 +168,9 @@ impl MockJustLogServer {
         }
 
         let routes = Arc::new(Mutex::new(HashMap::new()));
-        let app = Router::new().route("/{*path}", get(handler)).with_state(routes.clone());
+        let app = Router::new()
+            .route("/{*path}", get(handler))
+            .with_state(routes.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -371,6 +374,7 @@ impl TestHarness {
             config: shared_config.clone(),
             store: store.clone(),
             helix: helix.clone(),
+            legacy_txt: Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory)),
             debug_runtime,
             ingest: ingest_slot.clone(),
             start_time: Instant::now(),

@@ -16,10 +16,7 @@ use common::{MockJustLogServer, TestHarness, privmsg};
 
 fn trusted_runtime(base_url: &str, log_dir: &Path) -> Arc<DebugRuntime> {
     let mut vars = std::collections::HashMap::new();
-    vars.insert(
-        "JUSTLOG_DEBUG".to_string(),
-        "1".to_string(),
-    );
+    vars.insert("JUSTLOG_DEBUG".to_string(), "1".to_string());
     vars.insert(
         "JUSTLOG_DEBUG_TRUSTED_COMPARE_URL".to_string(),
         base_url.to_string(),
@@ -28,24 +25,17 @@ fn trusted_runtime(base_url: &str, log_dir: &Path) -> Arc<DebugRuntime> {
         "JUSTLOG_DEBUG_FALLBACK_TRUSTED_API".to_string(),
         "1".to_string(),
     );
-    Arc::new(
-        DebugRuntime::from_summary(log_dir, DebugRuntime::summary_from_map(&vars)).unwrap(),
-    )
+    Arc::new(DebugRuntime::from_summary(log_dir, DebugRuntime::summary_from_map(&vars)).unwrap())
 }
 
 fn compare_runtime(base_url: &str, log_dir: &Path) -> Arc<DebugRuntime> {
     let mut vars = std::collections::HashMap::new();
-    vars.insert(
-        "JUSTLOG_DEBUG".to_string(),
-        "1".to_string(),
-    );
+    vars.insert("JUSTLOG_DEBUG".to_string(), "1".to_string());
     vars.insert(
         "JUSTLOG_DEBUG_COMPARE_URL".to_string(),
         base_url.to_string(),
     );
-    Arc::new(
-        DebugRuntime::from_summary(log_dir, DebugRuntime::summary_from_map(&vars)).unwrap(),
-    )
+    Arc::new(DebugRuntime::from_summary(log_dir, DebugRuntime::summary_from_map(&vars)).unwrap())
 }
 
 fn startup_runtime(log_dir: &Path, value: &str) -> Arc<DebugRuntime> {
@@ -54,9 +44,7 @@ fn startup_runtime(log_dir: &Path, value: &str) -> Arc<DebugRuntime> {
         "JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP".to_string(),
         value.to_string(),
     );
-    Arc::new(
-        DebugRuntime::from_summary(log_dir, DebugRuntime::summary_from_map(&vars)).unwrap(),
-    )
+    Arc::new(DebugRuntime::from_summary(log_dir, DebugRuntime::summary_from_map(&vars)).unwrap())
 }
 
 #[tokio::test]
@@ -77,7 +65,11 @@ async fn compaction_schedules_reconciliation_after_delay() {
     harness.seed_channel_event(&event);
     harness.compact_channel_day("1", 2024, 1, 2);
 
-    let due_now = harness.state.store.due_reconciliation_jobs(Utc::now()).unwrap();
+    let due_now = harness
+        .state
+        .store
+        .due_reconciliation_jobs(Utc::now())
+        .unwrap();
     assert!(due_now.is_empty());
 
     let due_later = harness
@@ -117,13 +109,22 @@ async fn trusted_reconciliation_repairs_archived_segment_and_logs_it() {
         1_704_153_601_000,
         "second",
     );
-    let event = justlog::model::CanonicalEvent::from_raw(&msg1).unwrap().unwrap();
+    let event = justlog::model::CanonicalEvent::from_raw(&msg1)
+        .unwrap()
+        .unwrap();
     harness.seed_channel_event(&event);
     harness.compact_channel_day("1", 2024, 1, 2);
     harness
         .state
         .store
-        .schedule_reconciliation("1", 2024, 1, 2, "segments/channel/1/2024/1/2.br", Utc::now())
+        .schedule_reconciliation(
+            "1",
+            2024,
+            1,
+            2,
+            "segments/channel/1/2024/1/2.br",
+            Utc::now(),
+        )
         .unwrap();
     remote
         .set_json(
@@ -142,11 +143,13 @@ async fn trusted_reconciliation_repairs_archived_segment_and_logs_it() {
         .read_channel_logs("1", 2024, 1, 2)
         .unwrap();
     assert_eq!(repaired.len(), 2);
-    assert!(!harness
-        .state
-        .store
-        .channel_day_is_unhealthy("1", 2024, 1, 2)
-        .unwrap());
+    assert!(
+        !harness
+            .state
+            .store
+            .channel_day_is_unhealthy("1", 2024, 1, 2)
+            .unwrap()
+    );
 
     let log = fs::read_to_string(log_dir.path().join("reconciliation.log")).unwrap();
     assert!(log.contains("repaired channel-day 1/2024/1/2"));
@@ -179,13 +182,22 @@ async fn compare_only_reconciliation_logs_conflicts_without_mutating_archive() {
         1_704_153_601_000,
         "second",
     );
-    let event = justlog::model::CanonicalEvent::from_raw(&msg1).unwrap().unwrap();
+    let event = justlog::model::CanonicalEvent::from_raw(&msg1)
+        .unwrap()
+        .unwrap();
     harness.seed_channel_event(&event);
     harness.compact_channel_day("1", 2024, 1, 2);
     harness
         .state
         .store
-        .schedule_reconciliation("1", 2024, 1, 2, "segments/channel/1/2024/1/2.br", Utc::now())
+        .schedule_reconciliation(
+            "1",
+            2024,
+            1,
+            2,
+            "segments/channel/1/2024/1/2.br",
+            Utc::now(),
+        )
         .unwrap();
     remote
         .set_json(
@@ -204,11 +216,13 @@ async fn compare_only_reconciliation_logs_conflicts_without_mutating_archive() {
         .read_channel_logs("1", 2024, 1, 2)
         .unwrap();
     assert_eq!(archived.len(), 1);
-    assert!(harness
-        .state
-        .store
-        .channel_day_is_unhealthy("1", 2024, 1, 2)
-        .unwrap());
+    assert!(
+        harness
+            .state
+            .store
+            .channel_day_is_unhealthy("1", 2024, 1, 2)
+            .unwrap()
+    );
     let log = fs::read_to_string(log_dir.path().join("reconciliation.log")).unwrap();
     assert!(log.contains("missing locally"));
     assert!(log.contains("compare-2"));
@@ -304,7 +318,12 @@ async fn fallback_proxies_dated_range_random_and_user_reads() {
         .await;
 
     let dated = harness
-        .response_text(Request::builder().uri("/channelid/1/2024/1/2").body(Body::empty()).unwrap())
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await;
     assert_eq!(dated, "dated fallback");
 
@@ -427,8 +446,8 @@ async fn startup_validation_repairs_missing_channel_data_from_user_month() {
     harness.compact_user_month("1", "200", 2024, 1);
 
     run_startup_validation(runtime, harness.state.store.clone(), Utc::now())
-    .await
-    .unwrap();
+        .await
+        .unwrap();
 
     let repaired_channel = harness
         .state

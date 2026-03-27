@@ -9,8 +9,8 @@ use chrono::{DateTime, Datelike, Duration, Utc};
 use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::debug_sync::RECONCILIATION_DELAY_SECONDS;
 use crate::config::Config;
+use crate::debug_sync::RECONCILIATION_DELAY_SECONDS;
 use crate::model::{
     CanonicalEvent, ChannelDayKey, ChannelLogFile, ChannelPartitionSummary, SegmentRecord,
     StoredEvent, UserLogFile, UserMonthKey, UserPartitionSummary,
@@ -910,7 +910,10 @@ impl Store {
         day: u32,
         events: &[StoredEvent],
     ) -> Result<String> {
-        let relative = format!("segments/channel/{}/{}/{}/{}.br", channel_id, year, month, day);
+        let relative = format!(
+            "segments/channel/{}/{}/{}/{}.br",
+            channel_id, year, month, day
+        );
         let final_path = self.root_dir.join(&relative);
         let temp_path = self.root_dir.join(format!("{}.repair.tmp", relative));
         self.write_segment_file(&final_path, &temp_path, events)?;
@@ -942,7 +945,10 @@ impl Store {
         month: u32,
         events: &[StoredEvent],
     ) -> Result<String> {
-        let relative = format!("segments/user/{}/{}/{}/{}.br", channel_id, user_id, year, month);
+        let relative = format!(
+            "segments/user/{}/{}/{}/{}.br",
+            channel_id, user_id, year, month
+        );
         let final_path = self.root_dir.join(&relative);
         let temp_path = self.root_dir.join(format!("{}.repair.tmp", relative));
         self.write_segment_file(&final_path, &temp_path, events)?;
@@ -973,7 +979,10 @@ impl Store {
         self.list_segments("channel", start, None)
     }
 
-    pub fn list_user_segments_since(&self, start: Option<DateTime<Utc>>) -> Result<Vec<SegmentRecord>> {
+    pub fn list_user_segments_since(
+        &self,
+        start: Option<DateTime<Utc>>,
+    ) -> Result<Vec<SegmentRecord>> {
         self.list_segments("user", start, None)
     }
 
@@ -1227,7 +1236,10 @@ impl Store {
                 )?;
                 rows.extend(
                     statement
-                        .query_map(params![scope, channel_id, start.timestamp()], map_segment_row)?
+                        .query_map(
+                            params![scope, channel_id, start.timestamp()],
+                            map_segment_row,
+                        )?
                         .collect::<rusqlite::Result<Vec<_>>>()?,
                 );
             } else {

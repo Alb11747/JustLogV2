@@ -19,6 +19,7 @@ use tokio_util::io::ReaderStream;
 use tracing::warn;
 
 use crate::app::AppState;
+use crate::legacy_txt::{LegacyTxtMode, merge_messages};
 use crate::model::{
     AllChannelsJson, ChannelInfo, ChannelLogList, ChatLog, ChatMessage, ErrorResponse, UserLogList,
 };
@@ -160,7 +161,18 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
         );
         Ok(response)
     } else {
-        let logs = state.store.get_available_logs_for_channel(&channel_id)?;
+        let mut logs = state.store.get_available_logs_for_channel(&channel_id)?;
+        if state.legacy_txt.is_request_enabled() {
+            logs.extend(state.legacy_txt.available_channel_logs(&channel_id));
+            logs.sort_by(|left, right| {
+                right
+                    .year
+                    .cmp(&left.year)
+                    .then_with(|| right.month.cmp(&left.month))
+                    .then_with(|| right.day.cmp(&left.day))
+            });
+            logs.dedup();
+        }
         let mut response = Json(ChannelLogList {
             available_logs: logs,
         })
@@ -253,12 +265,7 @@ async fn log_handler(state: AppState, request: Request) -> Result<Response> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let log_request = parse_log_request(
-        &state,
-        request.uri(),
-        &content_type,
-    )
-    .await?;
+    let log_request = parse_log_request(&state, request.uri(), &content_type).await?;
     if let Some(redirect_path) = log_request.redirect_path {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::FOUND;
@@ -365,7 +372,11 @@ async fn dated_response(
             .read_user_logs(&request.channel_id, user_id, year, month)?
     } else {
         let day = request.time.day.ok_or_else(|| anyhow!("invalid day"))?;
-        if request.response_type == ResponseType::Raw && accept_encoding.contains("br") {
+        let legacy_mode = state.legacy_txt.mode();
+        if request.response_type == ResponseType::Raw
+            && accept_encoding.contains("br")
+            && legacy_mode == LegacyTxtMode::Off
+        {
             let plan = state
                 .store
                 .channel_raw_plan(&request.channel_id, year, month, day)?;
@@ -373,9 +384,24 @@ async fn dated_response(
                 return direct_brotli_response(path);
             }
         }
-        state
+        let native = state
             .store
-            .read_channel_logs(&request.channel_id, year, month, day)?
+            .read_channel_logs(&request.channel_id, year, month, day)?;
+        let channel_login = resolve_channel_login(&state, &request.channel_id).await;
+        let legacy = state.legacy_txt.load_channel_day_messages(
+            &request.channel_id,
+            &channel_login,
+            year,
+            month,
+            day,
+        );
+        return respond_with_channel_day_messages(
+            request,
+            native.into_iter().map(ChatMessage::from).collect(),
+            legacy.unwrap_or_default(),
+            accept_encoding.contains("br"),
+            legacy_mode,
+        );
     };
     if request.reverse {
         events.reverse();
@@ -389,6 +415,30 @@ async fn dated_response(
         request.response_type,
         accept_encoding.contains("br"),
     )
+}
+
+fn respond_with_channel_day_messages(
+    request: LogRequest,
+    native: Vec<ChatMessage>,
+    legacy: Vec<ChatMessage>,
+    compress_brotli: bool,
+    legacy_mode: LegacyTxtMode,
+) -> Result<Response> {
+    let mut messages = match legacy_mode {
+        LegacyTxtMode::Off => native,
+        LegacyTxtMode::MissingOnly => {
+            if native.is_empty() {
+                legacy
+            } else {
+                native
+            }
+        }
+        LegacyTxtMode::Merge => merge_messages(native, legacy),
+    };
+    if request.reverse {
+        messages.reverse();
+    }
+    respond_with_events(messages, request.response_type, compress_brotli)
 }
 
 async fn parse_log_request(state: &AppState, uri: &Uri, content_type: &str) -> Result<LogRequest> {
@@ -549,9 +599,11 @@ async fn should_force_trusted_fallback(state: &AppState, request: &LogRequest) -
         return Ok(false);
     }
     match (request.time.year, request.time.month, request.time.day) {
-        (Some(year), Some(month), Some(day)) => state
-            .store
-            .channel_day_is_unhealthy(&request.channel_id, year, month, day),
+        (Some(year), Some(month), Some(day)) => {
+            state
+                .store
+                .channel_day_is_unhealthy(&request.channel_id, year, month, day)
+        }
         _ => Ok(false),
     }
 }
@@ -598,6 +650,16 @@ async fn resolve_login_to_id(helix: &crate::helix::HelixClient, login: &str) -> 
         .get(&login.to_lowercase())
         .map(|user| user.id.clone())
         .ok_or_else(|| anyhow!("could not find users"))
+}
+
+async fn resolve_channel_login(state: &AppState, channel_id: &str) -> String {
+    state
+        .helix
+        .get_users_by_ids(&[channel_id.to_string()])
+        .await
+        .ok()
+        .and_then(|users| users.get(channel_id).map(|user| user.login.clone()))
+        .unwrap_or_else(|| channel_id.to_string())
 }
 
 fn parse_timestamp(input: &str) -> Result<DateTime<Utc>> {
