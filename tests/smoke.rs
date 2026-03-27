@@ -35,6 +35,7 @@ async fn basic_routes_are_healthy() {
     assert_status_ok(&harness, "/readyz").await;
     assert_status_ok(&harness, "/openapi.yaml").await;
     assert_status_ok(&harness, "/docs").await;
+    assert_status_ok(&harness, "/docs/rapidoc-min.js").await;
 }
 
 #[tokio::test]
@@ -96,7 +97,40 @@ async fn docs_route_points_at_served_openapi_spec() {
     )
     .unwrap();
     assert!(body.contains("spec-url=\"/openapi.yaml\""));
+    assert!(body.contains("src=\"/docs/rapidoc-min.js\""));
+    assert!(body.contains("data-cfasync=\"false\""));
+    assert!(!body.contains("https://unpkg.com/rapidoc"));
     assert!(body.contains("rapidoc"));
+}
+
+#[tokio::test]
+async fn docs_rapidoc_bundle_route_serves_local_script() {
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+
+    let response = harness
+        .request(
+            Request::builder()
+                .uri("/docs/rapidoc-min.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/javascript; charset=utf-8"
+    );
+
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("customElements.define"));
+    assert!(body.contains("RapiDoc"));
 }
 
 #[test]

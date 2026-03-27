@@ -28,6 +28,10 @@ use crate::model::{
 };
 
 const OPENAPI_YAML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"));
+const RAPIDOC_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/docs/rapidoc-min.js"
+));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponseType {
@@ -106,6 +110,7 @@ pub async fn dispatch(state: AppState, request: Request) -> Response {
         (_, "/") => docs_redirect_response(),
         (_, "/openapi.yaml") => openapi_response(),
         (_, "/docs") => docs_response(),
+        (_, "/docs/rapidoc-min.js") => docs_rapidoc_js_response(),
         (_, "/channels") => match channels_handler(state).await {
             Ok(response) => response,
             Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -1041,6 +1046,14 @@ fn openapi_response() -> Response {
         .unwrap()
 }
 
+fn docs_rapidoc_js_response() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/javascript; charset=utf-8")
+        .body(Body::from(RAPIDOC_JS))
+        .unwrap()
+}
+
 fn docs_response() -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -1052,7 +1065,7 @@ fn docs_response() -> Response {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>JustLogV2 API Docs</title>
-  <script type="module" src="https://unpkg.com/rapidoc/dist/rapidoc-min.js"></script>
+  <script type="module" data-cfasync="false" src="/docs/rapidoc-min.js"></script>
   <style>
     body {{
       margin: 0;

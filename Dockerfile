@@ -29,6 +29,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 COPY Cargo.toml Cargo.lock ./
 COPY openapi.yaml ./
+COPY assets ./assets
 COPY src ./src
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

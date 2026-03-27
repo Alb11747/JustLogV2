@@ -50,6 +50,8 @@ When the app is running locally, you can use:
 - `http://127.0.0.1:8026/docs` for the browser-based API UI
 - `http://127.0.0.1:8026/openapi.yaml` for the raw OpenAPI document
 
+The docs UI serves its RapiDoc bundle locally from `/docs/rapidoc-min.js` so it keeps working behind proxies or CDNs that rewrite third-party script tags.
+
 For Postman or similar tools, import `openapi.yaml` directly from the repo or point the importer at the running `/openapi.yaml` route.
 
 Any HTTP API change must update `openapi.yaml` in the same change. Treat route additions, removals, request or response shape changes, status code changes, auth changes, and path/query contract changes as OpenAPI-sensitive by default.
