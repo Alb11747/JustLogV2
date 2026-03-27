@@ -105,7 +105,18 @@ Optional env flags support reconciliation and startup consistency validation:
 - `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP=true|24h|7d|3mo|1y`
 - `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP_IGNORE_LAST_VALIDATED=1`
 
-Startup validation caches the last successful validation time in the logs directory and, by default, only rechecks recent data plus up to one day of overlap. Setting `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP_IGNORE_LAST_VALIDATED=1` forces the full requested scope to be revalidated on every startup.
+Behavior summary:
+
+- `JUSTLOG_DEBUG_COMPARE_URL` enables compare-only reconciliation. Archived channel-day partitions are checked against another JustLog instance after compaction, conflicts are logged, and mismatches are marked unhealthy without changing local data.
+- `JUSTLOG_DEBUG_TRUSTED_COMPARE_URL` enables trusted reconciliation. Missing local archived events are repaired from the trusted remote source, and the affected channel-day plus related user-month archives are rewritten to stay in sync.
+- If both compare URLs are set, trusted mode wins.
+- Reconciliation work is scheduled when a channel-day archive is written and becomes eligible about 4 hours later, then runs in the background.
+- Checks and repairs are appended to `reconciliation.log` under the logs directory.
+- `JUSTLOG_DEBUG_FALLBACK_TRUSTED_API=1` only works with `JUSTLOG_DEBUG_TRUSTED_COMPARE_URL`. When enabled, unhealthy archived channel-day reads and local read failures can be proxied to the trusted JustLog instance instead of failing locally.
+
+Startup validation runs before the app starts serving traffic. It scans archived channel-day and user-month data, does local sanity checks, and repairs safe mismatches between the two archive views. In trusted mode it can also recover from corrupted local archive data by refetching the authoritative channel-day from the trusted remote instance.
+
+The last successful startup validation time is cached in `consistency-validation-watermark.json` under the logs directory. By default, future startups only recheck the requested recent scope plus up to one day of overlap. Setting `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP_IGNORE_LAST_VALIDATED=1` forces the full requested scope to be revalidated on every startup.
 
 ## Run with Docker Compose
 

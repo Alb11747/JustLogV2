@@ -27,7 +27,8 @@ src/main.rs
      -> create ingest manager
      -> resolve channel IDs to logins
      -> start IRC ingest lanes
-     -> start background compactor
+     -> run optional startup validation
+     -> start background compactor and reconciliation worker
      -> serve Axum API
 ```
 
@@ -68,6 +69,7 @@ At runtime:
 - `src/compact.rs`: background loop that periodically archives old partitions.
 - `src/import.rs`: CLI import path for legacy plain-text or gzip-compressed log files.
 - `src/legacy_txt.rs`: isolated read-only compatibility layer for sparse legacy TXT files used during API reads.
+- `src/debug_sync.rs`: reconciliation jobs, trusted/compare debug runtime, startup consistency validation, and trusted API fallback helpers.
 
 ## Startup and Lifecycle
 
@@ -93,8 +95,9 @@ The binary supports:
 7. Create the chat command service and ingest manager.
 8. Resolve configured channel IDs into channel logins through Helix.
 9. Start ingestion lanes.
-10. Start the background compactor.
-11. Build the Axum router and bind the HTTP listener.
+10. Run optional startup consistency validation.
+11. Start the background compactor and reconciliation worker.
+12. Build the Axum router and bind the HTTP listener.
 
 ## Shared State
 
@@ -103,7 +106,7 @@ The binary supports:
 - `config`: shared mutable config behind `Arc<RwLock<Config>>`
 - `store`: cloned handle to the SQLite/segment storage layer
 - `helix`: cached Twitch API client
-- `legacy_txt`: env-driven compatibility runtime for optional legacy TXT reads
+- `debug_runtime`: env-driven reconciliation, startup validation, and trusted fallback runtime
 - `ingest`: optional ingest manager handle used for runtime join/part/say actions
 - `start_time`: used for uptime reporting
 - `optout_codes`: temporary one-minute confirmation codes for self-service opt-out
@@ -270,16 +273,41 @@ If a channel-day query requests `raw` output and the entire partition is already
 
 ### Reconciliation And Startup Validation
 
-The debug reconciliation layer can compare archived channel-day partitions against another JustLog instance, repair trusted mismatches, and log all checks to `reconciliation.log`.
+The debug reconciliation layer in `src/debug_sync.rs` adds two related safety workflows:
+
+- post-compaction reconciliation jobs for archived channel-day segments
+- startup consistency validation across archived channel-day and user-month segments
+
+Reconciliation is env-driven:
+
+- `JUSTLOG_DEBUG=1` enables compare/trusted reconciliation modes.
+- `JUSTLOG_DEBUG_COMPARE_URL=<base>` enables compare-only checks against another JustLog instance.
+- `JUSTLOG_DEBUG_TRUSTED_COMPARE_URL=<base>` enables trusted reconciliation and wins if both compare URLs are present.
+- `JUSTLOG_DEBUG_FALLBACK_TRUSTED_API=1` allows trusted API proxy fallback for unhealthy archived channel-day reads and local read failures.
+
+When a channel-day partition is compacted into a segment, the store records a reconciliation job in SQLite and schedules it roughly 4 hours in the future. A second background loop in `src/compact.rs` polls due jobs every minute and processes them.
+
+Per-job behavior:
+
+- compare mode fetches the remote `/channelid/<id>/<year>/<month>/<day>?json=1` view, logs diffs to `reconciliation.log`, and marks the partition unhealthy without mutating local archives
+- trusted mode uses the trusted remote day as authoritative when local archived events are missing, then rewrites the channel-day archive and affected user-month archives so both archive views stay aligned
+
+Reconciliation status is stored in the `reconciliation_jobs` table. That status is also consulted by API reads so unhealthy archived channel-day requests can be proxied to a trusted instance when trusted fallback is enabled.
 
 Startup validation can also run before the app starts serving traffic:
 
 - `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP=true` scans all archived data, subject to the cached watermark limit.
 - Relative values such as `24h`, `7d`, `3mo`, and `1y` scan recent archived data.
-- The last successful startup validation time is cached under the logs directory, and future startups reuse it with up to one day of overlap so stable data is not revalidated unnecessarily.
+- The last successful startup validation time is cached in `consistency-validation-watermark.json` under the logs directory, and future startups reuse it with up to one day of overlap so stable data is not revalidated unnecessarily.
 - `JUSTLOG_DEBUG_VALIDATE_CONSISTENCY_ON_STARTUP_IGNORE_LAST_VALIDATED=1` disables that limit and rechecks the full requested scope.
 
-Startup validation performs a quick sanity check on archived lines, locally self-heals sane missing-data drift between channel-day and user-month archives, and only falls back to trusted remote data when local repair is not safe enough.
+Startup validation walks archived channel-day partitions plus user-month segments, builds an authoritative per-day event set from sane local archives, and then:
+
+- repairs missing or stale channel-day data from local user-month data when possible
+- repairs missing or stale user-month data from the channel-day archive when possible
+- in trusted mode, refetches a day from the trusted remote instance if local archive corruption prevents a safe local repair
+
+Validation outcomes are logged to `reconciliation.log` and also upserted into `reconciliation_jobs` so later reads see the partition as healthy after repair.
 
 ## HTTP API
 
