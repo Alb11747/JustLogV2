@@ -58,7 +58,9 @@ impl HelixClient {
         } else {
             config.helix.base_url.trim_end_matches('/').to_string()
         };
-        let token_url = if base_url.contains("/helix") {
+        let token_url = if config.helix.base_url.is_empty() {
+            "https://id.twitch.tv/oauth2/token".to_string()
+        } else if base_url.contains("/helix") {
             base_url.replacen("/helix", "/oauth2/token", 1)
         } else {
             format!("{base_url}/oauth2/token")
@@ -73,6 +75,10 @@ impl HelixClient {
             cache_by_id: Arc::new(Mutex::new(HashMap::new())),
             cache_by_login: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        !self.client_id.is_empty() && !self.client_secret.is_empty()
     }
 
     pub async fn get_users_by_ids(&self, ids: &[String]) -> Result<HashMap<String, UserData>> {
@@ -146,6 +152,11 @@ impl HelixClient {
     }
 
     async fn ensure_token(&self) -> Result<String> {
+        if !self.is_enabled() {
+            return Err(anyhow!(
+                "Twitch Helix is disabled because clientID/clientSecret are not configured"
+            ));
+        }
         if let Some(token) = self.access_token.read().await.clone() {
             return Ok(token);
         }

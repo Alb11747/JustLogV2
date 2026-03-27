@@ -10,7 +10,7 @@ use axum::Router;
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::api;
@@ -105,6 +105,26 @@ pub async fn resolve_channel_logins(
     helix: &HelixClient,
     channel_ids: &[String],
 ) -> Result<Vec<String>> {
+    if !helix.is_enabled() {
+        let mut logins = channel_ids
+            .iter()
+            .filter(|value| !looks_like_channel_id(value))
+            .cloned()
+            .collect::<Vec<_>>();
+        logins.sort();
+        if logins.len() != channel_ids.len() {
+            let skipped = channel_ids
+                .iter()
+                .filter(|value| looks_like_channel_id(value))
+                .cloned()
+                .collect::<Vec<_>>();
+            warn!(
+                "skipping startup channels that require Helix lookup because clientID/clientSecret are not configured: {:?}",
+                skipped
+            );
+        }
+        return Ok(logins);
+    }
     let users = helix.get_users_by_ids(channel_ids).await?;
     let mut logins = users
         .into_values()
@@ -112,6 +132,10 @@ pub async fn resolve_channel_logins(
         .collect::<Vec<_>>();
     logins.sort();
     Ok(logins)
+}
+
+fn looks_like_channel_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn normalize_listen_address(listen_address: &str) -> SocketAddr {

@@ -30,12 +30,12 @@ The app listens on port `8025` by default and expects a JSON config file. The mi
 
 ```json
 {
-  "clientID": "your-twitch-client-id",
-  "clientSecret": "your-twitch-client-secret",
   "adminAPIKey": "replace-me",
-  "channels": ["123456789"]
+  "channels": ["channel_login_here"]
 }
 ```
+
+`clientID` and `clientSecret` are optional unless you want Twitch Helix-backed features such as login/id resolution, `/channels` name resolution from stored IDs, or admin/chat commands that translate logins into channel IDs. If Helix credentials are omitted, startup ingestion can still join channels listed by login name directly, but numeric channel IDs cannot be resolved at startup.
 
 For the Docker and upload workflow in this repo, keep the runtime file at `./data/config.json` instead.
 
@@ -134,7 +134,7 @@ Copy-Item data/config.template.json data/config.json
 Then edit:
 
 - `.env` if you want to change the published port, data mount, or optional env-only feature flags
-- `data/config.json` for Twitch credentials, admin API key, startup channels, and other JSON config
+- `data/config.json` for optional Twitch Helix credentials, admin API key, startup channels, and other JSON config
 
 `.env.template` exists as a clean starting point for a local `.env`.
 

@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
+use justlog::app::resolve_channel_logins;
 use justlog::config::Config;
+use justlog::helix::HelixClient;
 use justlog::model::CanonicalEvent;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -140,6 +142,26 @@ fn config_load_normalizes_and_persists_defaults() {
     assert_eq!(persisted.log_level, "info");
     assert_eq!(persisted.admins, vec!["adminuser"]);
     assert_eq!(persisted.channels, vec!["2", "1"]);
+}
+
+#[tokio::test]
+async fn startup_channel_logins_can_use_plain_logins_without_helix_credentials() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("config.json");
+    fs::write(
+        &config_path,
+        r#"{
+  "logsDirectory": ".\\logs\\",
+  "channels": ["channelone", "channeltwo", "12345"]
+}"#,
+    )
+    .unwrap();
+
+    let config = Config::load(&config_path).unwrap();
+    let helix = HelixClient::new(&config);
+    let logins = resolve_channel_logins(&helix, &config.channels).await.unwrap();
+
+    assert_eq!(logins, vec!["channelone", "channeltwo"]);
 }
 
 #[tokio::test]

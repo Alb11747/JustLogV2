@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -238,9 +238,6 @@ impl Config {
                 .map(|value| value.to_string())
                 .collect(),
         );
-        if self.client_id.is_empty() {
-            bail!("No clientID specified");
-        }
         Ok(())
     }
 

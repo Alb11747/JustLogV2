@@ -1,8 +1,8 @@
 {
-  "clientID": "replace-with-twitch-client-id",
-  "clientSecret": "replace-with-twitch-client-secret",
+  "clientID": "",
+  "clientSecret": "",
   "adminAPIKey": "replace-with-a-long-random-admin-key",
-  "channels": [],
+  "channels": ["channel_login_here"],
   "admins": [],
   "listenAddress": ":8025",
   "logsDirectory": "/data/logs",
