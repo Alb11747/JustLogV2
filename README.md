@@ -39,62 +39,88 @@ The app listens on port `8025` by default and expects a JSON config file. The mi
 
 For the Docker and upload workflow in this repo, keep the runtime file at `./data/config.json` instead.
 
-## Legacy TXT Compatibility
+## Import Folder Compatibility
 
-JustLogV2 also has an optional read-only legacy TXT compatibility layer for sparse chat exports. This is intended as a backward-compatibility feature for API reads, not as part of the main ingest, storage, or compaction pipeline.
+JustLogV2 supports an optional recursive import folder for channel-day reads and `/list`. This is a compatibility feature layered around API reads; it is not part of ingest, archive generation, or compaction.
 
 Supported env flags:
 
-- `JUSTLOG_LEGACY_TXT_ENABLED=1`: turn the compatibility layer on.
-- `JUSTLOG_LEGACY_TXT_ROOT=<path>`: root folder to search for legacy TXT files.
-- `JUSTLOG_LEGACY_TXT_MODE=missing_only|merge|off`: request behavior. Default is `missing_only`.
-- `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`: re-check the legacy root on every request instead of only trusting startup availability.
+- `JUSTLOG_IMPORT_HOST_DIR=<host-path>`: Docker Compose host folder to mount. Default is `./data/import-folder`.
+- `JUSTLOG_IMPORT_FOLDER=<path>`: in-container or local folder to search recursively.
+- `JUSTLOG_LEGACY_TXT_MODE=missing_only|merge|off`: applies only to reconstructed data. Default is `missing_only`.
+- `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`: re-check reconstructed-file availability on each request.
 
-Mode behavior:
+Behavior summary:
 
-- `missing_only`: use legacy TXT only when native JustLog data for that channel-day is missing.
-- `merge`: merge native and TXT messages by timestamp using a stable sort.
-- `off`: completely ignore TXT data.
+- Raw IRC `.txt` and `.txt.gz` files are imported into the native store when found.
+- Simple sparse TXT files like `[0:04:26] user: msg` stay separate and are controlled by `JUSTLOG_LEGACY_TXT_MODE`.
+- JSON `.json` and `.json.gz` chat exports stay separate and are merged at read time.
+- `off` only disables reconstructed overlays. It does not disable raw IRC imports.
 
-The current compatibility scope is channel-day reads and `/list` channel-day discovery. User-month, random, and range reads still use native data only.
+The current scope is channel-day reads and `/list`. User-month, random, and range reads still use native data only.
 
-### Legacy TXT layout
+### How to add files
 
-The legacy reader looks for files matching:
+For local non-Docker runs, point `JUSTLOG_IMPORT_FOLDER` at any folder and drop files there.
 
-```text
-.../<channel_id>/<year>/<month>/<day>.txt
-```
-
-The search is recursive under `JUSTLOG_LEGACY_TXT_ROOT`, so you can copy an existing JustLog-style folder tree anywhere under that root and the API will still find matching days.
-
-Example:
+For the committed Docker Compose setup, the default host path is:
 
 ```text
-D:\legacy-root\copied\justlog\31062476\2024\1\2.txt
+./data/import-folder
 ```
 
-If the requested route is `/channelid/31062476/2024/1/2`, that file is eligible.
-
-### TXT parsing behavior
-
-The parser is intentionally minimal and targets response compatibility for lines like:
+That folder is mounted into the container as:
 
 ```text
-[0:00:04] SomeUser: hello
+/import-folder
 ```
 
-It derives:
+The easiest workflow is:
 
-- absolute timestamps from the requested channel-day plus the per-line offset
-- normalized usernames from the visible name
-- stable fallback ids from timestamp, username, and message text
+1. Set `JUSTLOG_IMPORT_FOLDER=/import-folder` in `.env`.
+2. Choose `JUSTLOG_LEGACY_TXT_MODE` for reconstructed simple TXT and JSON overlays.
+3. Copy files anywhere under `./data/import-folder`.
+4. Restart the service with `docker compose up -d --build` or `docker compose restart`.
 
-Unsupported metadata is left empty, and TXT parse failures never fail the request.
+Example host paths:
+
+```text
+./data/import-folder/copied/raw/31062476/2024/10/20.txt
+./data/import-folder/copied/simple/31062476/2024/10/20.txt
+./data/import-folder/copied/json/31062476/2024/10/20.json.gz
+```
+
+The service recurses under the import folder, so only the trailing `.../<channel_id>/<year>/<month>/<day>.*` suffix matters.
+
+### Supported file families
+
+Supported file types:
+
+- `.txt`
+- `.txt.gz`
+- `.json`
+- `.json.gz`
+
+TXT files are classified per file:
+
+- Raw IRC text with stable Twitch metadata is imported into native storage and keeps all parsed fields.
+- Simple sparse text is reconstructed into overlay messages.
+
+JSON exports are reconstructed into overlay messages using fields such as:
+
+- `comments[]._id`
+- `comments[].created_at`
+- `comments[].channel_id`
+- `comments[].commenter.display_name`
+- `comments[].commenter._id`
+- `comments[].commenter.name`
+- `comments[].message.body`
+
+Useful extra JSON metadata is preserved in message tags when available, such as user color, badges, emoticons, content id, video id/title, streamer name, and commenter logo.
 
 ### Empty directory cleanup
 
-Whenever the legacy root is checked, the compatibility layer prunes empty directories under that root and removes empty parent directories upward when possible. This helps clean up copied legacy trees after files are moved or deleted, while leaving non-empty branches untouched.
+Whenever the import folder is checked, the compatibility layer prunes empty directories below that root and removes empty parent directories upward when possible, while leaving non-empty branches alone.
 
 ## Debug Validation
 
@@ -150,7 +176,7 @@ Stop it again:
 docker compose down
 ```
 
-The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}`, mounts `${JUSTLOG_DATA_DIR}` to `/data`, keeps logs and SQLite state under that mounted directory, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
+The committed [`docker-compose.yml`](C:\Users\Albert\Sync\Projects\JustLogV2\docker-compose.yml) file builds from the local `Dockerfile`, reads defaults from `.env`, publishes host port `8026` by default through `${JUSTLOG_PUBLIC_PORT}`, mounts `./data` to `/data`, mounts `${JUSTLOG_IMPORT_HOST_DIR:-./data/import-folder}` to `/import-folder`, keeps logs and SQLite state under the `/data` mount, and uses `restart: unless-stopped`. The container config path stays at the Docker image default of `/data/config.json`.
 
 ## Ubuntu Production Setup
 

@@ -1,6 +1,7 @@
 mod common;
 
 use std::fs;
+use std::io::Write;
 use std::sync::OnceLock;
 
 use axum::body::{Body, to_bytes};
@@ -17,6 +18,13 @@ use common::{TestHarness, assert_status_ok, privmsg};
 fn env_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn write_gzip(path: &std::path::Path, content: &str) {
+    let file = fs::File::create(path).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    encoder.write_all(content.as_bytes()).unwrap();
+    encoder.finish().unwrap();
 }
 
 #[tokio::test]
@@ -159,31 +167,48 @@ async fn startup_channel_logins_can_use_plain_logins_without_helix_credentials()
 
     let config = Config::load(&config_path).unwrap();
     let helix = HelixClient::new(&config);
-    let logins = resolve_channel_logins(&helix, &config.channels).await.unwrap();
+    let logins = resolve_channel_logins(&helix, &config.channels)
+        .await
+        .unwrap();
 
     assert_eq!(logins, vec!["channelone", "channeltwo"]);
 }
 
 #[tokio::test]
-async fn legacy_txt_missing_only_uses_txt_when_native_missing() {
+async fn import_folder_raw_irc_txt_imports_into_native_store_without_duplication() {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();
-    let legacy_root = temp.path().join("legacy");
-    fs::create_dir_all(legacy_root.join("1/2024/1")).unwrap();
+    let import_root = temp.path().join("imports");
+    fs::create_dir_all(import_root.join("nested/1/2024/1")).unwrap();
     fs::write(
-        legacy_root.join("1/2024/1/2.txt"),
-        "[0:00:04] Foo-Bar!: hello legacy\n[0:00:05] AnotherUser: second",
+        import_root.join("nested/1/2024/1/2.txt"),
+        privmsg(
+            "import-raw-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "raw imported",
+        ),
     )
     .unwrap();
     unsafe {
-        std::env::set_var("JUSTLOG_LEGACY_TXT_ENABLED", "1");
-        std::env::set_var("JUSTLOG_LEGACY_TXT_ROOT", legacy_root.as_os_str());
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST");
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
     }
 
     let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
-    let body = harness
+    let first = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let second = harness
         .response_text(
             Request::builder()
                 .uri("/channelid/1/2024/1/2")
@@ -192,34 +217,33 @@ async fn legacy_txt_missing_only_uses_txt_when_native_missing() {
         )
         .await;
 
-    assert!(body.contains("#channelone foobar: hello legacy"));
-    assert!(body.contains("#channelone anotheruser: second"));
+    assert!(first.contains("raw imported"));
+    assert!(second.contains("raw imported"));
+    assert_eq!(harness.state.store.event_count().unwrap(), 1);
 
     unsafe {
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_ENABLED");
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_ROOT");
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
     }
 }
 
 #[tokio::test]
-async fn legacy_txt_merge_mode_merges_with_native_and_list_exposes_txt_days() {
+async fn import_folder_merge_mode_merges_native_json_and_simple_text() {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();
-    let legacy_root = temp.path().join("legacy");
-    fs::create_dir_all(legacy_root.join("1/2024/1")).unwrap();
+    let import_root = temp.path().join("imports");
+    fs::create_dir_all(import_root.join("a/b/1/2024/1")).unwrap();
     fs::write(
-        legacy_root.join("1/2024/1/2.txt"),
+        import_root.join("a/b/1/2024/1/2.txt"),
         "[0:00:03] LegacyUser: earliest\n[0:00:05] LegacyUser: latest",
     )
     .unwrap();
     fs::write(
-        legacy_root.join("1/2024/1/3.txt"),
-        "[0:00:01] LegacyUser: txt only day",
-    )
-    .unwrap();
+        import_root.join("a/b/1/2024/1/2.json"),
+        r##"{"streamer":{"name":"channelone","id":1},"video":{"title":"vod title","id":"vod-1"},"comments":[{"_id":"json-1","created_at":"2024-01-02T00:00:04Z","channel_id":"1","content_id":"vod-1","commenter":{"display_name":"JsonUser","_id":"300","name":"jsonuser","logo":"https://example.com/logo.png"},"message":{"body":"json middle","user_color":"#FF0000","user_badges":[{"_id":"vip","version":"1"}],"emoticons":[]}}]}"##,
+    ).unwrap();
     unsafe {
-        std::env::set_var("JUSTLOG_LEGACY_TXT_ENABLED", "1");
-        std::env::set_var("JUSTLOG_LEGACY_TXT_ROOT", legacy_root.as_os_str());
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
         std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "merge");
     }
 
@@ -248,8 +272,59 @@ async fn legacy_txt_merge_mode_merges_with_native_and_list_exposes_txt_days() {
         .await;
     let earliest = body.find("earliest").unwrap();
     let middle = body.find("native middle").unwrap();
+    let json_middle = body.find("json middle").unwrap();
     let latest = body.find("latest").unwrap();
     assert!(earliest < middle && middle < latest);
+    assert!(earliest < json_middle && json_middle < latest);
+    assert!(body.contains("channelone jsonuser: json middle"));
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+    }
+}
+
+#[tokio::test]
+async fn import_folder_list_and_gzip_support_work() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    fs::create_dir_all(import_root.join("copied/raw/1/2024/1")).unwrap();
+    fs::create_dir_all(import_root.join("copied/reconstructed/1/2024/1")).unwrap();
+    fs::create_dir_all(import_root.join("copied/empty/a/b")).unwrap();
+    write_gzip(
+        &import_root.join("copied/raw/1/2024/1/2.txt.gz"),
+        &privmsg(
+            "import-raw-gz-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_605_000,
+            "raw gz imported",
+        ),
+    );
+    write_gzip(
+        &import_root.join("copied/reconstructed/1/2024/1/3.json.gz"),
+        r##"{"streamer":{"name":"channelone","id":1},"video":{"title":"vod title","id":"vod-2"},"comments":[{"_id":"json-gz-1","created_at":"2024-01-03T00:00:04Z","channel_id":"1","content_id":"vod-2","commenter":{"display_name":"JsonGzUser","_id":"301","name":"jsongzuser","logo":"https://example.com/logo.png"},"message":{"body":"json gz only","user_color":"#00FF00","user_badges":[],"emoticons":[]}}]}"##,
+    );
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
+        std::env::set_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let raw_body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(raw_body.contains("raw gz imported"));
 
     let response = harness
         .request(
@@ -266,67 +341,42 @@ async fn legacy_txt_merge_mode_merges_with_native_and_list_exposes_txt_days() {
             .as_array()
             .unwrap()
             .iter()
+            .any(|entry| entry["day"] == "2")
+    );
+    assert!(
+        json["availableLogs"]
+            .as_array()
+            .unwrap()
+            .iter()
             .any(|entry| entry["day"] == "3")
     );
+    assert!(!import_root.join("copied/empty/a/b").exists());
+    assert!(!import_root.join("copied/empty/a").exists());
 
     unsafe {
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_ENABLED");
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_ROOT");
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
-    }
-}
-
-#[tokio::test]
-async fn legacy_txt_recurses_under_root_and_prunes_empty_dirs() {
-    let _guard = env_lock().lock().await;
-    let temp = TempDir::new().unwrap();
-    let legacy_root = temp.path().join("legacy");
-    fs::create_dir_all(legacy_root.join("copied/justlog/tree/1/2024/1")).unwrap();
-    fs::create_dir_all(legacy_root.join("copied/empty/a/b")).unwrap();
-    fs::write(
-        legacy_root.join("copied/justlog/tree/1/2024/1/2.txt"),
-        "[0:00:04] RecurseUser: found recursively",
-    )
-    .unwrap();
-    unsafe {
-        std::env::set_var("JUSTLOG_LEGACY_TXT_ENABLED", "1");
-        std::env::set_var("JUSTLOG_LEGACY_TXT_ROOT", legacy_root.as_os_str());
-        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
-        std::env::set_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST", "1");
-    }
-
-    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
-    let body = harness
-        .response_text(
-            Request::builder()
-                .uri("/channelid/1/2024/1/2")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-
-    assert!(body.contains("found recursively"));
-    assert!(!legacy_root.join("copied/empty/a/b").exists());
-    assert!(!legacy_root.join("copied/empty/a").exists());
-
-    unsafe {
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_ENABLED");
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_ROOT");
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST");
     }
 }
 
 #[tokio::test]
-async fn legacy_txt_off_and_parse_failures_do_not_break_requests() {
+async fn legacy_txt_mode_off_ignores_simple_text_but_keeps_complete_json() {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();
-    let legacy_root = temp.path().join("legacy");
-    fs::create_dir_all(legacy_root.join("1/2024/1")).unwrap();
-    fs::write(legacy_root.join("1/2024/1/2.txt"), "not a parseable line").unwrap();
+    let import_root = temp.path().join("imports");
+    fs::create_dir_all(import_root.join("1/2024/1")).unwrap();
+    fs::write(
+        import_root.join("1/2024/1/2.txt"),
+        "[0:00:04] HiddenUser: simple hidden",
+    )
+    .unwrap();
+    fs::write(
+        import_root.join("1/2024/1/2.json"),
+        r##"{"streamer":{"name":"channelone","id":1},"video":{"title":"vod title","id":"vod-3"},"comments":[{"_id":"json-visible-1","created_at":"2024-01-02T00:00:05Z","channel_id":"1","content_id":"vod-3","commenter":{"display_name":"VisibleUser","_id":"302","name":"visibleuser","logo":"https://example.com/logo.png"},"message":{"body":"json visible","user_color":"#0000FF","user_badges":[],"emoticons":[]}}]}"##,
+    ).unwrap();
     unsafe {
-        std::env::set_var("JUSTLOG_LEGACY_TXT_ENABLED", "1");
-        std::env::set_var("JUSTLOG_LEGACY_TXT_ROOT", legacy_root.as_os_str());
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
         std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "off");
         std::env::set_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST", "1");
     }
@@ -340,24 +390,11 @@ async fn legacy_txt_off_and_parse_failures_do_not_break_requests() {
                 .unwrap(),
         )
         .await;
-    assert_eq!(body, "");
+    assert!(!body.contains("simple hidden"));
+    assert!(body.contains("json visible"));
 
     unsafe {
-        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "merge");
-    }
-    let body = harness
-        .response_text(
-            Request::builder()
-                .uri("/channelid/1/2024/1/2")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(body, "");
-
-    unsafe {
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_ENABLED");
-        std::env::remove_var("JUSTLOG_LEGACY_TXT_ROOT");
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST");
     }

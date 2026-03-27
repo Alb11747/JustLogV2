@@ -9,8 +9,13 @@ services:
         RUST_VERSION: "1.85"
     env_file:
       - .env
+    environment:
+      JUSTLOG_IMPORT_FOLDER: ${JUSTLOG_IMPORT_FOLDER:-/import-folder}
+      JUSTLOG_LEGACY_TXT_MODE: ${JUSTLOG_LEGACY_TXT_MODE:-missing_only}
+      JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST: ${JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST:-0}
     restart: unless-stopped
     ports:
       - "${JUSTLOG_PUBLIC_PORT}:8026"
     volumes:
       - ./data:/data
+      - ${JUSTLOG_IMPORT_HOST_DIR:-./data/import-folder}:/import-folder

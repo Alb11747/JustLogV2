@@ -212,12 +212,10 @@ async fn optout_flow_updates_config_and_blocks_queries() {
 #[tokio::test]
 async fn expired_optout_codes_cannot_be_redeemed() {
     let harness = TestHarness::start(vec!["1".to_string()]).await;
-    harness
-        .state
-        .optout_codes
-        .lock()
-        .await
-        .insert("expired1".to_string(), Instant::now() - StdDuration::from_secs(1));
+    harness.state.optout_codes.lock().await.insert(
+        "expired1".to_string(),
+        Instant::now() - StdDuration::from_secs(1),
+    );
 
     harness
         .irc
@@ -295,7 +293,11 @@ async fn user_month_reads_include_messages_from_compacted_channel_days() {
             .iter()
             .any(|message| message["text"] == "from compacted day")
     );
-    assert!(messages.iter().any(|message| message["text"] == "still hot"));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message["text"] == "still hot")
+    );
 }
 
 #[tokio::test]

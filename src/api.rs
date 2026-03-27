@@ -161,9 +161,12 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
         );
         Ok(response)
     } else {
+        state
+            .legacy_txt
+            .import_raw_channel(&state.store, &channel_id)?;
         let mut logs = state.store.get_available_logs_for_channel(&channel_id)?;
-        if state.legacy_txt.is_request_enabled() {
-            logs.extend(state.legacy_txt.available_channel_logs(&channel_id));
+        if state.legacy_txt.is_import_enabled() {
+            logs.extend(state.legacy_txt.available_channel_logs(&channel_id)?);
             logs.sort_by(|left, right| {
                 right
                     .year
@@ -385,7 +388,7 @@ async fn dated_response(
         let legacy_mode = state.legacy_txt.mode();
         if request.response_type == ResponseType::Raw
             && accept_encoding.contains("br")
-            && legacy_mode == LegacyTxtMode::Off
+            && !state.legacy_txt.is_import_enabled()
         {
             let plan = state
                 .store
@@ -394,21 +397,29 @@ async fn dated_response(
                 return direct_brotli_response(path);
             }
         }
+        state.legacy_txt.import_raw_channel_day(
+            &state.store,
+            &request.channel_id,
+            year,
+            month,
+            day,
+        )?;
         let native = state
             .store
             .read_channel_logs(&request.channel_id, year, month, day)?;
         let channel_login = resolve_channel_login(&state, &request.channel_id).await;
-        let legacy = state.legacy_txt.load_channel_day_messages(
+        let imported = state.legacy_txt.load_channel_day_import(
             &request.channel_id,
             &channel_login,
             year,
             month,
             day,
-        );
+        )?;
         return respond_with_channel_day_messages(
             request,
             native.into_iter().map(ChatMessage::from).collect(),
-            legacy.unwrap_or_default(),
+            imported.complete_messages,
+            imported.simple_messages,
             accept_encoding.contains("br"),
             legacy_mode,
         );
@@ -430,20 +441,23 @@ async fn dated_response(
 fn respond_with_channel_day_messages(
     request: LogRequest,
     native: Vec<ChatMessage>,
-    legacy: Vec<ChatMessage>,
+    complete_imported: Vec<ChatMessage>,
+    simple_imported: Vec<ChatMessage>,
     compress_brotli: bool,
     legacy_mode: LegacyTxtMode,
 ) -> Result<Response> {
+    let native_is_empty = native.is_empty();
+    let with_complete = merge_messages(native, complete_imported);
     let mut messages = match legacy_mode {
-        LegacyTxtMode::Off => native,
+        LegacyTxtMode::Off => with_complete,
         LegacyTxtMode::MissingOnly => {
-            if native.is_empty() {
-                legacy
+            if native_is_empty {
+                merge_messages(with_complete, simple_imported)
             } else {
-                native
+                with_complete
             }
         }
-        LegacyTxtMode::Merge => merge_messages(native, legacy),
+        LegacyTxtMode::Merge => merge_messages(with_complete, simple_imported),
     };
     if request.reverse {
         messages.reverse();

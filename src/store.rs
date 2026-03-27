@@ -156,6 +156,13 @@ impl Store {
 
             CREATE UNIQUE INDEX IF NOT EXISTS reconciliation_jobs_partition_idx
                 ON reconciliation_jobs(channel_id, year, month, day);
+
+            CREATE TABLE IF NOT EXISTS imported_raw_files (
+                path TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                imported_at INTEGER NOT NULL,
+                status TEXT NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -412,6 +419,39 @@ impl Store {
     pub fn event_count(&self) -> Result<i64> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
+    }
+
+    pub fn imported_raw_file_is_current(&self, path: &str, fingerprint: &str) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        let stored = db
+            .query_row(
+                "SELECT fingerprint FROM imported_raw_files WHERE path = ?1",
+                params![path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(stored.as_deref() == Some(fingerprint))
+    }
+
+    pub fn record_imported_raw_file(
+        &self,
+        path: &str,
+        fingerprint: &str,
+        status: &str,
+    ) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            r#"
+            INSERT INTO imported_raw_files(path, fingerprint, imported_at, status)
+            VALUES(?1, ?2, ?3, ?4)
+            ON CONFLICT(path) DO UPDATE SET
+                fingerprint = excluded.fingerprint,
+                imported_at = excluded.imported_at,
+                status = excluded.status
+            "#,
+            params![path, fingerprint, Utc::now().timestamp(), status],
+        )?;
+        Ok(())
     }
 
     fn compactable_channel_days(
@@ -1109,7 +1149,10 @@ impl Store {
         drop(statement);
         drop(db);
         for segment in segments {
-            events.extend(filter_user_events(self.load_segment_events(&segment)?, user_id));
+            events.extend(filter_user_events(
+                self.load_segment_events(&segment)?,
+                user_id,
+            ));
         }
         Ok(events)
     }
