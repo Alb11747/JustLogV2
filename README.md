@@ -74,6 +74,7 @@ Supported env flags:
 - `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`: delete reconstructed TXT / JSON source files after they are successfully consumed on read.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=0|1`: delete reconstructed TXT / JSON source files that are already marked consumed with the same fingerprint. Default is `0`.
 - `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS=<n>`: global cap for concurrent archive compression jobs. Default is `min(available_parallelism, 4)`.
+- `JUSTLOG_IMPORT_MAX_RAW_WORKERS=<n>`: global cap for concurrent raw-file parsing workers during bulk raw import. Default is `min(available_parallelism, 8)`.
 
 Behavior summary:
 
@@ -167,6 +168,7 @@ Useful extra JSON metadata is preserved in message tags when available, such as 
 Large import folders are handled incrementally:
 
 - Raw IRC imports are streamed line-by-line instead of loading full files into memory.
+- Bulk raw import now prefers v1 day-level `channel.txt(.gz)` files over same-day numeric shard files, so a canonical day file can skip redundant shard work before status checks and worker scheduling.
 - The importer logs start, periodic progress, and completion summaries through normal tracing output.
 - Progress logs are emitted every `100000` scanned lines for long-running raw imports.
 - Archive compression now runs in parallel across independent segment files, capped by `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS`.

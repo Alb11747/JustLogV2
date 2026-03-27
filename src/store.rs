@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use brotli::{CompressorWriter, Decompressor};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{ToSql, params_from_iter};
 
 use crate::config::Config;
 use crate::debug_sync::RECONCILIATION_DELAY_SECONDS;
@@ -705,6 +706,69 @@ impl Store {
             );
         }
         Ok(is_current)
+    }
+
+    pub fn imported_raw_files_current_map(
+        &self,
+        entries: &[(String, String)],
+    ) -> Result<HashMap<String, bool>> {
+        if entries.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let lock_started = Instant::now();
+        let db = self.lock_db();
+        let lock_elapsed = lock_started.elapsed();
+        let mut stored = HashMap::<String, (String, String)>::new();
+
+        for chunk in entries.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT path, fingerprint, status FROM imported_raw_files WHERE path IN ({placeholders})"
+            );
+            let params_vec = chunk
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>();
+            let mut statement = db.prepare(&sql)?;
+            let rows = statement.query_map(
+                params_from_iter(params_vec.iter().map(|value| value as &dyn ToSql)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (path, fingerprint, status) = row?;
+                stored.insert(path, (fingerprint, status));
+            }
+        }
+
+        if lock_elapsed > std::time::Duration::from_secs(1) {
+            tracing::warn!(
+                "Waited {:?} for imported_raw_files batch status lock: paths={}",
+                lock_elapsed,
+                entries.len()
+            );
+        }
+
+        Ok(entries
+            .iter()
+            .map(|(path, fingerprint)| {
+                let is_current = matches!(
+                    stored.get(path),
+                    Some((stored_fingerprint, status))
+                        if stored_fingerprint == fingerprint
+                            && matches!(status.as_str(), "imported" | "seen")
+                );
+                (path.clone(), is_current)
+            })
+            .collect())
     }
 
     pub fn record_imported_raw_file(

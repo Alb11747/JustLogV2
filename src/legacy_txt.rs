@@ -120,6 +120,7 @@ pub struct BulkRawImportSummary {
     pub files_scanned: usize,
     pub raw_candidates: usize,
     pub files_selected: usize,
+    pub files_skipped_v1_preferred: usize,
     pub files_current: usize,
     pub files_pending: usize,
     pub files_imported: usize,
@@ -429,15 +430,17 @@ impl LegacyTxtRuntime {
             files_scanned: discovery.files_scanned,
             raw_candidates: discovery.raw_candidates,
             files_selected: selected.len(),
+            files_skipped_v1_preferred: discovery.skipped_v1_preferred,
             dry_run,
             channel_id: channel_id.map(str::to_string),
             ..BulkRawImportSummary::default()
         };
         info!(
-            "Completed bulk raw import discovery in {:?}: files_scanned={}, raw_candidates={}, selected={}",
+            "Completed bulk raw import discovery in {:?}: files_scanned={}, raw_candidates={}, skipped_v1_preferred={}, selected={}",
             discovery_started.elapsed(),
             summary.files_scanned,
             summary.raw_candidates,
+            summary.files_skipped_v1_preferred,
             summary.files_selected
         );
 
@@ -448,23 +451,36 @@ impl LegacyTxtRuntime {
             selected.len()
         );
 
+        let status_check_started = Instant::now();
+        info!(
+            "Starting bulk raw import status prefetch for {} selected file(s)",
+            selected.len()
+        );
+        let current_map = store.imported_raw_files_current_map(
+            &selected
+                .iter()
+                .map(|file| {
+                    (
+                        file.path.to_string_lossy().to_string(),
+                        file.fingerprint.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        info!(
+            "Completed bulk raw import status prefetch in {:?}: selected={}, current={}",
+            status_check_started.elapsed(),
+            selected.len(),
+            current_map
+                .values()
+                .filter(|is_current| **is_current)
+                .count()
+        );
+
         let mut pending = Vec::new();
-        let total_files = selected.len();
-        for (index, file) in selected.into_iter().enumerate() {
+        for file in selected {
             let path_key = file.path.to_string_lossy().to_string();
-            let status_check_started = Instant::now();
-            info!(
-                "Bulk import status check {}/{} for {}",
-                index + 1,
-                total_files,
-                file.path.display()
-            );
-            let is_current = store.imported_raw_file_is_current(&path_key, &file.fingerprint)?;
-            info!(
-                "Completed bulk import status check for {} in {:?}: current={is_current}",
-                file.path.display(),
-                status_check_started.elapsed()
-            );
+            let is_current = current_map.get(&path_key).copied().unwrap_or(false);
             if is_current {
                 summary.files_current += 1;
                 if !dry_run && self.delete_current_raw_if_configured(&file) {
@@ -482,9 +498,10 @@ impl LegacyTxtRuntime {
 
         summary.elapsed_ms = started.elapsed().as_millis();
         info!(
-            "Completed bulk raw import: scanned={}, selected={}, current={}, pending={}, imported={}, failed={}, deleted={}, channel_days={}, user_months={}, elapsed_ms={}",
+            "Completed bulk raw import: scanned={}, selected={}, skipped_v1_preferred={}, current={}, pending={}, imported={}, failed={}, deleted={}, channel_days={}, user_months={}, elapsed_ms={}",
             summary.files_scanned,
             summary.files_selected,
+            summary.files_skipped_v1_preferred,
             summary.files_current,
             summary.files_pending,
             summary.files_imported,
@@ -656,10 +673,10 @@ impl LegacyTxtRuntime {
         };
 
         let mut discovery = BulkRawDiscovery::default();
+        let mut selected = Vec::new();
         for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
-            if limit_files.is_some_and(|limit| discovery.selected.len() >= limit)
-                || channel_id.is_some()
-                    && discovery.selected.len() >= limit_files.unwrap_or(usize::MAX)
+            if limit_files.is_some_and(|limit| selected.len() >= limit)
+                || channel_id.is_some() && selected.len() >= limit_files.unwrap_or(usize::MAX)
             {
                 break;
             }
@@ -694,14 +711,18 @@ impl LegacyTxtRuntime {
                 fingerprint,
                 kind: ImportKind::RawIrc,
             };
-            let is_raw = match behaves_like_raw_irc_path(&file.path) {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!(
-                        "Skipping raw import candidate {} during classification: {error:#}",
-                        file.path.display()
-                    );
-                    false
+            let is_raw = if looks_like_v1_raw_import_path(&file.path) {
+                true
+            } else {
+                match behaves_like_raw_irc_path(&file.path) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(
+                            "Skipping raw import candidate {} during classification: {error:#}",
+                            file.path.display()
+                        );
+                        false
+                    }
                 }
             };
             if !is_raw {
@@ -711,11 +732,18 @@ impl LegacyTxtRuntime {
             if channel_id.is_some_and(|value| !raw_file_matches_channel(&file, value)) {
                 continue;
             }
-            discovery.selected.push(file);
-            if limit_files.is_some_and(|limit| discovery.selected.len() >= limit) {
+            selected.push(file);
+            if limit_files.is_some_and(|limit| selected.len() >= limit) {
                 break;
             }
         }
+        let (selected, skipped_v1_preferred) = prune_v1_preferred_raw_files(selected);
+        discovery.skipped_v1_preferred = skipped_v1_preferred;
+        discovery.selected = if let Some(limit) = limit_files {
+            selected.into_iter().take(limit).collect()
+        } else {
+            selected
+        };
         Ok(discovery)
     }
 
@@ -730,9 +758,14 @@ impl LegacyTxtRuntime {
             return Ok(());
         }
         let worker_count = default_bulk_raw_worker_count().min(planned_files.max(1));
+        let compression_threads = std::env::var("JUSTLOG_IMPORT_MAX_COMPRESS_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4);
         info!(
-            "Starting parallel bulk raw import with {} worker(s) for {} pending file(s)",
-            worker_count, planned_files
+            "Starting parallel bulk raw import with {} raw worker(s), {} compression worker(s) for {} pending file(s)",
+            worker_count, compression_threads, planned_files
         );
 
         let (work_tx, work_rx) =
@@ -873,7 +906,7 @@ impl LegacyTxtRuntime {
                         || finished == scheduled_files
                     {
                         info!(
-                            "Bulk raw import summary: finished={finished}/{scheduled_files}, imported_files={}, failed_files={}, deleted_files={}, channel_days={}, user_months={}",
+                            "Bulk raw import summary: finished={finished}/{scheduled_files}, imported_files={}, failed_files={}, deleted_files={}, channel_days={}, user_months={}, raw_workers={worker_count}, compression_workers={compression_threads}",
                             summary.files_imported,
                             summary.files_failed,
                             summary.files_deleted,
@@ -1048,15 +1081,12 @@ impl LegacyTxtRuntime {
 struct BulkRawDiscovery {
     files_scanned: usize,
     raw_candidates: usize,
+    skipped_v1_preferred: usize,
     selected: Vec<ImportFile>,
 }
 
 fn default_bulk_raw_worker_count() -> usize {
-    thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(2)
-        .min(4)
-        .max(1)
+    read_max_raw_workers_from_env()
 }
 
 fn accumulate_insert_outcome(state: &mut RawFileImportState, outcome: InsertEventsBatchOutcome) {
@@ -1179,7 +1209,148 @@ fn is_supported_raw_import_path(path: &Path) -> bool {
         || name.ends_with(".log.gz")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct V1ChannelDayKey {
+    channel_id: String,
+    year: i32,
+    month: u32,
+    day: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V1RawPathKind {
+    ChannelDay,
+    DayUserShard,
+    Other,
+}
+
+fn prune_v1_preferred_raw_files(files: Vec<ImportFile>) -> (Vec<ImportFile>, usize) {
+    let mut preferred_days = HashSet::new();
+    for file in &files {
+        if let Some((key, V1RawPathKind::ChannelDay)) = infer_v1_raw_layout(&file.path) {
+            preferred_days.insert(key);
+        }
+    }
+
+    let mut skipped = 0usize;
+    let mut kept = Vec::with_capacity(files.len());
+    for file in files {
+        match infer_v1_raw_layout(&file.path) {
+            Some((key, V1RawPathKind::DayUserShard)) if preferred_days.contains(&key) => {
+                skipped += 1;
+            }
+            _ => kept.push(file),
+        }
+    }
+
+    kept.sort_by(|left, right| {
+        v1_raw_sort_rank(&left.path)
+            .cmp(&v1_raw_sort_rank(&right.path))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    (kept, skipped)
+}
+
+fn v1_raw_sort_rank(path: &Path) -> u8 {
+    match infer_v1_raw_layout(path) {
+        Some((_, V1RawPathKind::ChannelDay)) => 0,
+        Some((_, V1RawPathKind::DayUserShard)) => 1,
+        Some((_, V1RawPathKind::Other)) | None => 2,
+    }
+}
+
+fn infer_v1_raw_layout(path: &Path) -> Option<(V1ChannelDayKey, V1RawPathKind)> {
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    let v1_index = components.iter().position(|component| *component == "v1")?;
+    let rest = components.get(v1_index + 1..)?;
+    if rest.len() < 4 {
+        return None;
+    }
+    let channel_id = rest[0].to_string();
+    let year = rest[1].parse::<i32>().ok()?;
+    let month = rest[2].parse::<u32>().ok()?;
+
+    if rest.len() >= 5 && is_channel_day_filename(rest[4]) {
+        let day = rest[3].parse::<u32>().ok()?;
+        return Some((
+            V1ChannelDayKey {
+                channel_id,
+                year,
+                month,
+                day,
+            },
+            V1RawPathKind::ChannelDay,
+        ));
+    }
+    if rest.len() >= 5 && is_v1_user_shard_filename(rest[4]) {
+        let day = rest[3].parse::<u32>().ok()?;
+        return Some((
+            V1ChannelDayKey {
+                channel_id,
+                year,
+                month,
+                day,
+            },
+            V1RawPathKind::DayUserShard,
+        ));
+    }
+    if rest.len() >= 4 && is_v1_user_shard_filename(rest[3]) {
+        return Some((
+            V1ChannelDayKey {
+                channel_id,
+                year,
+                month,
+                day: 0,
+            },
+            V1RawPathKind::Other,
+        ));
+    }
+    None
+}
+
+fn is_channel_day_filename(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "channel.txt" | "channel.txt.gz"
+    )
+}
+
+fn is_v1_user_shard_filename(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    let stem = lowered
+        .strip_suffix(".txt.gz")
+        .or_else(|| lowered.strip_suffix(".txt"))
+        .unwrap_or(&lowered);
+    !stem.is_empty() && stem.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn looks_like_v1_raw_import_path(path: &Path) -> bool {
+    infer_v1_raw_layout(path).is_some()
+}
+
+fn read_max_raw_workers_from_env() -> usize {
+    std::env::var("JUSTLOG_IMPORT_MAX_RAW_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(default_max_raw_workers)
+}
+
+fn default_max_raw_workers() -> usize {
+    thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(2)
+        .min(8)
+        .max(1)
+}
+
 fn raw_file_matches_channel(file: &ImportFile, channel_id: &str) -> bool {
+    if let Some((key, _)) = infer_v1_raw_layout(&file.path) {
+        return key.channel_id == channel_id;
+    }
     if let Some((matched_channel_id, _, _, _)) = infer_legacy_path_channel_day(&file.path) {
         if matched_channel_id == channel_id {
             return true;
