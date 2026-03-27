@@ -9,10 +9,11 @@ use chrono::{DateTime, TimeZone, Utc};
 use flate2::read::GzDecoder;
 use regex::Regex;
 use serde::Deserialize;
+use tracing::{info, warn};
 use walkdir::WalkDir;
 
 use crate::model::{CanonicalEvent, ChannelLogFile, ChatMessage, PRIVMSG_TYPE};
-use crate::store::{Store, load_lines_from_text_file};
+use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyTxtMode {
@@ -51,6 +52,8 @@ pub struct ChannelDayImport {
     pub complete_messages: Vec<ChatMessage>,
     pub simple_messages: Vec<ChatMessage>,
 }
+
+const IMPORT_PROGRESS_LINE_INTERVAL: usize = 100_000;
 
 impl LegacyTxtRuntime {
     pub fn from_env(_default_logs_directory: &Path) -> Self {
@@ -95,58 +98,18 @@ impl LegacyTxtRuntime {
         month: u32,
         day: u32,
     ) -> Result<()> {
-        for file in self.discover_channel_day_files(channel_id, year, month, day)? {
-            if file.kind != ImportKind::RawIrc {
-                continue;
-            }
-            let path_key = file.path.to_string_lossy().to_string();
-            if store.imported_raw_file_is_current(&path_key, &file.fingerprint)? {
-                continue;
-            }
-            let mut imported = 0usize;
-            let lines = load_lines_from_supported_file(&file.path)?;
-            for line in extract_raw_irc_lines(&lines) {
-                match CanonicalEvent::from_raw(&line) {
-                    Ok(Some(event)) => {
-                        if store.insert_event(&event)? {
-                            imported += 1;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(_) => {}
-                }
-            }
-            let status = if imported > 0 { "imported" } else { "seen" };
-            store.record_imported_raw_file(&path_key, &file.fingerprint, status)?;
-        }
+        let files = self.discover_channel_day_files(channel_id, year, month, day)?;
+        self.import_raw_files(
+            store,
+            files,
+            &format!("channel-day {channel_id}/{year}/{month}/{day}"),
+        )?;
         Ok(())
     }
 
     pub fn import_raw_channel(&self, store: &Store, channel_id: &str) -> Result<()> {
-        for file in self.discover_channel_files(channel_id)? {
-            if file.kind != ImportKind::RawIrc {
-                continue;
-            }
-            let path_key = file.path.to_string_lossy().to_string();
-            if store.imported_raw_file_is_current(&path_key, &file.fingerprint)? {
-                continue;
-            }
-            let mut imported = 0usize;
-            let lines = load_lines_from_supported_file(&file.path)?;
-            for line in extract_raw_irc_lines(&lines) {
-                match CanonicalEvent::from_raw(&line) {
-                    Ok(Some(event)) => {
-                        if store.insert_event(&event)? {
-                            imported += 1;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(_) => {}
-                }
-            }
-            let status = if imported > 0 { "imported" } else { "seen" };
-            store.record_imported_raw_file(&path_key, &file.fingerprint, status)?;
-        }
+        let files = self.discover_channel_files(channel_id)?;
+        self.import_raw_files(store, files, &format!("channel {channel_id}"))?;
         Ok(())
     }
 
@@ -237,7 +200,14 @@ impl LegacyTxtRuntime {
             {
                 continue;
             }
-            if let Some(kind) = classify_import_file(&path)? {
+            let kind = match classify_import_file(&path) {
+                Ok(kind) => kind,
+                Err(error) => {
+                    warn!("Skipping import candidate {}: {error:#}", path.display());
+                    None
+                }
+            };
+            if let Some(kind) = kind {
                 files.push(ImportFile {
                     path: path.clone(),
                     fingerprint: file_fingerprint(&path)?,
@@ -269,7 +239,14 @@ impl LegacyTxtRuntime {
             if matched_channel_id != channel_id {
                 continue;
             }
-            if let Some(kind) = classify_import_file(&path)? {
+            let kind = match classify_import_file(&path) {
+                Ok(kind) => kind,
+                Err(error) => {
+                    warn!("Skipping import candidate {}: {error:#}", path.display());
+                    None
+                }
+            };
+            if let Some(kind) = kind {
                 files.push(ImportFile {
                     path: path.clone(),
                     fingerprint: file_fingerprint(&path)?,
@@ -302,6 +279,51 @@ impl LegacyTxtRuntime {
         }
         None
     }
+
+    fn import_raw_files(&self, store: &Store, files: Vec<ImportFile>, scope: &str) -> Result<()> {
+        let pending = files
+            .into_iter()
+            .filter(|file| file.kind == ImportKind::RawIrc)
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut remaining = Vec::new();
+        let mut total_bytes = 0u64;
+        for file in pending {
+            let path_key = file.path.to_string_lossy().to_string();
+            if store.imported_raw_file_is_current(&path_key, &file.fingerprint)? {
+                continue;
+            }
+            total_bytes += fs::metadata(&file.path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            remaining.push(file);
+        }
+        if remaining.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Starting raw import scan for {scope}: {} file(s), {:.2} MiB pending",
+            remaining.len(),
+            total_bytes as f64 / (1024.0 * 1024.0)
+        );
+
+        let total_files = remaining.len();
+        for (index, file) in remaining.into_iter().enumerate() {
+            if let Err(error) = import_raw_file_with_progress(store, &file, index + 1, total_files)
+            {
+                let path_key = file.path.to_string_lossy().to_string();
+                let failed_status = format!("failed:{error}");
+                let _ =
+                    store.record_imported_raw_file(&path_key, &file.fingerprint, &failed_status);
+                warn!("Failed raw import for {}: {error:#}", file.path.display());
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn merge_messages(
@@ -325,14 +347,30 @@ fn classify_import_file(path: &Path) -> Result<Option<ImportKind>> {
     if !(name.ends_with(".txt") || name.ends_with(".txt.gz")) {
         return Ok(None);
     }
-    let lines = load_lines_from_supported_file(path)?;
-    if behaves_like_raw_irc(&lines) {
+    if behaves_like_raw_irc_path(path)? {
         Ok(Some(ImportKind::RawIrc))
     } else {
         Ok(Some(ImportKind::SimpleText))
     }
 }
 
+fn behaves_like_raw_irc_path(path: &Path) -> Result<bool> {
+    let mut saw_supported = false;
+    let mut saw_raw_line = false;
+    for_each_line_in_supported_file(path, |line| {
+        let Some(raw) = extract_raw_irc_line(&line) else {
+            return Ok(());
+        };
+        saw_raw_line = true;
+        if let Ok(Some(_)) = CanonicalEvent::from_raw(&raw) {
+            saw_supported = true;
+        }
+        Ok(())
+    })?;
+    Ok(saw_raw_line && saw_supported)
+}
+
+#[cfg(test)]
 fn behaves_like_raw_irc(lines: &[String]) -> bool {
     let raw_lines = extract_raw_irc_lines(lines);
     let mut saw_supported = false;
@@ -346,6 +384,7 @@ fn behaves_like_raw_irc(lines: &[String]) -> bool {
     saw_supported && !raw_lines.is_empty()
 }
 
+#[cfg(test)]
 fn extract_raw_irc_lines(lines: &[String]) -> Vec<String> {
     lines
         .iter()
@@ -368,21 +407,12 @@ fn extract_raw_irc_line(line: &str) -> Option<String> {
 }
 
 fn load_lines_from_supported_file(path: &Path) -> Result<Vec<String>> {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name.ends_with(".gz") {
-        let file = File::open(path)?;
-        let decoder = GzDecoder::new(file);
-        let reader = BufReader::new(decoder);
-        return reader
-            .lines()
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(Into::into);
-    }
-    load_lines_from_text_file(path)
+    let mut lines = Vec::new();
+    for_each_line_in_supported_file(path, |line| {
+        lines.push(line);
+        Ok(())
+    })?;
+    Ok(lines)
 }
 
 fn load_string_from_supported_file(path: &Path) -> Result<String> {
@@ -400,6 +430,117 @@ fn load_string_from_supported_file(path: &Path) -> Result<String> {
         File::open(path)?.read_to_string(&mut output)?;
     }
     Ok(output)
+}
+
+fn for_each_line_in_supported_file<F>(path: &Path, mut f: F) -> Result<()>
+where
+    F: FnMut(String) -> Result<()>,
+{
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.ends_with(".gz") {
+        let file = File::open(path)?;
+        let decoder = GzDecoder::new(file);
+        let reader = BufReader::new(decoder);
+        for line in reader.lines() {
+            f(line?)?;
+        }
+        return Ok(());
+    }
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        f(line?)?;
+    }
+    Ok(())
+}
+
+fn import_raw_file_with_progress(
+    store: &Store,
+    file: &ImportFile,
+    index: usize,
+    total_files: usize,
+) -> Result<()> {
+    let path_key = file.path.to_string_lossy().to_string();
+    store.record_imported_raw_file(&path_key, &file.fingerprint, "importing")?;
+
+    let file_size = fs::metadata(&file.path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    info!(
+        "Importing raw file {index}/{total_files}: {} ({:.2} MiB)",
+        file.path.display(),
+        file_size as f64 / (1024.0 * 1024.0)
+    );
+
+    let mut scanned_lines = 0usize;
+    let mut candidate_lines = 0usize;
+    let mut imported = 0usize;
+    let mut parse_errors = 0usize;
+    let mut skipped_events = 0usize;
+    for_each_line_in_supported_file(&file.path, |line| {
+        scanned_lines += 1;
+        let Some(raw) = extract_raw_irc_line(&line) else {
+            if scanned_lines % IMPORT_PROGRESS_LINE_INTERVAL == 0 {
+                let status = format!("importing:{scanned_lines}:{imported}:{parse_errors}");
+                let _ = store.record_imported_raw_file(&path_key, &file.fingerprint, &status);
+                info!(
+                    "Raw import progress {}: scanned {} lines, imported {}, parse_errors {}",
+                    file.path.display(),
+                    scanned_lines,
+                    imported,
+                    parse_errors
+                );
+            }
+            return Ok(());
+        };
+
+        candidate_lines += 1;
+        match CanonicalEvent::from_raw(&raw) {
+            Ok(Some(event)) => {
+                if store.insert_event(&event)? {
+                    imported += 1;
+                } else {
+                    skipped_events += 1;
+                }
+            }
+            Ok(None) => {
+                skipped_events += 1;
+            }
+            Err(_) => {
+                parse_errors += 1;
+            }
+        }
+
+        if scanned_lines % IMPORT_PROGRESS_LINE_INTERVAL == 0 {
+            let status = format!("importing:{scanned_lines}:{imported}:{parse_errors}");
+            let _ = store.record_imported_raw_file(&path_key, &file.fingerprint, &status);
+            info!(
+                "Raw import progress {}: scanned {} lines, imported {}, parse_errors {}",
+                file.path.display(),
+                scanned_lines,
+                imported,
+                parse_errors
+            );
+        }
+        Ok(())
+    })?;
+
+    let status = if imported > 0 { "imported" } else { "seen" };
+    store.record_imported_raw_file(&path_key, &file.fingerprint, status)?;
+    info!(
+        "Completed raw import {}: scanned {} lines, raw_candidates {}, imported {}, skipped {}, parse_errors {}",
+        file.path.display(),
+        scanned_lines,
+        candidate_lines,
+        imported,
+        skipped_events,
+        parse_errors
+    );
+    Ok(())
 }
 
 fn parse_sparse_txt_file(

@@ -425,12 +425,16 @@ impl Store {
         let db = self.db.lock().unwrap();
         let stored = db
             .query_row(
-                "SELECT fingerprint FROM imported_raw_files WHERE path = ?1",
+                "SELECT fingerprint, status FROM imported_raw_files WHERE path = ?1",
                 params![path],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        Ok(stored.as_deref() == Some(fingerprint))
+        Ok(matches!(
+            stored.as_ref(),
+            Some((stored_fingerprint, status))
+                if stored_fingerprint == fingerprint && matches!(status.as_str(), "imported" | "seen")
+        ))
     }
 
     pub fn record_imported_raw_file(

@@ -228,6 +228,72 @@ async fn import_folder_raw_irc_txt_imports_into_native_store_without_duplication
 }
 
 #[tokio::test]
+async fn import_folder_retries_files_left_in_importing_state() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("nested/1/2024/1/2.txt");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(
+        &import_file,
+        privmsg(
+            "import-raw-retry-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "raw imported after retry",
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let fingerprint = format!(
+        "{}:{}",
+        fs::metadata(&import_file).unwrap().len(),
+        fs::metadata(&import_file)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    );
+    harness
+        .state
+        .store
+        .record_imported_raw_file(
+            import_file.to_string_lossy().as_ref(),
+            &fingerprint,
+            "importing",
+        )
+        .unwrap();
+
+    let body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    assert!(body.contains("raw imported after retry"));
+    assert_eq!(harness.state.store.event_count().unwrap(), 1);
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+    }
+}
+
+#[tokio::test]
 async fn import_folder_merge_mode_merges_native_json_and_simple_text() {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();
