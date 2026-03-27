@@ -221,9 +221,19 @@ async fn admin_channels_handler(state: AppState, request: Request, join: bool) -
     let body = axum::body::to_bytes(request.into_body(), usize::MAX).await?;
     let payload: ChannelsPayload = serde_json::from_slice(&body)?;
     let users = state.helix.get_users_by_ids(&payload.channels).await?;
-    let logins = users
-        .values()
-        .map(|user| user.login.clone())
+    let missing = payload
+        .channels
+        .iter()
+        .filter(|channel_id| !users.contains_key(*channel_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(anyhow!("unknown channel ids: {}", missing.join(", ")));
+    }
+    let logins = payload
+        .channels
+        .iter()
+        .filter_map(|channel_id| users.get(channel_id).map(|user| user.login.clone()))
         .collect::<Vec<_>>();
     {
         let mut config = state.config.write().await;

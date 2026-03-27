@@ -368,3 +368,23 @@ async fn admin_channel_mutation_requires_valid_api_key() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(harness.state.config.read().await.channels, vec!["1"]);
 }
+
+#[tokio::test]
+async fn admin_channel_mutation_rejects_unknown_channel_ids() {
+    let harness = TestHarness::start(vec!["1".to_string()]).await;
+
+    let response = harness
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/admin/channels")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channels":["2","999"]}"#))
+                .unwrap(),
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(harness.state.config.read().await.channels, vec!["1"]);
+}
