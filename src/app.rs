@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use axum::Router;
 use clap::{Parser, Subcommand};
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as HyperServerBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
@@ -80,25 +82,45 @@ pub async fn run_cli() -> Result<()> {
         optout_codes: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let command_service = Arc::new(CommandService::new(state.clone()));
-    let ingest = IngestManager::new(shared_config.clone(), store.clone(), command_service);
-    *ingest_slot.write().await = Some(ingest.clone());
+    if config.oauth.trim().is_empty() {
+        warn!("ingest startup skipped because oauth is not configured");
+    } else {
+        let command_service = Arc::new(CommandService::new(state.clone()));
+        let ingest = IngestManager::new(shared_config.clone(), store.clone(), command_service);
+        *ingest_slot.write().await = Some(ingest.clone());
 
-    let initial_channels = resolve_channel_logins(&helix, &config.channels).await?;
-    ingest.start(initial_channels).await;
+        let initial_channels = resolve_channel_logins(&helix, &config.channels).await?;
+        ingest.start(initial_channels).await;
+    }
     spawn_compactor(shared_config.clone(), store.clone(), debug_runtime);
 
-    let app = api::router(state);
-    serve(app, &config.listen_address).await
+    serve(state, &config.listen_address).await
 }
 
-async fn serve(app: Router, listen_address: &str) -> Result<()> {
+async fn serve(state: AppState, listen_address: &str) -> Result<()> {
     let bind_address = normalize_listen_address(listen_address);
     let listener = TcpListener::bind(bind_address).await?;
     let local_address = listener.local_addr()?;
     info!("Listening on {local_address}");
-    axum::serve(listener, app).await?;
-    Ok(())
+    loop {
+        let (stream, remote_address) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |request| {
+                let state = state.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        api::dispatch(state, request.map(axum::body::Body::new)).await,
+                    )
+                }
+            });
+            let builder = HyperServerBuilder::new(TokioExecutor::new());
+            if let Err(error) = builder.serve_connection_with_upgrades(io, service).await {
+                warn!("failed to serve HTTP connection from {remote_address}: {error}");
+            }
+        });
+    }
 }
 
 pub async fn resolve_channel_logins(

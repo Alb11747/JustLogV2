@@ -9,14 +9,16 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, LOCATION
 use axum::http::{HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use axum::{Json, Router};
+use axum::Json;
+use axum::Router;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use regex::Regex;
 use serde::Deserialize;
 use tokio::fs::File;
+use tokio::task;
 use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::app::AppState;
 use crate::legacy_txt::{LegacyTxtMode, merge_messages};
@@ -57,13 +59,18 @@ struct ChannelsPayload {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", any(dispatch))
-        .route("/{*path}", any(dispatch))
+        .route("/", any(dispatch_router))
+        .route("/{*path}", any(dispatch_router))
         .with_state(state)
 }
 
-async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
+async fn dispatch_router(State(state): State<AppState>, request: Request) -> Response {
+    dispatch(state, request).await
+}
+
+pub async fn dispatch(state: AppState, request: Request) -> Response {
     let path = request.uri().path().to_string();
+    info!("HTTP request start: {} {}", request.method(), path);
     {
         let config = state.config.read().await;
         if config.ops.metrics_enabled && path == config.ops.metrics_route {
@@ -148,9 +155,13 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
         }
     }
     if let Some(user_id) = user_id {
-        let logs = state
-            .store
-            .get_available_logs_for_user(&channel_id, &user_id)?;
+        let store = state.store.clone();
+        let channel_id_for_logs = channel_id.clone();
+        let user_id_for_logs = user_id.clone();
+        let logs = run_blocking(move || {
+            store.get_available_logs_for_user(&channel_id_for_logs, &user_id_for_logs)
+        })
+        .await?;
         let mut response = Json(UserLogList {
             available_logs: logs,
         })
@@ -161,12 +172,22 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
         );
         Ok(response)
     } else {
-        state
-            .legacy_txt
-            .import_raw_channel(&state.store, &channel_id)?;
-        let mut logs = state.store.get_available_logs_for_channel(&channel_id)?;
+        let legacy_txt = state.legacy_txt.clone();
+        let store = state.store.clone();
+        let channel_id_for_import = channel_id.clone();
+        run_blocking(move || legacy_txt.import_raw_channel(&store, &channel_id_for_import)).await?;
+
+        let store = state.store.clone();
+        let channel_id_for_logs = channel_id.clone();
+        let mut logs =
+            run_blocking(move || store.get_available_logs_for_channel(&channel_id_for_logs)).await?;
         if state.legacy_txt.is_import_enabled() {
-            logs.extend(state.legacy_txt.available_channel_logs(&channel_id)?);
+            let legacy_txt = state.legacy_txt.clone();
+            let channel_id_for_available = channel_id.clone();
+            logs.extend(
+                run_blocking(move || legacy_txt.available_channel_logs(&channel_id_for_available))
+                    .await?,
+            );
             logs.sort_by(|left, right| {
                 right
                     .year
@@ -327,11 +348,14 @@ async fn log_handler(state: AppState, request: Request) -> Result<Response> {
 
 async fn random_response(state: AppState, request: LogRequest) -> Result<Response> {
     let event = if let Some(user_id) = request.user_id.as_deref() {
-        state
-            .store
-            .random_user_message(&request.channel_id, user_id)?
+        let store = state.store.clone();
+        let channel_id = request.channel_id.clone();
+        let user_id = user_id.to_string();
+        run_blocking(move || store.random_user_message(&channel_id, &user_id)).await?
     } else {
-        state.store.random_channel_message(&request.channel_id)?
+        let store = state.store.clone();
+        let channel_id = request.channel_id.clone();
+        run_blocking(move || store.random_channel_message(&channel_id)).await?
     };
     let Some(event) = event else {
         return Ok(error_response(StatusCode::NOT_FOUND, "could not load logs"));
@@ -350,13 +374,14 @@ async fn range_response(
         .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
     let to = request.time.to.unwrap_or_else(Utc::now);
     let mut events = if let Some(user_id) = request.user_id.as_deref() {
-        state
-            .store
-            .read_user_range(&request.channel_id, user_id, from, to)?
+        let store = state.store.clone();
+        let channel_id = request.channel_id.clone();
+        let user_id = user_id.to_string();
+        run_blocking(move || store.read_user_range(&channel_id, &user_id, from, to)).await?
     } else {
-        state
-            .store
-            .read_channel_range(&request.channel_id, from, to)?
+        let store = state.store.clone();
+        let channel_id = request.channel_id.clone();
+        run_blocking(move || store.read_channel_range(&channel_id, from, to)).await?
     };
     if request.reverse {
         events.reverse();
@@ -380,9 +405,10 @@ async fn dated_response(
     let year = request.time.year.ok_or_else(|| anyhow!("invalid year"))?;
     let month = request.time.month.ok_or_else(|| anyhow!("invalid month"))?;
     let mut events = if let Some(user_id) = request.user_id.as_deref() {
-        state
-            .store
-            .read_user_logs(&request.channel_id, user_id, year, month)?
+        let store = state.store.clone();
+        let channel_id = request.channel_id.clone();
+        let user_id = user_id.to_string();
+        run_blocking(move || store.read_user_logs(&channel_id, &user_id, year, month)).await?
     } else {
         let day = request.time.day.ok_or_else(|| anyhow!("invalid day"))?;
         let legacy_mode = state.legacy_txt.mode();
@@ -390,31 +416,38 @@ async fn dated_response(
             && accept_encoding.contains("br")
             && !state.legacy_txt.is_import_enabled()
         {
-            let plan = state
-                .store
-                .channel_raw_plan(&request.channel_id, year, month, day)?;
+            let store = state.store.clone();
+            let channel_id = request.channel_id.clone();
+            let plan =
+                run_blocking(move || store.channel_raw_plan(&channel_id, year, month, day)).await?;
             if let Some(path) = plan.segment_path {
                 return direct_brotli_response(path);
             }
         }
-        state.legacy_txt.import_raw_channel_day(
-            &state.store,
-            &request.channel_id,
-            year,
-            month,
-            day,
-        )?;
-        let native = state
-            .store
-            .read_channel_logs(&request.channel_id, year, month, day)?;
+        let legacy_txt = state.legacy_txt.clone();
+        let store = state.store.clone();
+        let channel_id = request.channel_id.clone();
+        run_blocking(move || legacy_txt.import_raw_channel_day(&store, &channel_id, year, month, day))
+            .await?;
+
+        let store = state.store.clone();
+        let channel_id_for_native = request.channel_id.clone();
+        let native =
+            run_blocking(move || store.read_channel_logs(&channel_id_for_native, year, month, day))
+                .await?;
         let channel_login = resolve_channel_login(&state, &request.channel_id).await;
-        let imported = state.legacy_txt.load_channel_day_import(
-            &request.channel_id,
-            &channel_login,
-            year,
-            month,
-            day,
-        )?;
+        let legacy_txt = state.legacy_txt.clone();
+        let channel_id_for_import = request.channel_id.clone();
+        let imported = run_blocking(move || {
+            legacy_txt.load_channel_day_import(
+                &channel_id_for_import,
+                &channel_login,
+                year,
+                month,
+                day,
+            )
+        })
+        .await?;
         return respond_with_channel_day_messages(
             request,
             native.into_iter().map(ChatMessage::from).collect(),
@@ -823,4 +856,124 @@ fn random_string(len: usize) -> String {
     (0..len)
         .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
+}
+
+async fn run_blocking<T, F>(f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    task::spawn_blocking(f)
+        .await
+        .map_err(|error| anyhow!("blocking task join error: {error}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch;
+    use crate::app::AppState;
+    use crate::config::Config;
+    use crate::debug_sync::DebugRuntime;
+    use crate::helix::HelixClient;
+    use crate::ingest::{ChatCommandService, IngestManager};
+    use crate::legacy_txt::LegacyTxtRuntime;
+    use crate::model::CanonicalEvent;
+    use crate::store::Store;
+    use anyhow::Result;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tempfile::TempDir;
+    use tokio::sync::{Mutex, RwLock};
+
+    struct NoopCommands;
+
+    #[async_trait::async_trait]
+    impl ChatCommandService for NoopCommands {
+        async fn handle_privmsg_command(&self, _event: &CanonicalEvent) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_state() -> AppState {
+        let temp = TempDir::new().unwrap();
+        let root = temp.keep();
+        let logs_directory = root.join("logs");
+        let config_path = root.join("config.json");
+        let mut config = Config {
+            config_path,
+            config_file_permissions: None,
+            bot_verified: false,
+            logs_directory,
+            archive: false,
+            admin_api_key: String::new(),
+            username: "justinfan0".to_string(),
+            oauth: String::new(),
+            listen_address: "127.0.0.1:0".to_string(),
+            admins: Vec::new(),
+            channels: Vec::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            log_level: "info".to_string(),
+            opt_out: HashMap::new(),
+            compression: Default::default(),
+            http: Default::default(),
+            ingest: Default::default(),
+            helix: Default::default(),
+            irc: Default::default(),
+            storage: Default::default(),
+            ops: Default::default(),
+        };
+        config.storage.sqlite_path = PathBuf::from(root.join("justlog.sqlite3"));
+        config.normalize().unwrap();
+        let shared_config = Arc::new(RwLock::new(config.clone()));
+        let store = Store::open(&config).unwrap();
+        AppState {
+            config: shared_config,
+            store,
+            helix: HelixClient::new(&config),
+            legacy_txt: Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory)),
+            debug_runtime: Arc::new(DebugRuntime::disabled()),
+            ingest: Arc::new(RwLock::new(None)),
+            start_time: Instant::now(),
+            optout_codes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn start_test_ingest(state: &AppState) {
+        {
+            let mut config = state.config.write().await;
+            config.ingest.connect_timeout_ms = 50;
+            config.irc.server = "127.0.0.1".to_string();
+            config.irc.port = 1;
+            config.irc.tls = false;
+        }
+        let ingest = IngestManager::new(
+            state.config.clone(),
+            state.store.clone(),
+            Arc::new(NoopCommands),
+        );
+        *state.ingest.write().await = Some(ingest.clone());
+        ingest.start(Vec::new()).await;
+    }
+
+    #[tokio::test]
+    async fn healthz_route_returns_ok_in_process() {
+        let response =
+            dispatch(test_state(), Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn healthz_route_returns_ok_over_tcp_with_ingest_started() {
+        let state = test_state();
+        start_test_ingest(&state).await;
+        let response =
+            dispatch(state, Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

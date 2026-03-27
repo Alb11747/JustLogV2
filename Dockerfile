@@ -47,7 +47,7 @@ COPY --from=builder /tmp/justlog /usr/local/bin/justlog
 
 RUN mkdir -p /data/logs
 
-EXPOSE 8025
+EXPOSE 8026
 
 VOLUME ["/data"]
 

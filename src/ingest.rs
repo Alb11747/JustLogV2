@@ -190,8 +190,20 @@ impl IngestManager {
                             continue;
                         }
                         drop(cfg);
-                        if let Err(error) = self.store.insert_event(&event) {
-                            error!("failed to persist event: {error}");
+                        let store = self.store.clone();
+                        let event_to_store = event.clone();
+                        let insert_result = tokio::task::spawn_blocking(move || {
+                            store.insert_event(&event_to_store)
+                        })
+                        .await;
+                        match insert_result {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                error!("failed to persist event: {error}");
+                            }
+                            Err(error) => {
+                                error!("failed to join blocking event persistence task: {error}");
+                            }
                         }
                     }
                 }
