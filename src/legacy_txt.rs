@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::TrySendError;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -152,7 +153,6 @@ const RAW_IMPORT_CHUNK_EVENTS: usize = 4_000;
 const BULK_IMPORT_COMMIT_EVENTS: usize = 20_000;
 const BULK_IMPORT_COMMIT_FILES: usize = 32;
 const BULK_IMPORT_DISCOVERY_LOG_INTERVAL: usize = 500;
-const BULK_IMPORT_SUMMARY_FILE_INTERVAL: usize = 10;
 const BULK_IMPORT_CHANNEL_WARN_THRESHOLD: usize = 200;
 
 impl LegacyTxtRuntime {
@@ -426,83 +426,284 @@ impl LegacyTxtRuntime {
         dry_run: bool,
     ) -> Result<BulkRawImportSummary> {
         let started = Instant::now();
-        info!(
-            "Starting bulk raw import discovery: channel_filter={:?}, limit_files={:?}, dry_run={dry_run}",
-            channel_id, limit_files
-        );
-        let discovery_started = Instant::now();
-        let discovery = self.discover_bulk_raw_files(channel_id, limit_files)?;
-        let selected = discovery.selected;
-
         let mut summary = BulkRawImportSummary {
-            files_scanned: discovery.files_scanned,
-            raw_candidates: discovery.raw_candidates,
-            files_selected: selected.len(),
-            files_skipped_v1_preferred: discovery.skipped_v1_preferred,
             dry_run,
             channel_id: channel_id.map(str::to_string),
             ..BulkRawImportSummary::default()
         };
         info!(
-            "Completed bulk raw import discovery in {:?}: files_scanned={}, raw_candidates={}, skipped_v1_preferred={}, selected={}",
-            discovery_started.elapsed(),
-            summary.files_scanned,
-            summary.raw_candidates,
-            summary.files_skipped_v1_preferred,
-            summary.files_selected
+            "Starting streaming bulk raw import: channel_filter={:?}, limit_files={:?}, dry_run={dry_run}",
+            channel_id, limit_files
         );
 
-        info!(
-            "Starting bulk raw import: channel_filter={:?}, dry_run={}, selected_files={}",
-            channel_id,
-            dry_run,
-            selected.len()
-        );
+        let mut files = Vec::<ImportFile>::new();
+        let mut states = HashMap::<usize, RawFileImportState>::new();
+        let mut all_channel_days = BTreeSet::new();
+        let mut all_user_months = BTreeSet::new();
+        let mut pending_batch = PendingIndexedRawBatch::default();
+        let mut finished = 0usize;
+        let mut workers = Vec::new();
+        let mut work_tx_opt = None;
+        let mut result_rx_opt = None;
+        let mut worker_count = 0usize;
+        let compression_threads = std::env::var("JUSTLOG_IMPORT_MAX_COMPRESS_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4);
+        let shutdown = Arc::new(AtomicBool::new(store.shutdown_requested()));
 
-        let status_check_started = Instant::now();
-        info!(
-            "Starting bulk raw import status prefetch for {} selected file(s)",
-            selected.len()
-        );
-        let current_map = store.imported_raw_files_current_map(
-            &selected
-                .iter()
-                .map(|file| {
-                    (
-                        file.path.to_string_lossy().to_string(),
-                        file.fingerprint.clone(),
-                    )
+        if !dry_run {
+            worker_count = default_bulk_raw_worker_count();
+            let planned_workers = worker_count.max(1);
+            info!(
+                "Starting streaming raw worker pool with {} raw worker(s), {} compression worker(s); coalesced_commit_events={}, coalesced_commit_files={}; SQLite progress writes disabled",
+                planned_workers,
+                compression_threads,
+                BULK_IMPORT_COMMIT_EVENTS,
+                BULK_IMPORT_COMMIT_FILES
+            );
+            let (work_tx, work_rx) =
+                mpsc::sync_channel::<Option<(usize, ImportFile)>>(planned_workers * 2);
+            let (result_tx, result_rx) =
+                mpsc::sync_channel::<RawWorkerMessage>(planned_workers * 8);
+            let shared_rx = Arc::new(Mutex::new(work_rx));
+            for _ in 0..planned_workers {
+                let sender = result_tx.clone();
+                let receiver = Arc::clone(&shared_rx);
+                let shutdown = Arc::clone(&shutdown);
+                workers.push(thread::spawn(move || {
+                    raw_import_worker_loop(receiver, sender, shutdown)
+                }));
+            }
+            drop(result_tx);
+            work_tx_opt = Some(work_tx);
+            result_rx_opt = Some(result_rx);
+        }
+
+        let mut active_month_state = None;
+        let root = match self.import_folder_path() {
+            Some(root) => root,
+            None => {
+                summary.elapsed_ms = started.elapsed().as_millis();
+                return Ok(summary);
+            }
+        };
+
+        for entry in WalkDir::new(&root)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if limit_files.is_some_and(|limit| summary.files_selected >= limit) {
+                break;
+            }
+            if store.shutdown_requested() {
+                shutdown.store(true, Ordering::SeqCst);
+                info!("store shutdown requested; stopping streaming bulk raw discovery");
+                break;
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.into_path();
+            let month_location = infer_v1_raw_location(&path);
+            if active_month_state
+                .as_ref()
+                .is_some_and(|state: &StreamingMonthState| {
+                    Some(&state.month_root)
+                        != month_location.as_ref().map(|location| &location.month_root)
                 })
-                .collect::<Vec<_>>(),
-        )?;
-        info!(
-            "Completed bulk raw import status prefetch in {:?}: selected={}, current={}",
-            status_check_started.elapsed(),
-            selected.len(),
-            current_map
-                .values()
-                .filter(|is_current| **is_current)
-                .count()
-        );
+            {
+                self.flush_streaming_month_state(
+                    store,
+                    &mut active_month_state,
+                    &mut summary,
+                    dry_run,
+                    &mut files,
+                    work_tx_opt.as_ref(),
+                    result_rx_opt.as_ref(),
+                    &mut states,
+                    &mut pending_batch,
+                    &mut finished,
+                    &mut all_channel_days,
+                    &mut all_user_months,
+                )?;
+            }
+            if !is_supported_raw_import_path(&path) {
+                continue;
+            }
 
-        let mut pending = Vec::new();
-        for file in selected {
+            summary.files_scanned += 1;
+            if summary.files_scanned % BULK_IMPORT_DISCOVERY_LOG_INTERVAL == 0 {
+                info!(
+                    "Streaming bulk raw discovery progress: scanned={} raw_candidates={} selected={} current={} skipped_v1_preferred={}",
+                    summary.files_scanned,
+                    summary.raw_candidates,
+                    summary.files_selected,
+                    summary.files_current,
+                    summary.files_skipped_v1_preferred
+                );
+            }
+
+            let fingerprint = match file_fingerprint(&path) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    warn!(
+                        "Skipping raw import candidate {}: {error:#}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let file = ImportFile {
+                path,
+                fingerprint,
+                kind: ImportKind::RawIrc,
+            };
+            let is_raw = if looks_like_v1_raw_import_path(&file.path) {
+                true
+            } else {
+                match behaves_like_raw_irc_path(&file.path) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(
+                            "Skipping raw import candidate {} during classification: {error:#}",
+                            file.path.display()
+                        );
+                        false
+                    }
+                }
+            };
+            if !is_raw {
+                continue;
+            }
+            summary.raw_candidates += 1;
+            if channel_id.is_some_and(|value| !raw_file_matches_channel(&file, value)) {
+                continue;
+            }
+            info!("Discovered raw import file {}", file.path.display());
+
             let path_key = file.path.to_string_lossy().to_string();
-            let is_current = current_map.get(&path_key).copied().unwrap_or(false);
+            let is_current = store.imported_raw_file_is_current(&path_key, &file.fingerprint)?;
+            if let Some(location) = month_location.as_ref() {
+                if matches!(location.kind, V1RawPathKind::ChannelDay) && is_v1_shard_skip_enabled()
+                {
+                    let state = ensure_streaming_month_state(&mut active_month_state, location);
+                    collect_channel_file_event_ids_into(&file.path, &mut state.month_channel_ids);
+                }
+            }
             if is_current {
                 summary.files_current += 1;
+                info!("Skipping already-current raw file {}", file.path.display());
                 if !dry_run && self.delete_current_raw_if_configured(&file) {
                     summary.files_deleted += 1;
                 }
+                if let Some(result_rx) = result_rx_opt.as_ref() {
+                    process_ready_worker_messages(
+                        self,
+                        store,
+                        result_rx,
+                        &files,
+                        &mut states,
+                        &mut pending_batch,
+                        &mut finished,
+                        &mut summary,
+                        &mut all_channel_days,
+                        &mut all_user_months,
+                    )?;
+                }
                 continue;
             }
-            summary.files_pending += 1;
-            pending.push(file);
+
+            if let Some(location) = month_location.as_ref() {
+                if is_v1_shard_skip_enabled()
+                    && matches!(location.kind, V1RawPathKind::MonthUserShard)
+                {
+                    let state = ensure_streaming_month_state(&mut active_month_state, location);
+                    info!(
+                        "Parking month user shard {} until month proof is ready",
+                        file.path.display()
+                    );
+                    state.pending_shards.push(file);
+                    continue;
+                }
+            }
+
+            if dry_run {
+                summary.files_selected += 1;
+                summary.files_pending += 1;
+            } else if let (Some(work_tx), Some(result_rx)) =
+                (work_tx_opt.as_ref(), result_rx_opt.as_ref())
+            {
+                self.schedule_streaming_raw_file(
+                    store,
+                    work_tx,
+                    result_rx,
+                    file,
+                    &mut files,
+                    &mut states,
+                    &mut pending_batch,
+                    &mut finished,
+                    &mut summary,
+                    &mut all_channel_days,
+                    &mut all_user_months,
+                )?;
+            }
         }
 
-        if !dry_run && !pending.is_empty() {
-            self.bulk_import_raw_pending_files(store, &pending, &mut summary)?;
+        self.flush_streaming_month_state(
+            store,
+            &mut active_month_state,
+            &mut summary,
+            dry_run,
+            &mut files,
+            work_tx_opt.as_ref(),
+            result_rx_opt.as_ref(),
+            &mut states,
+            &mut pending_batch,
+            &mut finished,
+            &mut all_channel_days,
+            &mut all_user_months,
+        )?;
+
+        if let Some(work_tx) = work_tx_opt.take() {
+            for _ in 0..worker_count.max(1) {
+                work_tx.send(None)?;
+            }
         }
+
+        if let Some(result_rx) = result_rx_opt.as_ref() {
+            while finished < summary.files_pending {
+                process_next_worker_message(
+                    self,
+                    store,
+                    result_rx.recv().map_err(|_| {
+                        anyhow!("bulk raw import worker channel closed unexpectedly")
+                    })?,
+                    &files,
+                    &mut states,
+                    &mut pending_batch,
+                    &mut finished,
+                    &mut summary,
+                    &mut all_channel_days,
+                    &mut all_user_months,
+                )?;
+            }
+            flush_pending_indexed_raw_batch(
+                store,
+                &mut pending_batch,
+                &mut states,
+                summary.files_pending,
+            )?;
+        }
+
+        for worker in workers {
+            let _ = worker.join();
+        }
+
+        summary.affected_channel_days = all_channel_days.len();
+        summary.affected_user_months = all_user_months.len();
 
         summary.elapsed_ms = started.elapsed().as_millis();
         info!(
@@ -671,316 +872,6 @@ impl LegacyTxtRuntime {
         Ok(outcome)
     }
 
-    fn discover_bulk_raw_files(
-        &self,
-        channel_id: Option<&str>,
-        limit_files: Option<usize>,
-    ) -> Result<BulkRawDiscovery> {
-        let Some(root) = self.import_folder_path() else {
-            return Ok(BulkRawDiscovery::default());
-        };
-
-        let mut discovery = BulkRawDiscovery::default();
-        let mut selected = Vec::new();
-        for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
-            if limit_files.is_some_and(|limit| selected.len() >= limit)
-                || channel_id.is_some() && selected.len() >= limit_files.unwrap_or(usize::MAX)
-            {
-                break;
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            discovery.files_scanned += 1;
-            if discovery.files_scanned % BULK_IMPORT_DISCOVERY_LOG_INTERVAL == 0 {
-                info!(
-                    "Bulk raw import discovery progress: scanned={} raw_candidates={} selected={}",
-                    discovery.files_scanned,
-                    discovery.raw_candidates,
-                    discovery.selected.len()
-                );
-            }
-            let path = entry.into_path();
-            if !is_supported_raw_import_path(&path) {
-                continue;
-            }
-            let fingerprint = match file_fingerprint(&path) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    warn!(
-                        "Skipping raw import candidate {}: {error:#}",
-                        path.display()
-                    );
-                    continue;
-                }
-            };
-            let file = ImportFile {
-                path,
-                fingerprint,
-                kind: ImportKind::RawIrc,
-            };
-            let is_raw = if looks_like_v1_raw_import_path(&file.path) {
-                true
-            } else {
-                match behaves_like_raw_irc_path(&file.path) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(
-                            "Skipping raw import candidate {} during classification: {error:#}",
-                            file.path.display()
-                        );
-                        false
-                    }
-                }
-            };
-            if !is_raw {
-                continue;
-            }
-            discovery.raw_candidates += 1;
-            if channel_id.is_some_and(|value| !raw_file_matches_channel(&file, value)) {
-                continue;
-            }
-            selected.push(file);
-            if limit_files.is_some_and(|limit| selected.len() >= limit) {
-                break;
-            }
-        }
-        let (selected, skipped_v1_preferred) = prune_v1_preferred_raw_files(selected);
-        discovery.skipped_v1_preferred = skipped_v1_preferred;
-        discovery.selected = if let Some(limit) = limit_files {
-            selected.into_iter().take(limit).collect()
-        } else {
-            selected
-        };
-        Ok(discovery)
-    }
-
-    fn bulk_import_raw_pending_files(
-        &self,
-        store: &Store,
-        files: &[ImportFile],
-        summary: &mut BulkRawImportSummary,
-    ) -> Result<()> {
-        let planned_files = files.len();
-        if planned_files == 0 {
-            return Ok(());
-        }
-        let worker_count = default_bulk_raw_worker_count().min(planned_files.max(1));
-        let compression_threads = std::env::var("JUSTLOG_IMPORT_MAX_COMPRESS_THREADS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(4);
-        info!(
-            "Starting parallel bulk raw import with {} raw worker(s), {} compression worker(s) for {} pending file(s); coalesced_commit_events={}, coalesced_commit_files={}; SQLite progress writes disabled",
-            worker_count,
-            compression_threads,
-            planned_files,
-            BULK_IMPORT_COMMIT_EVENTS,
-            BULK_IMPORT_COMMIT_FILES
-        );
-
-        let (work_tx, work_rx) =
-            mpsc::sync_channel::<Option<(usize, ImportFile)>>(worker_count * 2);
-        let (result_tx, result_rx) = mpsc::sync_channel::<RawWorkerMessage>(worker_count * 4);
-        let shutdown = Arc::new(AtomicBool::new(store.shutdown_requested()));
-
-        let mut workers = Vec::new();
-        let shared_rx = Arc::new(Mutex::new(work_rx));
-        for _ in 0..worker_count {
-            let sender = result_tx.clone();
-            let receiver = Arc::clone(&shared_rx);
-            let shutdown = Arc::clone(&shutdown);
-            workers.push(thread::spawn(move || {
-                raw_import_worker_loop(receiver, sender, shutdown)
-            }));
-        }
-        drop(result_tx);
-
-        let mut scheduled_files = 0usize;
-        for (index, file) in files.iter().cloned().enumerate() {
-            if store.shutdown_requested() {
-                shutdown.store(true, Ordering::SeqCst);
-                info!("store shutdown requested; stopping bulk raw import job scheduling");
-                break;
-            }
-            let path_key = file.path.to_string_lossy().to_string();
-            store.record_imported_raw_file(&path_key, &file.fingerprint, "importing")?;
-            work_tx.send(Some((index, file)))?;
-            scheduled_files += 1;
-        }
-        for _ in 0..worker_count {
-            work_tx.send(None)?;
-        }
-        drop(work_tx);
-
-        let mut states = HashMap::new();
-        let mut all_channel_days = BTreeSet::new();
-        let mut all_user_months = BTreeSet::new();
-        let mut pending_batch = PendingIndexedRawBatch::default();
-        let mut finished = 0usize;
-        while finished < scheduled_files {
-            if store.shutdown_requested() {
-                shutdown.store(true, Ordering::SeqCst);
-            }
-            let message = result_rx
-                .recv()
-                .map_err(|_| anyhow!("bulk raw import worker channel closed unexpectedly"))?;
-            match message {
-                RawWorkerMessage::Chunk(chunk) => {
-                    pending_batch.file_indexes.insert(chunk.file_index);
-                    pending_batch.entries.extend(
-                        chunk
-                            .events
-                            .into_iter()
-                            .map(|event| (chunk.file_index, event)),
-                    );
-                    if pending_batch.entries.len() >= BULK_IMPORT_COMMIT_EVENTS
-                        || pending_batch.file_indexes.len() >= BULK_IMPORT_COMMIT_FILES
-                    {
-                        flush_pending_indexed_raw_batch(
-                            store,
-                            &mut pending_batch,
-                            &mut states,
-                            scheduled_files,
-                        )?;
-                    }
-                }
-                RawWorkerMessage::Progress(progress) => {
-                    let state = states
-                        .entry(progress.file_index)
-                        .or_insert_with(RawFileImportState::default);
-                    state.scanned_lines = progress.scanned_lines;
-                    state.candidate_lines = progress.candidate_lines;
-                    state.parse_errors = progress.parse_errors;
-                    state.parse_skipped = progress.parse_skipped;
-                    let file = &files[progress.file_index];
-                    info!(
-                        "Bulk raw import progress {}: scanned {} lines, imported {}, parse_errors {} (SQLite progress writes disabled)",
-                        file.path.display(),
-                        state.scanned_lines,
-                        state.imported,
-                        state.parse_errors
-                    );
-                }
-                RawWorkerMessage::Finished {
-                    file_index,
-                    scanned_lines,
-                    candidate_lines,
-                    parse_errors,
-                    parse_skipped,
-                } => {
-                    flush_pending_indexed_raw_batch(
-                        store,
-                        &mut pending_batch,
-                        &mut states,
-                        scheduled_files,
-                    )?;
-                    finished += 1;
-                    let file = &files[file_index];
-                    let state = states
-                        .entry(file_index)
-                        .or_insert_with(RawFileImportState::default);
-                    state.scanned_lines = scanned_lines;
-                    state.candidate_lines = candidate_lines;
-                    state.parse_errors = parse_errors;
-                    state.parse_skipped = parse_skipped;
-
-                    merge_state_archives(store, state, file)?;
-                    let status = if state.imported > 0 {
-                        "imported"
-                    } else {
-                        "seen"
-                    };
-                    store.record_imported_raw_file(
-                        &file.path.to_string_lossy(),
-                        &file.fingerprint,
-                        status,
-                    )?;
-                    summary.files_imported += 1;
-                    all_channel_days.extend(state.affected_channel_days.iter().cloned());
-                    all_user_months.extend(state.affected_user_months.iter().cloned());
-                    if self.delete_import_file_if_configured(file, true) {
-                        summary.files_deleted += 1;
-                    }
-                    info!(
-                        "Completed bulk raw import {}/{} {}: scanned {}, raw_candidates {}, imported {}, skipped {}, parse_errors {}",
-                        file_index + 1,
-                        scheduled_files,
-                        file.path.display(),
-                        state.scanned_lines,
-                        state.candidate_lines,
-                        state.imported,
-                        state.skipped_events + state.parse_skipped,
-                        state.parse_errors
-                    );
-                    if finished % BULK_IMPORT_SUMMARY_FILE_INTERVAL == 0
-                        || finished == scheduled_files
-                    {
-                        info!(
-                            "Bulk raw import summary: finished={finished}/{scheduled_files}, imported_files={}, failed_files={}, deleted_files={}, channel_days={}, user_months={}, raw_workers={worker_count}, compression_workers={compression_threads}",
-                            summary.files_imported,
-                            summary.files_failed,
-                            summary.files_deleted,
-                            all_channel_days.len(),
-                            all_user_months.len()
-                        );
-                    }
-                }
-                RawWorkerMessage::Failed {
-                    file_index,
-                    scanned_lines,
-                    candidate_lines,
-                    parse_errors,
-                    parse_skipped,
-                    error,
-                } => {
-                    flush_pending_indexed_raw_batch(
-                        store,
-                        &mut pending_batch,
-                        &mut states,
-                        scheduled_files,
-                    )?;
-                    finished += 1;
-                    let file = &files[file_index];
-                    let state = states
-                        .entry(file_index)
-                        .or_insert_with(RawFileImportState::default);
-                    state.scanned_lines = scanned_lines;
-                    state.candidate_lines = candidate_lines;
-                    state.parse_errors = parse_errors;
-                    state.parse_skipped = parse_skipped;
-                    if !state.affected_channel_days.is_empty() {
-                        merge_state_archives(store, state, file)?;
-                    }
-                    let failed_status = format!("failed:{error}");
-                    let _ = store.record_imported_raw_file(
-                        &file.path.to_string_lossy(),
-                        &file.fingerprint,
-                        &failed_status,
-                    );
-                    summary.files_failed += 1;
-                    warn!(
-                        "Failed bulk raw import for {} after scanning {} lines: {}",
-                        file.path.display(),
-                        state.scanned_lines,
-                        error
-                    );
-                }
-            }
-        }
-
-        flush_pending_indexed_raw_batch(store, &mut pending_batch, &mut states, scheduled_files)?;
-
-        summary.affected_channel_days = all_channel_days.len();
-        summary.affected_user_months = all_user_months.len();
-
-        for worker in workers {
-            let _ = worker.join();
-        }
-        Ok(())
-    }
-
     fn delete_import_file_if_configured(&self, file: &ImportFile, is_raw: bool) -> bool {
         let should_delete = if is_raw {
             self.delete_raw_after_import
@@ -1095,14 +986,109 @@ impl LegacyTxtRuntime {
             );
         }
     }
+
+    fn flush_streaming_month_state(
+        &self,
+        store: &Store,
+        active_month_state: &mut Option<StreamingMonthState>,
+        summary: &mut BulkRawImportSummary,
+        dry_run: bool,
+        files: &mut Vec<ImportFile>,
+        work_tx: Option<&SyncSender<Option<(usize, ImportFile)>>>,
+        result_rx: Option<&Receiver<RawWorkerMessage>>,
+        states: &mut HashMap<usize, RawFileImportState>,
+        pending_batch: &mut PendingIndexedRawBatch,
+        finished: &mut usize,
+        all_channel_days: &mut BTreeSet<ChannelDayKey>,
+        all_user_months: &mut BTreeSet<UserMonthKey>,
+    ) -> Result<()> {
+        let Some(state) = active_month_state.take() else {
+            return Ok(());
+        };
+        for file in state.pending_shards {
+            let decision = should_skip_month_user_shard(
+                &file.path,
+                &state.month_channel_ids,
+                read_v1_skip_sample_lines_from_env(),
+            );
+            match decision {
+                MonthShardDecision::Skip => {
+                    summary.files_skipped_v1_preferred += 1;
+                    info!("Skipped month user shard by proof {}", file.path.display());
+                }
+                MonthShardDecision::KeepNoChannelFiles
+                | MonthShardDecision::KeepMissingId
+                | MonthShardDecision::KeepParseFailure
+                | MonthShardDecision::KeepMissingMonthId
+                | MonthShardDecision::KeepInsufficientSample => {
+                    info!("Month user shard kept for import {}", file.path.display());
+                    if dry_run {
+                        summary.files_selected += 1;
+                        summary.files_pending += 1;
+                    } else if let (Some(work_tx), Some(result_rx)) = (work_tx, result_rx) {
+                        self.schedule_streaming_raw_file(
+                            store,
+                            work_tx,
+                            result_rx,
+                            file,
+                            files,
+                            states,
+                            pending_batch,
+                            finished,
+                            summary,
+                            all_channel_days,
+                            all_user_months,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_streaming_raw_file(
+        &self,
+        store: &Store,
+        work_tx: &SyncSender<Option<(usize, ImportFile)>>,
+        result_rx: &Receiver<RawWorkerMessage>,
+        file: ImportFile,
+        files: &mut Vec<ImportFile>,
+        states: &mut HashMap<usize, RawFileImportState>,
+        pending_batch: &mut PendingIndexedRawBatch,
+        finished: &mut usize,
+        summary: &mut BulkRawImportSummary,
+        all_channel_days: &mut BTreeSet<ChannelDayKey>,
+        all_user_months: &mut BTreeSet<UserMonthKey>,
+    ) -> Result<()> {
+        let path_key = file.path.to_string_lossy().to_string();
+        store.record_imported_raw_file(&path_key, &file.fingerprint, "importing")?;
+        let file_index = files.len();
+        files.push(file.clone());
+        summary.files_selected += 1;
+        summary.files_pending += 1;
+        info!("Queued raw import file {}", file.path.display());
+        schedule_streaming_work(
+            self,
+            work_tx,
+            (file_index, file),
+            store,
+            result_rx,
+            files,
+            states,
+            pending_batch,
+            finished,
+            summary,
+            all_channel_days,
+            all_user_months,
+        )
+    }
 }
 
-#[derive(Debug, Default)]
-struct BulkRawDiscovery {
-    files_scanned: usize,
-    raw_candidates: usize,
-    skipped_v1_preferred: usize,
-    selected: Vec<ImportFile>,
+#[derive(Debug)]
+struct StreamingMonthState {
+    month_root: PathBuf,
+    month_channel_ids: HashSet<String>,
+    pending_shards: Vec<ImportFile>,
 }
 
 fn default_bulk_raw_worker_count() -> usize {
@@ -1146,6 +1132,267 @@ fn merge_state_archives(
         started.elapsed()
     );
     Ok(())
+}
+
+fn ensure_streaming_month_state<'a>(
+    active: &'a mut Option<StreamingMonthState>,
+    location: &V1RawLocation,
+) -> &'a mut StreamingMonthState {
+    if active
+        .as_ref()
+        .is_none_or(|state| state.month_root != location.month_root)
+    {
+        *active = Some(StreamingMonthState {
+            month_root: location.month_root.clone(),
+            month_channel_ids: HashSet::new(),
+            pending_shards: Vec::new(),
+        });
+    }
+    active.as_mut().expect("month state should exist")
+}
+
+fn collect_channel_file_event_ids_into(path: &Path, ids: &mut HashSet<String>) {
+    let _ = for_each_line_in_supported_file(path, |line| {
+        let Some(raw) = extract_raw_irc_line(&line) else {
+            return Ok(());
+        };
+        let Ok(Some(event)) = CanonicalEvent::from_raw(&raw) else {
+            return Ok(());
+        };
+        if let Some(event_uid) = skip_proof_event_uid(&event) {
+            ids.insert(event_uid.to_string());
+        }
+        Ok(())
+    });
+}
+
+fn process_ready_worker_messages(
+    runtime: &LegacyTxtRuntime,
+    store: &Store,
+    result_rx: &Receiver<RawWorkerMessage>,
+    files: &[ImportFile],
+    states: &mut HashMap<usize, RawFileImportState>,
+    pending_batch: &mut PendingIndexedRawBatch,
+    finished: &mut usize,
+    summary: &mut BulkRawImportSummary,
+    all_channel_days: &mut BTreeSet<ChannelDayKey>,
+    all_user_months: &mut BTreeSet<UserMonthKey>,
+) -> Result<()> {
+    loop {
+        match result_rx.try_recv() {
+            Ok(message) => process_next_worker_message(
+                runtime,
+                store,
+                message,
+                files,
+                states,
+                pending_batch,
+                finished,
+                summary,
+                all_channel_days,
+                all_user_months,
+            )?,
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!(
+                    "bulk raw import worker channel closed unexpectedly"
+                ));
+            }
+        }
+    }
+}
+
+fn process_next_worker_message(
+    runtime: &LegacyTxtRuntime,
+    store: &Store,
+    message: RawWorkerMessage,
+    files: &[ImportFile],
+    states: &mut HashMap<usize, RawFileImportState>,
+    pending_batch: &mut PendingIndexedRawBatch,
+    finished: &mut usize,
+    summary: &mut BulkRawImportSummary,
+    all_channel_days: &mut BTreeSet<ChannelDayKey>,
+    all_user_months: &mut BTreeSet<UserMonthKey>,
+) -> Result<()> {
+    match message {
+        RawWorkerMessage::Chunk(chunk) => {
+            pending_batch.file_indexes.insert(chunk.file_index);
+            pending_batch.entries.extend(
+                chunk
+                    .events
+                    .into_iter()
+                    .map(|event| (chunk.file_index, event)),
+            );
+            if pending_batch.entries.len() >= BULK_IMPORT_COMMIT_EVENTS
+                || pending_batch.file_indexes.len() >= BULK_IMPORT_COMMIT_FILES
+            {
+                flush_pending_indexed_raw_batch(
+                    store,
+                    pending_batch,
+                    states,
+                    summary.files_pending.max(1),
+                )?;
+            }
+        }
+        RawWorkerMessage::Progress(progress) => {
+            let state = states
+                .entry(progress.file_index)
+                .or_insert_with(RawFileImportState::default);
+            state.scanned_lines = progress.scanned_lines;
+            state.candidate_lines = progress.candidate_lines;
+            state.parse_errors = progress.parse_errors;
+            state.parse_skipped = progress.parse_skipped;
+            let file = &files[progress.file_index];
+            info!(
+                "Bulk raw import progress {}: scanned {} lines, imported {}, parse_errors {} (SQLite progress writes disabled)",
+                file.path.display(),
+                state.scanned_lines,
+                state.imported,
+                state.parse_errors
+            );
+        }
+        RawWorkerMessage::Finished {
+            file_index,
+            scanned_lines,
+            candidate_lines,
+            parse_errors,
+            parse_skipped,
+        } => {
+            flush_pending_indexed_raw_batch(
+                store,
+                pending_batch,
+                states,
+                summary.files_pending.max(1),
+            )?;
+            *finished += 1;
+            let file = &files[file_index];
+            let state = states
+                .entry(file_index)
+                .or_insert_with(RawFileImportState::default);
+            state.scanned_lines = scanned_lines;
+            state.candidate_lines = candidate_lines;
+            state.parse_errors = parse_errors;
+            state.parse_skipped = parse_skipped;
+
+            merge_state_archives(store, state, file)?;
+            let status = if state.imported > 0 {
+                "imported"
+            } else {
+                "seen"
+            };
+            store.record_imported_raw_file(
+                &file.path.to_string_lossy(),
+                &file.fingerprint,
+                status,
+            )?;
+            summary.files_imported += 1;
+            all_channel_days.extend(state.affected_channel_days.iter().cloned());
+            all_user_months.extend(state.affected_user_months.iter().cloned());
+            if runtime.delete_import_file_if_configured(file, true) {
+                summary.files_deleted += 1;
+            }
+            info!(
+                "Recorded terminal raw import status for {} as {}",
+                file.path.display(),
+                status
+            );
+            info!("Completed archive merge for {}", file.path.display());
+            info!(
+                "Completed bulk raw import {}/{} {}: scanned {}, raw_candidates {}, imported {}, skipped {}, parse_errors {}",
+                file_index + 1,
+                summary.files_pending.max(1),
+                file.path.display(),
+                state.scanned_lines,
+                state.candidate_lines,
+                state.imported,
+                state.skipped_events + state.parse_skipped,
+                state.parse_errors
+            );
+        }
+        RawWorkerMessage::Failed {
+            file_index,
+            scanned_lines,
+            candidate_lines,
+            parse_errors,
+            parse_skipped,
+            error,
+        } => {
+            flush_pending_indexed_raw_batch(
+                store,
+                pending_batch,
+                states,
+                summary.files_pending.max(1),
+            )?;
+            *finished += 1;
+            let file = &files[file_index];
+            let state = states
+                .entry(file_index)
+                .or_insert_with(RawFileImportState::default);
+            state.scanned_lines = scanned_lines;
+            state.candidate_lines = candidate_lines;
+            state.parse_errors = parse_errors;
+            state.parse_skipped = parse_skipped;
+            if !state.affected_channel_days.is_empty() {
+                merge_state_archives(store, state, file)?;
+            }
+            let failed_status = format!("failed:{error}");
+            let _ = store.record_imported_raw_file(
+                &file.path.to_string_lossy(),
+                &file.fingerprint,
+                &failed_status,
+            );
+            summary.files_failed += 1;
+            warn!(
+                "Failed bulk raw import for {} after scanning {} lines: {}",
+                file.path.display(),
+                state.scanned_lines,
+                error
+            );
+        }
+    }
+    Ok(())
+}
+
+fn schedule_streaming_work(
+    runtime: &LegacyTxtRuntime,
+    work_tx: &SyncSender<Option<(usize, ImportFile)>>,
+    item: (usize, ImportFile),
+    store: &Store,
+    result_rx: &Receiver<RawWorkerMessage>,
+    files: &[ImportFile],
+    states: &mut HashMap<usize, RawFileImportState>,
+    pending_batch: &mut PendingIndexedRawBatch,
+    finished: &mut usize,
+    summary: &mut BulkRawImportSummary,
+    all_channel_days: &mut BTreeSet<ChannelDayKey>,
+    all_user_months: &mut BTreeSet<UserMonthKey>,
+) -> Result<()> {
+    let mut pending_item = Some(item);
+    loop {
+        match work_tx.try_send(Some(pending_item.take().unwrap())) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(returned)) => {
+                pending_item = returned;
+                process_next_worker_message(
+                    runtime,
+                    store,
+                    result_rx.recv().map_err(|_| {
+                        anyhow!("bulk raw import worker channel closed unexpectedly")
+                    })?,
+                    files,
+                    states,
+                    pending_batch,
+                    finished,
+                    summary,
+                    all_channel_days,
+                    all_user_months,
+                )?;
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(anyhow!("bulk raw import work queue closed unexpectedly"));
+            }
+        }
+    }
 }
 
 fn flush_pending_indexed_raw_batch(
@@ -1285,157 +1532,20 @@ struct V1ChannelDayKey {
     day: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct V1ChannelMonthKey {
-    channel_id: String,
-    year: i32,
-    month: u32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V1RawPathKind {
     ChannelDay,
     MonthUserShard,
 }
 
-fn prune_v1_preferred_raw_files(files: Vec<ImportFile>) -> (Vec<ImportFile>, usize) {
-    if !is_v1_shard_skip_enabled() {
-        let mut files = files;
-        files.sort_by(|left, right| {
-            v1_raw_sort_rank(&left.path)
-                .cmp(&v1_raw_sort_rank(&right.path))
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        info!("Month shard skip optimization disabled by env; keeping all candidate raw files");
-        return (files, 0);
-    }
-    let sample_lines = read_v1_skip_sample_lines_from_env();
-    let mut kept = Vec::with_capacity(files.len());
-    let mut skipped = 0usize;
-    let mut channel_files_by_month = BTreeMap::<V1ChannelMonthKey, Vec<ImportFile>>::new();
-    let mut month_user_shards = Vec::<(V1ChannelMonthKey, ImportFile)>::new();
-
-    for file in files {
-        match infer_v1_raw_layout(&file.path) {
-            Some((layout, V1RawPathKind::ChannelDay)) => {
-                channel_files_by_month
-                    .entry(layout.month_key())
-                    .or_default()
-                    .push(file);
-            }
-            Some((layout, V1RawPathKind::MonthUserShard)) => {
-                month_user_shards.push((layout.month_key(), file));
-            }
-            None => kept.push(file),
-        }
-    }
-
-    for channel_files in channel_files_by_month.values_mut() {
-        channel_files.sort_by(|left, right| left.path.cmp(&right.path));
-    }
-
-    let mut month_channel_id_cache = HashMap::<V1ChannelMonthKey, HashSet<String>>::new();
-    let mut month_reason_summary = BTreeMap::<V1ChannelMonthKey, MonthShardDecisionSummary>::new();
-
-    for (month_key, file) in month_user_shards {
-        let Some(channel_files) = channel_files_by_month.get(&month_key) else {
-            month_reason_summary
-                .entry(month_key.clone())
-                .or_default()
-                .kept_no_channel_files += 1;
-            kept.push(file);
-            continue;
-        };
-
-        let month_ids = month_channel_id_cache
-            .entry(month_key.clone())
-            .or_insert_with(|| collect_month_channel_event_ids(channel_files));
-
-        match should_skip_month_user_shard(&file.path, month_ids, sample_lines) {
-            MonthShardDecision::Skip => {
-                skipped += 1;
-                month_reason_summary
-                    .entry(month_key.clone())
-                    .or_default()
-                    .skipped += 1;
-            }
-            MonthShardDecision::KeepNoChannelFiles => {
-                month_reason_summary
-                    .entry(month_key.clone())
-                    .or_default()
-                    .kept_no_channel_files += 1;
-                kept.push(file);
-            }
-            MonthShardDecision::KeepParseFailure => {
-                month_reason_summary
-                    .entry(month_key.clone())
-                    .or_default()
-                    .kept_parse_failure += 1;
-                kept.push(file);
-            }
-            MonthShardDecision::KeepMissingId => {
-                month_reason_summary
-                    .entry(month_key.clone())
-                    .or_default()
-                    .kept_missing_id += 1;
-                kept.push(file);
-            }
-            MonthShardDecision::KeepMissingMonthId => {
-                month_reason_summary
-                    .entry(month_key.clone())
-                    .or_default()
-                    .kept_missing_month_id += 1;
-                kept.push(file);
-            }
-            MonthShardDecision::KeepInsufficientSample => {
-                month_reason_summary
-                    .entry(month_key.clone())
-                    .or_default()
-                    .kept_insufficient_sample += 1;
-                kept.push(file);
-            }
-        }
-    }
-
-    for (month_key, channel_files) in channel_files_by_month {
-        let summary = month_reason_summary
-            .get(&month_key)
-            .cloned()
-            .unwrap_or_default();
-        info!(
-            "Month shard skip summary {}/{}/{}: channel_files={}, skipped={}, kept_no_channel_files={}, kept_missing_id={}, kept_parse_failure={}, kept_missing_month_id={}, kept_insufficient_sample={}, sample_lines={}",
-            month_key.channel_id,
-            month_key.year,
-            month_key.month,
-            channel_files.len(),
-            summary.skipped,
-            summary.kept_no_channel_files,
-            summary.kept_missing_id,
-            summary.kept_parse_failure,
-            summary.kept_missing_month_id,
-            summary.kept_insufficient_sample,
-            sample_lines
-        );
-        kept.extend(channel_files);
-    }
-
-    kept.sort_by(|left, right| {
-        v1_raw_sort_rank(&left.path)
-            .cmp(&v1_raw_sort_rank(&right.path))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    (kept, skipped)
+#[derive(Debug, Clone)]
+struct V1RawLocation {
+    layout: V1ChannelDayKey,
+    kind: V1RawPathKind,
+    month_root: PathBuf,
 }
 
-fn v1_raw_sort_rank(path: &Path) -> u8 {
-    match infer_v1_raw_layout(path) {
-        Some((_, V1RawPathKind::ChannelDay)) => 0,
-        Some((_, V1RawPathKind::MonthUserShard)) => 1,
-        None => 2,
-    }
-}
-
-fn infer_v1_raw_layout(path: &Path) -> Option<(V1ChannelDayKey, V1RawPathKind)> {
+fn infer_v1_raw_location(path: &Path) -> Option<V1RawLocation> {
     let components = path
         .components()
         .map(|component| component.as_os_str().to_str())
@@ -1449,51 +1559,33 @@ fn infer_v1_raw_layout(path: &Path) -> Option<(V1ChannelDayKey, V1RawPathKind)> 
         let month = components[components.len() - 3].parse::<u32>().ok()?;
         let year = components[components.len() - 4].parse::<i32>().ok()?;
         let channel_id = components[components.len() - 5].to_string();
-        return Some((
-            V1ChannelDayKey {
+        return Some(V1RawLocation {
+            layout: V1ChannelDayKey {
                 channel_id,
                 year,
                 month,
                 day,
             },
-            V1RawPathKind::ChannelDay,
-        ));
+            kind: V1RawPathKind::ChannelDay,
+            month_root: path.parent()?.parent()?.to_path_buf(),
+        });
     }
     if is_v1_user_shard_filename(file_name) && components.len() >= 4 {
         let month = components[components.len() - 2].parse::<u32>().ok()?;
         let year = components[components.len() - 3].parse::<i32>().ok()?;
         let channel_id = components[components.len() - 4].to_string();
-        return Some((
-            V1ChannelDayKey {
+        return Some(V1RawLocation {
+            layout: V1ChannelDayKey {
                 channel_id,
                 year,
                 month,
                 day: 0,
             },
-            V1RawPathKind::MonthUserShard,
-        ));
+            kind: V1RawPathKind::MonthUserShard,
+            month_root: path.parent()?.to_path_buf(),
+        });
     }
     None
-}
-
-impl V1ChannelDayKey {
-    fn month_key(&self) -> V1ChannelMonthKey {
-        V1ChannelMonthKey {
-            channel_id: self.channel_id.clone(),
-            year: self.year,
-            month: self.month,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct MonthShardDecisionSummary {
-    skipped: usize,
-    kept_no_channel_files: usize,
-    kept_missing_id: usize,
-    kept_parse_failure: usize,
-    kept_missing_month_id: usize,
-    kept_insufficient_sample: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1504,25 +1596,6 @@ enum MonthShardDecision {
     KeepParseFailure,
     KeepMissingMonthId,
     KeepInsufficientSample,
-}
-
-fn collect_month_channel_event_ids(files: &[ImportFile]) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    for file in files {
-        let _ = for_each_line_in_supported_file(&file.path, |line| {
-            let Some(raw) = extract_raw_irc_line(&line) else {
-                return Ok(());
-            };
-            let Ok(Some(event)) = CanonicalEvent::from_raw(&raw) else {
-                return Ok(());
-            };
-            if let Some(event_uid) = skip_proof_event_uid(&event) {
-                ids.insert(event_uid.to_string());
-            }
-            Ok(())
-        });
-    }
-    ids
 }
 
 fn should_skip_month_user_shard(
@@ -1595,7 +1668,7 @@ fn is_v1_user_shard_filename(name: &str) -> bool {
 }
 
 fn looks_like_v1_raw_import_path(path: &Path) -> bool {
-    infer_v1_raw_layout(path).is_some()
+    infer_v1_raw_location(path).is_some()
 }
 
 fn read_max_raw_workers_from_env() -> usize {
@@ -1627,8 +1700,8 @@ fn is_v1_shard_skip_enabled() -> bool {
 }
 
 fn raw_file_matches_channel(file: &ImportFile, channel_id: &str) -> bool {
-    if let Some((key, _)) = infer_v1_raw_layout(&file.path) {
-        return key.channel_id == channel_id;
+    if let Some(location) = infer_v1_raw_location(&file.path) {
+        return location.layout.channel_id == channel_id;
     }
     if let Some((matched_channel_id, _, _, _)) = infer_legacy_path_channel_day(&file.path) {
         if matched_channel_id == channel_id {
