@@ -194,11 +194,13 @@ Useful extra JSON metadata is preserved in message tags when available, such as 
 Large import folders are handled incrementally:
 
 - Raw IRC imports are streamed line-by-line instead of loading full files into memory.
+- Bulk raw import is a streaming one-file-at-a-time pipeline, so it can begin importing before a whole-tree discovery pass finishes.
 - Bulk raw import recognizes v1-style raw layouts by trailing folder structure, not by a literal `v1` directory name.
 - Month-level numeric shard files like `.../<channel>/<year>/<month>/<user_id>.txt(.gz)` are only skipped when `JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION=1`.
 - When that optimization is enabled, a shard is skipped only after a sanity check proves its sampled IRC `id` values already exist in that month’s `.../<channel>/<year>/<month>/<day>/channel.txt(.gz)` data.
 - If a sampled raw line does not parse, lacks a real IRC `id`, or its sampled id is missing from the month channel data, the shard is kept and imported.
 - The importer logs start, periodic progress, and completion summaries through normal tracing output.
+- Bulk raw DB batches and import-triggered archive merges run as low-priority store work, so normal requests and live ingest writes can preempt them between bounded units.
 - Raw progress remains in logs only; intermediate progress checkpoints are no longer written into SQLite.
 - Progress logs are emitted every `100000` scanned lines for long-running raw imports.
 - Archive compression now runs in parallel across independent segment files, capped by `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS`.

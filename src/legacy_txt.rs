@@ -585,7 +585,8 @@ impl LegacyTxtRuntime {
             info!("Discovered raw import file {}", file.path.display());
 
             let path_key = file.path.to_string_lossy().to_string();
-            let is_current = store.imported_raw_file_is_current(&path_key, &file.fingerprint)?;
+            let is_current =
+                store.imported_raw_file_is_current_low_priority(&path_key, &file.fingerprint)?;
             if let Some(location) = month_location.as_ref() {
                 if matches!(location.kind, V1RawPathKind::ChannelDay) && is_v1_shard_skip_enabled()
                 {
@@ -1061,7 +1062,7 @@ impl LegacyTxtRuntime {
         all_user_months: &mut BTreeSet<UserMonthKey>,
     ) -> Result<()> {
         let path_key = file.path.to_string_lossy().to_string();
-        store.record_imported_raw_file(&path_key, &file.fingerprint, "importing")?;
+        store.record_imported_raw_file_low_priority(&path_key, &file.fingerprint, "importing")?;
         let file_index = files.len();
         files.push(file.clone());
         summary.files_selected += 1;
@@ -1125,7 +1126,11 @@ fn merge_state_archives(
         day_keys.len(),
         file.path.display()
     );
-    store.merge_imported_channel_days_into_archives(&day_keys)?;
+    info!(
+        "Import archive merge waiting for low-priority slot for {}",
+        file.path.display()
+    );
+    store.merge_imported_channel_days_into_archives_low_priority(&day_keys)?;
     info!(
         "Completed archive merge for {} in {:?}",
         file.path.display(),
@@ -1280,7 +1285,7 @@ fn process_next_worker_message(
             } else {
                 "seen"
             };
-            store.record_imported_raw_file(
+            store.record_imported_raw_file_low_priority(
                 &file.path.to_string_lossy(),
                 &file.fingerprint,
                 status,
@@ -1336,7 +1341,7 @@ fn process_next_worker_message(
                 merge_state_archives(store, state, file)?;
             }
             let failed_status = format!("failed:{error}");
-            let _ = store.record_imported_raw_file(
+            let _ = store.record_imported_raw_file_low_priority(
                 &file.path.to_string_lossy(),
                 &file.fingerprint,
                 &failed_status,
@@ -1412,7 +1417,7 @@ fn flush_pending_indexed_raw_batch(
         .collect::<Vec<_>>();
     let batch_events = pending_batch.entries.len();
     let batch_started = Instant::now();
-    let outcome = store.insert_indexed_events_batch(&pending_batch.entries)?;
+    let outcome = store.insert_indexed_events_batch_low_priority(&pending_batch.entries)?;
     for (file_index, file_outcome) in outcome.per_file {
         let state = states
             .entry(file_index)

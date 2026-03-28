@@ -29,6 +29,7 @@ use crate::model::{
 thread_local! {
     static STORE_DB_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
     static STORE_IMPORT_DB_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static STORE_DB_PRIORITY_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Clone)]
@@ -39,12 +40,14 @@ pub struct Store {
     archive_enabled: bool,
     compression_executor: Arc<CompressionExecutor>,
     compression_paths: Arc<CompressionPathLocks>,
+    db_priority: Arc<DbPriorityScheduler>,
     shutdown_requested: Arc<AtomicBool>,
 }
 
 struct StoreDbGuard<'a> {
     guard: MutexGuard<'a, Connection>,
     depth: &'static std::thread::LocalKey<Cell<usize>>,
+    _priority: Option<DbPriorityGuard>,
 }
 
 impl Deref for StoreDbGuard<'_> {
@@ -214,8 +217,131 @@ struct PreparedSegmentWrite {
     _path_guard: CompressionPathGuard,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbWorkPriority {
+    Live,
+    Import,
+}
+
+#[derive(Debug, Default)]
+struct DbPriorityState {
+    pending_live: usize,
+    active_live: usize,
+    waiting_import: usize,
+    active_import: usize,
+}
+
+#[derive(Debug, Default)]
+struct DbPriorityScheduler {
+    state: Mutex<DbPriorityState>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct DbPriorityGuard {
+    scheduler: Arc<DbPriorityScheduler>,
+    priority: DbWorkPriority,
+    active: bool,
+}
+
+impl Drop for DbPriorityGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.scheduler.state.lock().unwrap();
+        match self.priority {
+            DbWorkPriority::Live => {
+                state.active_live = state.active_live.saturating_sub(1);
+            }
+            DbWorkPriority::Import => {
+                state.active_import = state.active_import.saturating_sub(1);
+            }
+        }
+        self.scheduler.ready.notify_all();
+        STORE_DB_PRIORITY_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "store db priority depth underflow");
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
 impl Store {
+    fn enter_db_priority(
+        &self,
+        priority: DbWorkPriority,
+        label: &'static str,
+    ) -> Option<DbPriorityGuard> {
+        let already_inside = STORE_DB_PRIORITY_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current > 0 {
+                true
+            } else {
+                depth.set(current + 1);
+                false
+            }
+        });
+        if already_inside {
+            return None;
+        }
+
+        let mut state = self.db_priority.state.lock().unwrap();
+        match priority {
+            DbWorkPriority::Live => {
+                state.pending_live += 1;
+                if state.waiting_import > 0 || state.active_import > 0 {
+                    tracing::info!(
+                        "Live DB work preempted pending import work: {label} (waiting_import={}, active_import={})",
+                        state.waiting_import,
+                        state.active_import
+                    );
+                }
+                state.pending_live = state.pending_live.saturating_sub(1);
+                state.active_live += 1;
+            }
+            DbWorkPriority::Import => {
+                state.waiting_import += 1;
+                let mut logged_wait = false;
+                while state.pending_live > 0 || state.active_live > 0 || state.active_import > 0 {
+                    if !logged_wait {
+                        tracing::info!(
+                            "Import batch waiting for low-priority DB slot: {label} (pending_live={}, active_live={}, active_import={})",
+                            state.pending_live,
+                            state.active_live,
+                            state.active_import
+                        );
+                        logged_wait = true;
+                    }
+                    state = self.db_priority.ready.wait(state).unwrap();
+                }
+                state.waiting_import = state.waiting_import.saturating_sub(1);
+                state.active_import += 1;
+                if logged_wait {
+                    tracing::info!(
+                        "Import batch started after waiting for low-priority DB slot: {label}"
+                    );
+                }
+            }
+        }
+
+        Some(DbPriorityGuard {
+            scheduler: Arc::clone(&self.db_priority),
+            priority,
+            active: true,
+        })
+    }
+
     fn lock_db(&self) -> StoreDbGuard<'_> {
+        self.lock_db_with_priority(DbWorkPriority::Live, "live db")
+    }
+
+    fn lock_db_with_priority(
+        &self,
+        priority: DbWorkPriority,
+        label: &'static str,
+    ) -> StoreDbGuard<'_> {
+        let priority_guard = self.enter_db_priority(priority, label);
         STORE_DB_LOCK_DEPTH.with(|depth| {
             assert!(
                 depth.get() == 0,
@@ -227,10 +353,24 @@ impl Store {
         StoreDbGuard {
             guard,
             depth: &STORE_DB_LOCK_DEPTH,
+            _priority: priority_guard,
         }
     }
 
     fn lock_import_db(&self) -> StoreDbGuard<'_> {
+        self.lock_import_db_with_priority(DbWorkPriority::Live, "live import db")
+    }
+
+    fn lock_import_db_low_priority(&self, label: &'static str) -> StoreDbGuard<'_> {
+        self.lock_import_db_with_priority(DbWorkPriority::Import, label)
+    }
+
+    fn lock_import_db_with_priority(
+        &self,
+        priority: DbWorkPriority,
+        label: &'static str,
+    ) -> StoreDbGuard<'_> {
+        let priority_guard = self.enter_db_priority(priority, label);
         STORE_IMPORT_DB_LOCK_DEPTH.with(|depth| {
             assert!(
                 depth.get() == 0,
@@ -242,6 +382,7 @@ impl Store {
         StoreDbGuard {
             guard,
             depth: &STORE_IMPORT_DB_LOCK_DEPTH,
+            _priority: priority_guard,
         }
     }
 
@@ -268,6 +409,7 @@ impl Store {
                 config.compression.lgwin,
             )),
             compression_paths: Arc::new(CompressionPathLocks::default()),
+            db_priority: Arc::new(DbPriorityScheduler::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
         };
         store.initialize()?;
@@ -405,11 +547,30 @@ impl Store {
         &self,
         events: &[CanonicalEvent],
     ) -> Result<InsertEventsBatchOutcome> {
+        self.insert_events_batch_inner(events, false)
+    }
+
+    pub fn insert_events_batch_low_priority(
+        &self,
+        events: &[CanonicalEvent],
+    ) -> Result<InsertEventsBatchOutcome> {
+        self.insert_events_batch_inner(events, true)
+    }
+
+    fn insert_events_batch_inner(
+        &self,
+        events: &[CanonicalEvent],
+        low_priority: bool,
+    ) -> Result<InsertEventsBatchOutcome> {
         if events.is_empty() {
             return Ok(InsertEventsBatchOutcome::default());
         }
 
-        let mut db = self.lock_import_db();
+        let mut db = if low_priority {
+            self.lock_import_db_low_priority("bulk raw event batch")
+        } else {
+            self.lock_import_db()
+        };
         let tx = db.transaction()?;
         let mut statement = tx.prepare(
             r#"
@@ -459,11 +620,30 @@ impl Store {
         &self,
         events: &[(usize, CanonicalEvent)],
     ) -> Result<IndexedInsertEventsBatchOutcome> {
+        self.insert_indexed_events_batch_inner(events, false)
+    }
+
+    pub fn insert_indexed_events_batch_low_priority(
+        &self,
+        events: &[(usize, CanonicalEvent)],
+    ) -> Result<IndexedInsertEventsBatchOutcome> {
+        self.insert_indexed_events_batch_inner(events, true)
+    }
+
+    fn insert_indexed_events_batch_inner(
+        &self,
+        events: &[(usize, CanonicalEvent)],
+        low_priority: bool,
+    ) -> Result<IndexedInsertEventsBatchOutcome> {
         if events.is_empty() {
             return Ok(IndexedInsertEventsBatchOutcome::default());
         }
 
-        let mut db = self.lock_import_db();
+        let mut db = if low_priority {
+            self.lock_import_db_low_priority("bulk indexed raw event batch")
+        } else {
+            self.lock_import_db()
+        };
         let tx = db.transaction()?;
         let mut statement = tx.prepare(
             r#"
@@ -760,6 +940,33 @@ impl Store {
         Ok(())
     }
 
+    pub fn merge_imported_channel_days_into_archives_low_priority(
+        &self,
+        day_keys: &[ChannelDayKey],
+    ) -> Result<()> {
+        if !self.archive_enabled {
+            return Ok(());
+        }
+        if self.shutdown_requested() {
+            tracing::info!(
+                "store shutdown requested; skipping low-priority imported archive merge"
+            );
+            return Ok(());
+        }
+        let _priority =
+            self.enter_db_priority(DbWorkPriority::Import, "bulk imported archive merge");
+        tracing::info!(
+            "Import archive merge started for {} channel-day partition(s)",
+            day_keys.len()
+        );
+        self.merge_imported_channel_days_into_archives_parallel(day_keys)?;
+        tracing::info!(
+            "Import archive merge completed for {} channel-day partition(s)",
+            day_keys.len()
+        );
+        Ok(())
+    }
+
     pub fn event_count(&self) -> Result<i64> {
         let db = self.lock_db();
         Ok(db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
@@ -774,8 +981,29 @@ impl Store {
     }
 
     pub fn imported_raw_file_is_current(&self, path: &str, fingerprint: &str) -> Result<bool> {
+        self.imported_raw_file_is_current_inner(path, fingerprint, false)
+    }
+
+    pub fn imported_raw_file_is_current_low_priority(
+        &self,
+        path: &str,
+        fingerprint: &str,
+    ) -> Result<bool> {
+        self.imported_raw_file_is_current_inner(path, fingerprint, true)
+    }
+
+    fn imported_raw_file_is_current_inner(
+        &self,
+        path: &str,
+        fingerprint: &str,
+        low_priority: bool,
+    ) -> Result<bool> {
         let lock_started = Instant::now();
-        let db = self.lock_db();
+        let db = if low_priority {
+            self.lock_import_db_low_priority("bulk raw status lookup")
+        } else {
+            self.lock_db()
+        };
         let lock_elapsed = lock_started.elapsed();
         let stored = db
             .query_row(
@@ -867,8 +1095,31 @@ impl Store {
         fingerprint: &str,
         status: &str,
     ) -> Result<()> {
+        self.record_imported_raw_file_inner(path, fingerprint, status, false)
+    }
+
+    pub fn record_imported_raw_file_low_priority(
+        &self,
+        path: &str,
+        fingerprint: &str,
+        status: &str,
+    ) -> Result<()> {
+        self.record_imported_raw_file_inner(path, fingerprint, status, true)
+    }
+
+    fn record_imported_raw_file_inner(
+        &self,
+        path: &str,
+        fingerprint: &str,
+        status: &str,
+        low_priority: bool,
+    ) -> Result<()> {
         let lock_started = Instant::now();
-        let db = self.lock_import_db();
+        let db = if low_priority {
+            self.lock_import_db_low_priority("bulk raw status write")
+        } else {
+            self.lock_import_db()
+        };
         let lock_elapsed = lock_started.elapsed();
         db.execute(
             r#"
@@ -2369,23 +2620,72 @@ pub fn load_lines_from_text_file(path: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    #[test]
-    #[should_panic(
-        expected = "re-entrant Store DB lock on the same thread; drop the outer db guard before calling another Store method"
-    )]
-    fn nested_db_lock_panics_instead_of_deadlocking() {
-        let store = Store {
+    fn test_store() -> Store {
+        Store {
             db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             import_db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             root_dir: PathBuf::new(),
             archive_enabled: false,
             compression_executor: Arc::new(CompressionExecutor::new(1, 5, 22)),
             compression_paths: Arc::new(CompressionPathLocks::default()),
+            db_priority: Arc::new(DbPriorityScheduler::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
-        };
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "re-entrant Store DB lock on the same thread; drop the outer db guard before calling another Store method"
+    )]
+    fn nested_db_lock_panics_instead_of_deadlocking() {
+        let store = test_store();
 
         let _outer = store.lock_db();
         let _inner = store.lock_db();
+    }
+
+    #[test]
+    fn low_priority_db_work_waits_for_live_work() {
+        let store = test_store();
+        let (started_tx, started_rx) = mpsc::channel();
+        let shared = store.clone();
+        let handle = thread::spawn(move || {
+            let _guard = shared.lock_db();
+            started_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        started_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let _guard = store.lock_import_db_low_priority("test low-priority wait");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "low-priority db work should wait for active live work"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn live_db_work_does_not_wait_for_low_priority_gate() {
+        let store = test_store();
+        let (started_tx, started_rx) = mpsc::channel();
+        let shared = store.clone();
+        let handle = thread::spawn(move || {
+            let _guard = shared.lock_import_db_low_priority("test held low-priority slot");
+            started_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        started_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let _guard = store.lock_db();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "live db work should not wait for the low-priority scheduler slot"
+        );
+        handle.join().unwrap();
     }
 }
