@@ -10,8 +10,10 @@ use justlog::app::resolve_channel_logins;
 use justlog::config::Config;
 use justlog::helix::HelixClient;
 use justlog::model::CanonicalEvent;
+use reqwest::Client;
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::time::{Duration, sleep, timeout};
 
 use common::{TestHarness, assert_status_ok, privmsg};
 
@@ -549,6 +551,344 @@ async fn admin_bulk_import_raw_imports_v1_channel_tree() {
 
     unsafe {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+    }
+}
+
+#[tokio::test]
+async fn admin_bulk_import_raw_streaming_can_delete_current_file_and_import_next_file() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let current_file = import_root.join("aa/1/2024/1/1/channel.txt");
+    let next_file = import_root.join("ab/1/2024/1/2/channel.txt");
+    fs::create_dir_all(current_file.parent().unwrap()).unwrap();
+    fs::create_dir_all(next_file.parent().unwrap()).unwrap();
+    fs::write(
+        &current_file,
+        privmsg(
+            "stream-current-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_067_201_000,
+            "already current raw file",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &next_file,
+        privmsg(
+            "stream-next-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "next raw file imported",
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let first_response = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1","limit_files":1}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(first_response.status(), http::StatusCode::OK);
+    assert!(current_file.exists());
+
+    for day in 3..15 {
+        let path = import_root.join(format!("zz/1/2024/1/{day}/channel.txt"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            privmsg(
+                &format!("stream-tail-{day}"),
+                "1",
+                "200",
+                "viewer",
+                "viewer",
+                "channelone",
+                1_704_153_604_000 + i64::from(day) * 1_000,
+                &format!("tail file {day}"),
+            ),
+        )
+        .unwrap();
+    }
+
+    let response = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let _body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(!current_file.exists());
+
+    let route_body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(route_body.contains("next raw file imported"));
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW");
+    }
+}
+
+#[tokio::test]
+async fn bulk_raw_import_allows_live_requests_and_writes_while_running() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    for day in 1..=20 {
+        let path = import_root.join(format!("bulk/1/2024/2/{day}/channel.txt.gz"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut contents = String::new();
+        for line in 0..50 {
+            contents.push_str(&privmsg(
+                &format!("live-coexist-{day}-{line}"),
+                "1",
+                "200",
+                "viewer",
+                "viewer",
+                "channelone",
+                1_707_148_800_000 + i64::from(day * 1_000 + line),
+                &format!("import line {day}-{line}"),
+            ));
+            contents.push('\n');
+        }
+        write_gzip(&path, &contents);
+    }
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let live_event = CanonicalEvent::from_raw(&privmsg(
+        "live-read-seeded-1",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_153_604_000,
+        "seeded live read",
+    ))
+    .unwrap()
+    .unwrap();
+    harness.seed_channel_event(&live_event);
+    let server = harness.spawn_http_server().await;
+    let client = Client::new();
+
+    let import_client = client.clone();
+    let import_url = format!("{}/admin/import/raw", server.base_url);
+    let import_task = tokio::spawn(async move {
+        import_client
+            .post(import_url)
+            .header("X-Api-Key", "secret")
+            .header("content-type", "application/json")
+            .body(r#"{"channel_id":"1"}"#)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    sleep(Duration::from_millis(25)).await;
+
+    let health = timeout(
+        Duration::from_secs(8),
+        client.get(format!("{}/healthz", server.base_url)).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+
+    let live_read = timeout(
+        Duration::from_secs(8),
+        client
+            .get(format!("{}/channelid/1/2024/1/2", server.base_url))
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(live_read.status(), reqwest::StatusCode::OK);
+    assert!(live_read.text().await.unwrap().contains("seeded live read"));
+
+    let store = harness.state.store.clone();
+    let write_event = CanonicalEvent::from_raw(&privmsg(
+        "live-write-seeded-1",
+        "1",
+        "200",
+        "viewer",
+        "viewer",
+        "channelone",
+        1_704_153_605_000,
+        "live write during import",
+    ))
+    .unwrap()
+    .unwrap();
+    timeout(Duration::from_secs(8), async move {
+        tokio::task::spawn_blocking(move || store.insert_event(&write_event))
+            .await
+            .unwrap()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    let import_response = import_task.await.unwrap();
+    assert_eq!(import_response.status(), reqwest::StatusCode::OK);
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+    }
+}
+
+#[tokio::test]
+async fn admin_bulk_import_raw_reprocesses_refetched_file_and_deletes_it_when_current_again() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let import_file = import_root.join("again/1/2024/1/2/channel.txt");
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(
+        &import_file,
+        privmsg(
+            "refetch-raw-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "first fetch",
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_IMPORT_DELETE_RAW", "0");
+        std::env::set_var("JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+
+    let first = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(first.status(), http::StatusCode::OK);
+    assert!(import_file.exists());
+
+    let second = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(second.status(), http::StatusCode::OK);
+    assert!(!import_file.exists());
+
+    sleep(Duration::from_secs(1)).await;
+    fs::create_dir_all(import_file.parent().unwrap()).unwrap();
+    fs::write(
+        &import_file,
+        privmsg(
+            "refetch-raw-2",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_605_000,
+            "second fetch",
+        ),
+    )
+    .unwrap();
+
+    let third = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(third.status(), http::StatusCode::OK);
+    assert!(import_file.exists());
+
+    let route_body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(route_body.contains("first fetch"));
+    assert!(route_body.contains("second fetch"));
+
+    let fourth = harness
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/import/raw")
+                .header("X-Api-Key", "secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"channel_id":"1"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(fourth.status(), http::StatusCode::OK);
+    assert!(!import_file.exists());
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_RAW");
+        std::env::remove_var("JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW");
     }
 }
 

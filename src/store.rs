@@ -2620,20 +2620,28 @@ pub fn load_lines_from_text_file(path: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CanonicalEvent;
     use std::sync::mpsc;
     use std::time::Duration;
+    use tempfile::TempDir;
 
-    fn test_store() -> Store {
-        Store {
-            db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-            import_db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-            root_dir: PathBuf::new(),
-            archive_enabled: false,
+    fn test_store() -> (Store, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let sqlite_path = temp.path().join("test.sqlite3");
+        let root_dir = temp.path().join("logs");
+        fs::create_dir_all(&root_dir).unwrap();
+        let store = Store {
+            db: Arc::new(Mutex::new(Connection::open(&sqlite_path).unwrap())),
+            import_db: Arc::new(Mutex::new(Connection::open(&sqlite_path).unwrap())),
+            root_dir,
+            archive_enabled: true,
             compression_executor: Arc::new(CompressionExecutor::new(1, 5, 22)),
             compression_paths: Arc::new(CompressionPathLocks::default()),
             db_priority: Arc::new(DbPriorityScheduler::default()),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
-        }
+        };
+        store.initialize().unwrap();
+        (store, temp)
     }
 
     #[test]
@@ -2641,7 +2649,7 @@ mod tests {
         expected = "re-entrant Store DB lock on the same thread; drop the outer db guard before calling another Store method"
     )]
     fn nested_db_lock_panics_instead_of_deadlocking() {
-        let store = test_store();
+        let (store, _temp) = test_store();
 
         let _outer = store.lock_db();
         let _inner = store.lock_db();
@@ -2649,7 +2657,7 @@ mod tests {
 
     #[test]
     fn low_priority_db_work_waits_for_live_work() {
-        let store = test_store();
+        let (store, _temp) = test_store();
         let (started_tx, started_rx) = mpsc::channel();
         let shared = store.clone();
         let handle = thread::spawn(move || {
@@ -2670,7 +2678,7 @@ mod tests {
 
     #[test]
     fn live_db_work_does_not_wait_for_low_priority_gate() {
-        let store = test_store();
+        let (store, _temp) = test_store();
         let (started_tx, started_rx) = mpsc::channel();
         let shared = store.clone();
         let handle = thread::spawn(move || {
@@ -2686,6 +2694,141 @@ mod tests {
             started.elapsed() < Duration::from_millis(100),
             "live db work should not wait for the low-priority scheduler slot"
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn imported_raw_status_lookup_low_priority_waits_for_live_work() {
+        let (store, _temp) = test_store();
+        store
+            .record_imported_raw_file("path.txt", "fingerprint", "imported")
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let shared = store.clone();
+        let handle = thread::spawn(move || {
+            let _guard = shared.lock_db();
+            started_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        started_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let is_current = store
+            .imported_raw_file_is_current_low_priority("path.txt", "fingerprint")
+            .unwrap();
+        assert!(is_current);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "low-priority status lookup should wait for live work"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn record_imported_raw_file_low_priority_waits_for_live_work() {
+        let (store, _temp) = test_store();
+        let (started_tx, started_rx) = mpsc::channel();
+        let shared = store.clone();
+        let handle = thread::spawn(move || {
+            let _guard = shared.lock_db();
+            started_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        started_rx.recv().unwrap();
+
+        let started = Instant::now();
+        store
+            .record_imported_raw_file_low_priority("path.txt", "fingerprint", "imported")
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "low-priority status write should wait for live work"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn insert_events_batch_low_priority_waits_for_live_work() {
+        let (store, _temp) = test_store();
+        let event = CanonicalEvent::from_raw("@badge-info=;badges=;color=#1E90FF;display-name=viewer;emotes=;id=batch-low-pri-1;room-id=1;subscriber=0;tmi-sent-ts=1704153604000;turbo=0;user-id=200;user-type= :viewer!viewer@viewer.tmi.twitch.tv PRIVMSG #channelone :hello").unwrap().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let shared = store.clone();
+        let handle = thread::spawn(move || {
+            let _guard = shared.lock_db();
+            started_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        started_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let outcome = store.insert_events_batch_low_priority(&[event]).unwrap();
+        assert_eq!(outcome.inserted, 1);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "low-priority event batch should wait for live work"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn insert_indexed_events_batch_low_priority_waits_for_live_work() {
+        let (store, _temp) = test_store();
+        let event = CanonicalEvent::from_raw("@badge-info=;badges=;color=#1E90FF;display-name=viewer;emotes=;id=batch-low-pri-2;room-id=1;subscriber=0;tmi-sent-ts=1704153605000;turbo=0;user-id=200;user-type= :viewer!viewer@viewer.tmi.twitch.tv PRIVMSG #channelone :hello indexed").unwrap().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let shared = store.clone();
+        let handle = thread::spawn(move || {
+            let _guard = shared.lock_db();
+            started_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        started_rx.recv().unwrap();
+
+        let started = Instant::now();
+        let outcome = store
+            .insert_indexed_events_batch_low_priority(&[(0, event)])
+            .unwrap();
+        assert_eq!(outcome.totals.inserted, 1);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "low-priority indexed event batch should wait for live work"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn merge_imported_channel_days_low_priority_waits_for_live_work_and_completes() {
+        let (store, _temp) = test_store();
+        let event = CanonicalEvent::from_raw("@badge-info=;badges=;color=#1E90FF;display-name=viewer;emotes=;id=archive-low-pri-1;room-id=1;subscriber=0;tmi-sent-ts=1704153606000;turbo=0;user-id=200;user-type= :viewer!viewer@viewer.tmi.twitch.tv PRIVMSG #channelone :archive me").unwrap().unwrap();
+        store.insert_event(&event).unwrap();
+        let key = ChannelDayKey {
+            channel_id: "1".to_string(),
+            year: 2024,
+            month: 1,
+            day: 2,
+        };
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let shared = store.clone();
+        let handle = thread::spawn(move || {
+            let _guard = shared.lock_db();
+            started_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        started_rx.recv().unwrap();
+
+        let started = Instant::now();
+        store
+            .merge_imported_channel_days_into_archives_low_priority(std::slice::from_ref(&key))
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "low-priority archive merge should wait for live work"
+        );
+        let archived = store
+            .read_archived_channel_segment_strict("1", 2024, 1, 2)
+            .unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].text, "archive me");
         handle.join().unwrap();
     }
 }
