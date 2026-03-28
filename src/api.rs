@@ -1067,12 +1067,20 @@ fn docs_response() -> Response {
   <title>JustLogV2 API Docs</title>
   <script type="module" data-cfasync="false" src="/docs/rapidoc-min.js"></script>
   <style>
+    html {{
+      height: 100%;
+    }}
     body {{
+      height: 100%;
       margin: 0;
+      overflow: hidden;
       background: #f6f1e8;
       font-family: "Segoe UI", system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
     }}
     .banner {{
+      flex: 0 0 auto;
       padding: 18px 24px;
       background: linear-gradient(135deg, #1f5f8b, #2d8f85);
       color: #fff8ee;
@@ -1086,6 +1094,11 @@ fn docs_response() -> Response {
       font-size: 14px;
       opacity: 0.92;
     }}
+    rapi-doc {{
+      display: block;
+      flex: 1 1 auto;
+      min-height: 0;
+    }}
   </style>
 </head>
 <body>
@@ -1096,6 +1109,7 @@ fn docs_response() -> Response {
   <rapi-doc
     spec-url="/openapi.yaml"
     render-style="read"
+    update-route="false"
     show-header="false"
     allow-authentication="true"
     allow-try="true"

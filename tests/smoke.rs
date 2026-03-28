@@ -97,8 +97,14 @@ async fn docs_route_points_at_served_openapi_spec() {
     )
     .unwrap();
     assert!(body.contains("spec-url=\"/openapi.yaml\""));
+    assert!(body.contains("update-route=\"false\""));
     assert!(body.contains("src=\"/docs/rapidoc-min.js\""));
     assert!(body.contains("data-cfasync=\"false\""));
+    assert!(body.contains("overflow: hidden;"));
+    assert!(body.contains("display: flex;"));
+    assert!(body.contains("flex-direction: column;"));
+    assert!(body.contains("flex: 1 1 auto;"));
+    assert!(body.contains("min-height: 0;"));
     assert!(!body.contains("https://unpkg.com/rapidoc"));
     assert!(body.contains("rapidoc"));
 }
