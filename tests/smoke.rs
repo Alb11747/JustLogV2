@@ -2,6 +2,7 @@ mod common;
 
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use axum::body::{Body, to_bytes};
@@ -11,7 +12,7 @@ use justlog::config::Config;
 use justlog::helix::HelixClient;
 use justlog::model::CanonicalEvent;
 use reqwest::Client;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::{Duration, sleep, timeout};
 
@@ -27,6 +28,112 @@ fn write_gzip(path: &std::path::Path, content: &str) {
     let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     encoder.write_all(content.as_bytes()).unwrap();
     encoder.finish().unwrap();
+}
+
+fn write_import_fixture(path: &Path, content: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    if path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
+        write_gzip(path, content);
+    } else {
+        fs::write(path, content).unwrap();
+    }
+}
+
+fn tiny_json_export(day: u32, messages: &[(&str, &str, &str, &str)]) -> String {
+    let comments = messages
+        .iter()
+        .enumerate()
+        .map(|(index, (id, display_name, login, body))| {
+            json!({
+                "_id": id,
+                "created_at": format!("2024-01-{day:02}T00:00:{:02}Z", index + 4),
+                "channel_id": "1",
+                "content_id": "vod-1",
+                "commenter": {
+                    "display_name": display_name,
+                    "_id": format!("user-{index}"),
+                    "name": login,
+                    "logo": "https://example.com/logo.png"
+                },
+                "message": {
+                    "body": body,
+                    "user_color": "#8A2BE2",
+                    "user_badges": [],
+                    "emoticons": []
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&json!({
+        "streamer": { "name": "channelone", "id": 1 },
+        "video": { "title": "tiny vod", "id": "vod-1" },
+        "comments": comments
+    }))
+    .unwrap()
+}
+
+fn tiny_simple_text(messages: &[(&str, &str)]) -> String {
+    messages
+        .iter()
+        .map(|(time, line)| format!("[{time}] {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tiny_debug_raw_log(messages: &[(&str, i64, &str)]) -> String {
+    let mut lines = vec![
+        "2024-03-21 14:09:30.120 httpx 1 DEBUG: unrelated line".to_string(),
+        "2024-03-21 14:09:30.121 irc.client 1221 DEBUG: _dispatcher: all_raw_messages".to_string(),
+    ];
+    lines.extend(messages.iter().map(|(id, timestamp_ms, text)| {
+        format!(
+            "2024-03-21 14:09:30.126 irc.client 333 DEBUG: FROM SERVER: {}",
+            privmsg(
+                id,
+                "1",
+                "200",
+                "viewer",
+                "viewer",
+                "channelone",
+                *timestamp_ms,
+                text,
+            )
+        )
+    }));
+    lines.push(
+        "2024-03-21 14:09:30.127 irc.client 402 DEBUG: command: pubmsg".to_string(),
+    );
+    lines.join("\n")
+}
+
+async fn import_fixture_day_and_return_body(path: &Path, content: &str) -> String {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let full_path = import_root.join(path);
+    write_import_fixture(&full_path, content);
+    unsafe {
+        std::env::set_var("JUSTLOG_IMPORT_FOLDER", import_root.as_os_str());
+        std::env::set_var("JUSTLOG_LEGACY_TXT_MODE", "missing_only");
+        std::env::set_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST", "1");
+    }
+
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let body = harness
+        .response_text(
+            Request::builder()
+                .uri("/channelid/1/2024/1/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
+        std::env::remove_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST");
+    }
+    body
 }
 
 #[test]
@@ -227,6 +334,104 @@ async fn import_folder_raw_import_merges_into_existing_archived_day() {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
     }
+}
+
+#[tokio::test]
+async fn json_import_file_loads_messages_for_requested_day() {
+    let body = import_fixture_day_and_return_body(
+        Path::new("formats/1/2024/1/2.json"),
+        &tiny_json_export(
+            2,
+            &[
+                ("json-small-1", "Json Small One", "jsonsmallone", "json import alpha"),
+                ("json-small-2", "Json Small Two", "jsonsmalltwo", "json import beta"),
+            ],
+        ),
+    )
+    .await;
+
+    assert!(body.contains("json import alpha"));
+    assert!(body.contains("json import beta"));
+}
+
+#[tokio::test]
+async fn json_gzip_import_file_loads_messages_for_requested_day() {
+    let body = import_fixture_day_and_return_body(
+        Path::new("formats/1/2024/1/2.json.gz"),
+        &tiny_json_export(
+            2,
+            &[
+                ("json-gz-small-1", "Json Gz One", "jsongzone", "json gz import alpha"),
+                ("json-gz-small-2", "Json Gz Two", "jsongztwo", "json gz import beta"),
+            ],
+        ),
+    )
+    .await;
+
+    assert!(body.contains("json gz import alpha"));
+    assert!(body.contains("json gz import beta"));
+}
+
+#[tokio::test]
+async fn simple_text_import_file_loads_messages_for_requested_day() {
+    let body = import_fixture_day_and_return_body(
+        Path::new("[1-2-24] channelone - Tiny Chat.txt"),
+        &tiny_simple_text(&[
+            ("0:00:04", "Text User One: txt import alpha"),
+            ("0:00:09", "Text User Two: txt import beta"),
+        ]),
+    )
+    .await;
+
+    assert!(body.contains("txt import alpha"));
+    assert!(body.contains("txt import beta"));
+}
+
+#[tokio::test]
+async fn simple_text_gzip_import_file_loads_messages_for_requested_day() {
+    let body = import_fixture_day_and_return_body(
+        Path::new("[1-2-24] channelone - Tiny Chat.txt.gz"),
+        &tiny_simple_text(&[
+            ("0:00:04", "Text Gz One: txt gz import alpha"),
+            ("0:00:09", "Text Gz Two: txt gz import beta"),
+        ]),
+    )
+    .await;
+
+    assert!(body.contains("txt gz import alpha"));
+    assert!(body.contains("txt gz import beta"));
+}
+
+#[tokio::test]
+async fn raw_log_import_file_extracts_from_server_privmsg_lines() {
+    let body = import_fixture_day_and_return_body(
+        Path::new("raw/1/2024/1/2.log"),
+        &tiny_debug_raw_log(&[
+            ("log-small-1", 1_704_153_604_000, "log import alpha"),
+            ("log-small-2", 1_704_153_609_000, "log import beta"),
+        ]),
+    )
+    .await;
+
+    assert!(body.contains("log import alpha"));
+    assert!(body.contains("log import beta"));
+    assert!(!body.contains("unrelated line"));
+}
+
+#[tokio::test]
+async fn raw_log_gzip_import_file_extracts_from_server_privmsg_lines() {
+    let body = import_fixture_day_and_return_body(
+        Path::new("raw/1/2024/1/2.log.gz"),
+        &tiny_debug_raw_log(&[
+            ("log-gz-small-1", 1_704_153_604_000, "log gz import alpha"),
+            ("log-gz-small-2", 1_704_153_609_000, "log gz import beta"),
+        ]),
+    )
+    .await;
+
+    assert!(body.contains("log gz import alpha"));
+    assert!(body.contains("log gz import beta"));
+    assert!(!body.contains("unrelated line"));
 }
 
 #[tokio::test]
