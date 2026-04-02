@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::api;
+use crate::clock::SharedClock;
 use crate::compact::spawn_compactor;
 use crate::config::{Config, SharedConfig};
 use crate::debug_sync::{DebugRuntime, run_startup_validation};
@@ -50,6 +51,7 @@ pub struct AppState {
     pub legacy_txt: Arc<LegacyTxtRuntime>,
     pub debug_runtime: Arc<DebugRuntime>,
     pub ingest: Arc<RwLock<Option<IngestManager>>>,
+    pub clock: SharedClock,
     pub start_time: Instant,
     pub optout_codes: Arc<Mutex<HashMap<String, Instant>>>,
 }
@@ -61,10 +63,11 @@ pub async fn run_cli() -> Result<()> {
     let debug_runtime = Arc::new(DebugRuntime::from_env(&config.logs_directory)?);
     let legacy_txt = Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory));
     let recent_messages = Arc::new(RecentMessagesRuntime::from_env());
+    let clock = SharedClock::real();
 
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let store = Store::open(&config)?;
-    run_startup_validation(debug_runtime.clone(), store.clone(), chrono::Utc::now()).await?;
+    run_startup_validation(debug_runtime.clone(), store.clone(), clock.now_utc()).await?;
 
     if let Some(Commands::ImportLegacy { source }) = cli.command {
         let imported = import_legacy_logs(&store, &source)?;
@@ -82,7 +85,8 @@ pub async fn run_cli() -> Result<()> {
         legacy_txt,
         debug_runtime: debug_runtime.clone(),
         ingest: ingest_slot.clone(),
-        start_time: Instant::now(),
+        clock: clock.clone(),
+        start_time: clock.now_instant(),
         optout_codes: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -95,6 +99,7 @@ pub async fn run_cli() -> Result<()> {
         store.clone(),
         command_service,
         recent_messages,
+        clock.clone(),
     );
     *ingest_slot.write().await = Some(ingest.clone());
 
@@ -104,6 +109,7 @@ pub async fn run_cli() -> Result<()> {
         shared_config.clone(),
         store.clone(),
         debug_runtime,
+        clock.clone(),
         shutdown_rx.clone(),
     );
 
@@ -278,7 +284,12 @@ impl ChatCommandService for CommandService {
                 if !self.is_admin(&event.username).await {
                     return Ok(());
                 }
-                let uptime = format_duration(self.state.start_time.elapsed());
+                let uptime = format_duration(
+                    self.state
+                        .clock
+                        .now_instant()
+                        .saturating_duration_since(self.state.start_time),
+                );
                 self.say(
                     &event.channel_login,
                     &format!("{}, uptime: {}", event.display_name, uptime),
@@ -379,7 +390,7 @@ impl CommandService {
         {
             let mut codes = self.state.optout_codes.lock().await;
             if let Some(expires_at) = codes.remove(&args[0]) {
-                if expires_at <= Instant::now() {
+                if expires_at <= self.state.clock.now_instant() {
                     return Ok(());
                 }
                 if let Some(user_id) = event.user_id.clone() {

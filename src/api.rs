@@ -262,7 +262,7 @@ async fn optout_handler(state: AppState) -> Result<Response> {
             .optout_codes
             .lock()
             .await
-            .insert(code.clone(), Instant::now() + Duration::from_secs(60));
+            .insert(code.clone(), state.clock.now_instant() + Duration::from_secs(60));
     }
     let state_clone = state.clone();
     let code_clone = code.clone();
@@ -474,11 +474,12 @@ async fn range_response(
     request: LogRequest,
     accept_encoding: &str,
 ) -> Result<Response> {
+    let now = state.clock.now_utc();
     let from = request
         .time
         .from
-        .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
-    let to = request.time.to.unwrap_or_else(Utc::now);
+        .unwrap_or_else(|| now - chrono::Duration::days(30));
+    let to = request.time.to.unwrap_or(now);
     let mut events = if let Some(user_id) = request.user_id.as_deref() {
         let store = state.store.clone();
         let channel_id = request.channel_id.clone();
@@ -706,7 +707,7 @@ async fn parse_log_request(state: &AppState, uri: &Uri, content_type: &str) -> R
             .map(|capture| u32::from_str(capture.as_str()))
             .transpose()?;
     } else {
-        let now = Utc::now();
+        let now = state.clock.now_utc();
         time.year = Some(now.year());
         time.month = Some(now.month());
         if !is_user_request {
@@ -1147,6 +1148,7 @@ where
 mod tests {
     use super::dispatch;
     use crate::app::AppState;
+    use crate::clock::SharedClock;
     use crate::config::Config;
     use crate::debug_sync::DebugRuntime;
     use crate::helix::HelixClient;
@@ -1161,7 +1163,6 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Instant;
     use tempfile::TempDir;
     use tokio::sync::{Mutex, RwLock};
 
@@ -1207,6 +1208,7 @@ mod tests {
         config.normalize().unwrap();
         let shared_config = Arc::new(RwLock::new(config.clone()));
         let store = Store::open(&config).unwrap();
+        let clock = SharedClock::real();
         AppState {
             config: shared_config,
             store,
@@ -1214,7 +1216,8 @@ mod tests {
             legacy_txt: Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory)),
             debug_runtime: Arc::new(DebugRuntime::disabled()),
             ingest: Arc::new(RwLock::new(None)),
-            start_time: Instant::now(),
+            clock: clock.clone(),
+            start_time: clock.now_instant(),
             optout_codes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1232,6 +1235,7 @@ mod tests {
             state.store.clone(),
             Arc::new(NoopCommands),
             Arc::new(RecentMessagesRuntime::disabled()),
+            state.clock.clone(),
         );
         *state.ingest.write().await = Some(ingest.clone());
         ingest.start(Vec::new()).await;

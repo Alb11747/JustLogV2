@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration as StdDuration;
 
 use axum::body::{Body, to_bytes};
 use axum::extract::Request as AxumRequest;
@@ -11,8 +11,11 @@ use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{TimeZone, Utc};
 use justlog::api;
 use justlog::app::{AppState, CommandService, resolve_channel_logins};
+use justlog::clock::FakeClock;
+use justlog::compact::spawn_compactor;
 use justlog::config::Config;
 use justlog::debug_sync::DebugRuntime;
 use justlog::helix::{HelixClient, UserData};
@@ -25,9 +28,9 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep};
+use tokio::time::timeout;
 use tower::util::ServiceExt;
 
 #[derive(Clone)]
@@ -58,36 +61,20 @@ impl MockHelix {
                 .collect::<Vec<_>>();
             let ids = values
                 .iter()
-                .filter_map(|(key, value)| {
-                    if key == "id" {
-                        Some(value.clone())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|(key, value)| (key == "id").then_some(value.clone()))
                 .collect::<Vec<_>>();
             let logins = values
                 .iter()
-                .filter_map(|(key, value)| {
-                    if key == "login" {
-                        Some(value.clone())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|(key, value)| (key == "login").then_some(value.clone()))
                 .collect::<Vec<_>>();
-            if !ids.is_empty() {
-                for id in ids {
-                    if let Some(user) = state.users.get(&id) {
-                        data.push(user.clone());
-                    }
+            for id in ids {
+                if let Some(user) = state.users.get(&id) {
+                    data.push(user.clone());
                 }
             }
-            if !logins.is_empty() {
-                for login in logins {
-                    if let Some(user) = state.by_login.get(&login.to_lowercase()) {
-                        data.push(user.clone());
-                    }
+            for login in logins {
+                if let Some(user) = state.by_login.get(&login.to_lowercase()) {
+                    data.push(user.clone());
                 }
             }
             Json(json!({ "data": data }))
@@ -118,7 +105,6 @@ impl MockHelix {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        sleep(Duration::from_millis(50)).await;
         Self { address }
     }
 
@@ -177,7 +163,6 @@ impl MockJustLogServer {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        sleep(Duration::from_millis(50)).await;
         Self { address, routes }
     }
 
@@ -215,7 +200,9 @@ impl MockJustLogServer {
 pub struct MockIrc {
     pub address: SocketAddr,
     connections: Arc<Mutex<Vec<mpsc::UnboundedSender<ServerEvent>>>>,
+    connection_notify: Arc<Notify>,
     client_lines: Arc<Mutex<Vec<String>>>,
+    line_notify: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -229,38 +216,85 @@ impl MockIrc {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let connections = Arc::new(Mutex::new(Vec::new()));
+        let connection_notify = Arc::new(Notify::new());
         let client_lines = Arc::new(Mutex::new(Vec::new()));
+        let line_notify = Arc::new(Notify::new());
         let connections_clone = connections.clone();
+        let connection_notify_clone = connection_notify.clone();
         let client_lines_clone = client_lines.clone();
+        let line_notify_clone = line_notify.clone();
         tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let (tx, rx) = mpsc::unbounded_channel();
                 connections_clone.lock().await.push(tx);
+                connection_notify_clone.notify_waiters();
                 let client_lines = client_lines_clone.clone();
-                tokio::spawn(handle_irc_connection(socket, rx, client_lines));
+                let line_notify = line_notify_clone.clone();
+                tokio::spawn(handle_irc_connection(socket, rx, client_lines, line_notify));
             }
         });
         Self {
             address,
             connections,
+            connection_notify,
             client_lines,
+            line_notify,
         }
     }
 
     pub async fn wait_for_connections(&self, count: usize) {
-        for _ in 0..50 {
-            if self.connections.lock().await.len() >= count {
-                return;
+        timeout(StdDuration::from_secs(5), async {
+            loop {
+                if self.connections.lock().await.len() >= count {
+                    return;
+                }
+                self.connection_notify.notified().await;
             }
-            sleep(Duration::from_millis(100)).await;
-        }
-        panic!("timed out waiting for {count} IRC connections");
+        })
+        .await
+        .unwrap();
+    }
+
+    pub async fn wait_for_connection_count(&self, count: usize) {
+        self.wait_for_connections(count).await;
+    }
+
+    pub async fn wait_for_client_line_contains(&self, needle: &str) -> String {
+        timeout(StdDuration::from_secs(5), async {
+            loop {
+                if let Some(line) = self
+                    .client_lines
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|line| line.contains(needle))
+                    .cloned()
+                {
+                    return line;
+                }
+                self.line_notify.notified().await;
+            }
+        })
+        .await
+        .unwrap()
     }
 
     pub async fn broadcast_line(&self, line: &str) {
         for connection in self.connections.lock().await.iter() {
             let _ = connection.send(ServerEvent::Line(line.to_string()));
+        }
+    }
+
+    pub async fn send_to_connection(&self, index: usize, line: &str) {
+        if let Some(connection) = self.connections.lock().await.get(index).cloned() {
+            let _ = connection.send(ServerEvent::Line(line.to_string()));
+        }
+    }
+
+    pub async fn close_connection(&self, index: usize) {
+        if let Some(connection) = self.connections.lock().await.get(index).cloned() {
+            let _ = connection.send(ServerEvent::Close);
         }
     }
 
@@ -284,6 +318,7 @@ async fn handle_irc_connection(
     socket: TcpStream,
     mut rx: mpsc::UnboundedReceiver<ServerEvent>,
     client_lines: Arc<Mutex<Vec<String>>>,
+    line_notify: Arc<Notify>,
 ) {
     let (reader_half, mut writer_half) = socket.into_split();
     let mut reader = BufReader::new(reader_half).lines();
@@ -291,7 +326,10 @@ async fn handle_irc_connection(
         tokio::select! {
             line = reader.next_line() => {
                 match line {
-                    Ok(Some(line)) => client_lines.lock().await.push(line),
+                    Ok(Some(line)) => {
+                        client_lines.lock().await.push(line);
+                        line_notify.notify_waiters();
+                    }
                     _ => return,
                 }
             }
@@ -309,42 +347,71 @@ async fn handle_irc_connection(
     }
 }
 
+pub struct TestHarnessOptions {
+    pub channel_ids: Vec<String>,
+    pub start_ingest: bool,
+    pub start_compactor: bool,
+    pub debug_runtime: Arc<DebugRuntime>,
+    pub recent_messages_runtime: Arc<RecentMessagesRuntime>,
+    pub oauth: String,
+    pub metrics_enabled: bool,
+    pub initial_time: chrono::DateTime<Utc>,
+    pub compact_interval_seconds: u64,
+    pub compact_after_channel_days: i64,
+    pub compact_after_user_months: i64,
+}
+
+impl Default for TestHarnessOptions {
+    fn default() -> Self {
+        Self {
+            channel_ids: vec!["1".to_string()],
+            start_ingest: true,
+            start_compactor: false,
+            debug_runtime: Arc::new(DebugRuntime::disabled()),
+            recent_messages_runtime: Arc::new(RecentMessagesRuntime::disabled()),
+            oauth: "oauth:777777777".to_string(),
+            metrics_enabled: false,
+            initial_time: Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap(),
+            compact_interval_seconds: 60,
+            compact_after_channel_days: 7,
+            compact_after_user_months: 3,
+        }
+    }
+}
+
 pub struct TestHarness {
     pub _temp: TempDir,
     pub state: AppState,
     pub router: Router,
     pub irc: MockIrc,
+    pub clock: FakeClock,
+    _shutdown: watch::Sender<bool>,
 }
 
 impl TestHarness {
     pub async fn start(channel_ids: Vec<String>) -> Self {
-        Self::start_with_options(
+        Self::start_with_options(TestHarnessOptions {
             channel_ids,
-            true,
-            Arc::new(DebugRuntime::disabled()),
-            Arc::new(RecentMessagesRuntime::disabled()),
-        )
+            ..Default::default()
+        })
         .await
     }
 
     pub async fn start_anonymous(channel_ids: Vec<String>) -> Self {
-        Self::start_with_options_and_oauth(
+        Self::start_with_options(TestHarnessOptions {
             channel_ids,
-            true,
-            Arc::new(DebugRuntime::disabled()),
-            Arc::new(RecentMessagesRuntime::disabled()),
-            "",
-        )
+            oauth: String::new(),
+            ..Default::default()
+        })
         .await
     }
 
     pub async fn start_without_ingest(channel_ids: Vec<String>) -> Self {
-        Self::start_with_options(
+        Self::start_with_options(TestHarnessOptions {
             channel_ids,
-            false,
-            Arc::new(DebugRuntime::disabled()),
-            Arc::new(RecentMessagesRuntime::disabled()),
-        )
+            start_ingest: false,
+            ..Default::default()
+        })
         .await
     }
 
@@ -353,12 +420,12 @@ impl TestHarness {
         start_ingest: bool,
         debug_runtime: Arc<DebugRuntime>,
     ) -> Self {
-        Self::start_with_options(
+        Self::start_with_options(TestHarnessOptions {
             channel_ids,
             start_ingest,
             debug_runtime,
-            Arc::new(RecentMessagesRuntime::disabled()),
-        )
+            ..Default::default()
+        })
         .await
     }
 
@@ -367,38 +434,16 @@ impl TestHarness {
         start_ingest: bool,
         recent_messages_runtime: Arc<RecentMessagesRuntime>,
     ) -> Self {
-        Self::start_with_options(
+        Self::start_with_options(TestHarnessOptions {
             channel_ids,
             start_ingest,
-            Arc::new(DebugRuntime::disabled()),
             recent_messages_runtime,
-        )
+            ..Default::default()
+        })
         .await
     }
 
-    async fn start_with_options(
-        channel_ids: Vec<String>,
-        start_ingest: bool,
-        debug_runtime: Arc<DebugRuntime>,
-        recent_messages_runtime: Arc<RecentMessagesRuntime>,
-    ) -> Self {
-        Self::start_with_options_and_oauth(
-            channel_ids,
-            start_ingest,
-            debug_runtime,
-            recent_messages_runtime,
-            "oauth:777777777",
-        )
-        .await
-    }
-
-    async fn start_with_options_and_oauth(
-        channel_ids: Vec<String>,
-        start_ingest: bool,
-        debug_runtime: Arc<DebugRuntime>,
-        recent_messages_runtime: Arc<RecentMessagesRuntime>,
-        oauth: &str,
-    ) -> Self {
+    pub async fn start_with_options(options: TestHarnessOptions) -> Self {
         let users = vec![
             user("1", "channelone"),
             user("2", "channeltwo"),
@@ -417,16 +462,25 @@ impl TestHarness {
                 "logsDirectory": logs_dir.to_string_lossy(),
                 "adminAPIKey": "secret",
                 "username": "justinfan777777",
-                "oauth": oauth,
+                "oauth": options.oauth,
                 "botVerified": false,
                 "clientID": "client",
                 "clientSecret": "secret",
                 "logLevel": "info",
-                "channels": channel_ids,
+                "channels": options.channel_ids,
                 "archive": true,
                 "listenAddress": ":0",
                 "helix": { "baseUrl": helix_server.base_url() },
-                "irc": { "server": "127.0.0.1", "port": irc.address.port(), "tls": false }
+                "irc": { "server": "127.0.0.1", "port": irc.address.port(), "tls": false },
+                "storage": {
+                    "compactIntervalSeconds": options.compact_interval_seconds,
+                    "compactAfterChannelDays": options.compact_after_channel_days,
+                    "compactAfterUserMonths": options.compact_after_user_months
+                },
+                "ops": {
+                    "metricsEnabled": options.metrics_enabled,
+                    "metricsRoute": "/metrics"
+                }
             }))
             .unwrap(),
         )
@@ -436,23 +490,28 @@ impl TestHarness {
         let store = Store::open(&config).unwrap();
         let helix = HelixClient::new(&config);
         let ingest_slot = Arc::new(RwLock::new(None));
+        let clock = FakeClock::new(options.initial_time);
+        let shared_clock = clock.shared();
         let state = AppState {
             config: shared_config.clone(),
             store: store.clone(),
             helix: helix.clone(),
             legacy_txt: Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory)),
-            debug_runtime,
+            debug_runtime: options.debug_runtime,
             ingest: ingest_slot.clone(),
-            start_time: Instant::now(),
+            clock: shared_clock.clone(),
+            start_time: shared_clock.now_instant(),
             optout_codes: Arc::new(Mutex::new(HashMap::new())),
         };
-        if start_ingest {
+
+        if options.start_ingest {
             let command_service = Arc::new(CommandService::new(state.clone()));
             let ingest = IngestManager::new(
                 shared_config.clone(),
                 store.clone(),
                 command_service,
-                recent_messages_runtime,
+                options.recent_messages_runtime,
+                shared_clock.clone(),
             );
             *ingest_slot.write().await = Some(ingest.clone());
             let initial_logins = resolve_channel_logins(&helix, &config.channels)
@@ -460,12 +519,26 @@ impl TestHarness {
                 .unwrap();
             ingest.start(initial_logins).await;
         }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        if options.start_compactor {
+            spawn_compactor(
+                shared_config.clone(),
+                store.clone(),
+                state.debug_runtime.clone(),
+                shared_clock,
+                shutdown_rx,
+            );
+        }
+
         let router = api::router(state.clone());
         Self {
             _temp: temp,
             state,
             router,
             irc,
+            clock,
+            _shutdown: shutdown_tx,
         }
     }
 
@@ -520,6 +593,51 @@ impl TestHarness {
             .unwrap();
     }
 
+    pub async fn wait_for_event_count(&self, expected: i64) {
+        timeout(StdDuration::from_secs(5), async {
+            loop {
+                if self.state.store.event_count().unwrap() == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    pub async fn wait_for_channel_segment(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+    ) {
+        timeout(StdDuration::from_secs(5), async {
+            loop {
+                if self
+                    .state
+                    .store
+                    .channel_raw_plan(channel_id, year, month, day)
+                    .unwrap()
+                    .segment_path
+                    .is_some()
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    pub async fn advance_time(&self, duration: StdDuration) {
+        self.clock.advance(duration);
+        tokio::time::advance(duration).await;
+        tokio::task::yield_now().await;
+    }
+
     pub async fn spawn_http_server(&self) -> HttpServerHandle {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -527,7 +645,6 @@ impl TestHarness {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        sleep(Duration::from_millis(50)).await;
         HttpServerHandle {
             base_url: format!("http://{address}"),
             task,

@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -16,6 +15,7 @@ use tokio_native_tls::{TlsConnector, native_tls};
 use tracing::{error, info, warn};
 use twitch_irc::message::{IRCMessage, ServerMessage};
 
+use crate::clock::SharedClock;
 use crate::config::Config;
 use crate::model::{CanonicalEvent, OutboundMessage};
 use crate::recent_messages::RecentMessagesRuntime;
@@ -37,6 +37,7 @@ pub struct IngestManager {
     store: Store,
     commands: Arc<dyn ChatCommandService>,
     recent_messages: Arc<RecentMessagesRuntime>,
+    clock: SharedClock,
     client: reqwest::Client,
     outbound: broadcast::Sender<OutboundCommand>,
     shutdown: watch::Sender<bool>,
@@ -73,6 +74,7 @@ impl IngestManager {
         store: Store,
         commands: Arc<dyn ChatCommandService>,
         recent_messages: Arc<RecentMessagesRuntime>,
+        clock: SharedClock,
     ) -> Self {
         let (outbound, _) = broadcast::channel(1024);
         let (shutdown, _) = watch::channel(false);
@@ -81,6 +83,7 @@ impl IngestManager {
             store,
             commands,
             recent_messages,
+            clock,
             client: reqwest::Client::new(),
             outbound,
             shutdown,
@@ -174,7 +177,7 @@ impl IngestManager {
         let (reader_half, mut writer_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader_half).lines();
         let mut outbound_rx = self.outbound.subscribe();
-        let identity = irc_identity(&config);
+        let identity = irc_identity(&config, &self.clock);
 
         write_irc_line(&mut writer_half, &identity.pass_line).await?;
         write_irc_line(&mut writer_half, &format!("NICK {}", identity.nick)).await?;
@@ -386,11 +389,11 @@ async fn connect_stream(config: &Config) -> Result<BoxedStream> {
     }
 }
 
-fn irc_identity(config: &Config) -> IrcIdentity {
+fn irc_identity(config: &Config, clock: &SharedClock) -> IrcIdentity {
     if config.oauth.trim().is_empty() {
         IrcIdentity {
             pass_line: "PASS _".to_string(),
-            nick: generate_justinfan_username(),
+            nick: generate_justinfan_username(clock),
             anonymous: true,
         }
     } else {
@@ -402,11 +405,8 @@ fn irc_identity(config: &Config) -> IrcIdentity {
     }
 }
 
-fn generate_justinfan_username() -> String {
-    let digits = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() % 1_000_000_000)
-        .unwrap_or(0);
+fn generate_justinfan_username(clock: &SharedClock) -> String {
+    let digits = clock.now_unix_nanos() % 1_000_000_000;
     format!("justinfan{digits}")
 }
 
@@ -423,7 +423,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{generate_justinfan_username, irc_identity};
+    use crate::clock::{FakeClock, SharedClock};
     use crate::config::Config;
+    use chrono::{TimeZone, Utc};
+
+    fn test_clock() -> SharedClock {
+        FakeClock::new(Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap()).shared()
+    }
 
     #[test]
     fn anonymous_identity_uses_placeholder_pass_and_generated_justinfan_nick() {
@@ -436,7 +442,7 @@ mod tests {
         .unwrap();
         config.normalize().unwrap();
 
-        let identity = irc_identity(&config);
+        let identity = irc_identity(&config, &test_clock());
 
         assert_eq!(identity.pass_line, "PASS _");
         assert!(identity.anonymous);
@@ -456,7 +462,7 @@ mod tests {
         .unwrap();
         config.normalize().unwrap();
 
-        let identity = irc_identity(&config);
+        let identity = irc_identity(&config, &test_clock());
 
         assert_eq!(identity.pass_line, "PASS oauth:test-token");
         assert_eq!(identity.nick, "loggerbot");
@@ -465,7 +471,7 @@ mod tests {
 
     #[test]
     fn generated_justinfan_username_has_numeric_suffix() {
-        let nick = generate_justinfan_username();
+        let nick = generate_justinfan_username(&test_clock());
         assert!(nick.starts_with("justinfan"));
         assert!(nick[9..].chars().all(|ch| ch.is_ascii_digit()));
     }

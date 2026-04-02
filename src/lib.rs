@@ -1,5 +1,6 @@
 pub mod api;
 pub mod app;
+pub mod clock;
 pub mod compact;
 pub mod config;
 pub mod debug_sync;
