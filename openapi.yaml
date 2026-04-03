@@ -7,6 +7,9 @@ info:
     JustLogV2 stores Twitch chat and exposes HTTP routes for channel lists, archived log reads,
     import workflows, and a few admin operations.
 
+    Browser CORS is enabled by default for non-credentialed requests. By default the server
+    allows `Access-Control-Allow-Origin: *`; operators can tighten that behavior with env vars.
+
     The log-reading routes intentionally support multiple response modes:
     - JSON chat payloads with `?json=1` or `?type=json`
     - plain text log rendering by default

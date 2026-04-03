@@ -178,6 +178,15 @@ Recent-message backfill is also env-only:
 - `JUSTLOG_RECENT_MESSAGES_URL=<base-url>`
 - `JUSTLOG_RECENT_MESSAGES_LIMIT=<n>`
 
+Browser CORS is env-only as well:
+
+- `JUSTLOG_CORS_ENABLED=0|1`
+- `JUSTLOG_CORS_ALLOW_ORIGINS=*|<comma-separated origins>`
+- `JUSTLOG_CORS_ALLOW_METHODS=<comma-separated methods>`
+- `JUSTLOG_CORS_ALLOW_HEADERS=*|<comma-separated headers>`
+- `JUSTLOG_CORS_EXPOSE_HEADERS=<comma-separated headers>`
+- `JUSTLOG_CORS_MAX_AGE_SECONDS=<n>`
+
 Behavior summary:
 
 - Raw IRC `.txt` and `.txt.gz` files found under the import folder are imported into native storage.
@@ -193,6 +202,7 @@ Behavior summary:
 - `JUSTLOG_IMPORT_MAX_RAW_WORKERS` caps concurrent raw-file parsing workers during `POST /admin/import/raw`. Default is `min(available_parallelism, 8)`.
 - `JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION` enables or disables the month-level numeric shard skip optimization for v1-style raw layouts. Default is `1`.
 - `JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES` controls how many raw IRC lines must be sampled from a month-level numeric shard before it can be skipped as redundant. Default is `5`.
+- Default CORS behavior is open to any origin for non-credentialed browser reads, with optional env-based allowlist tightening.
 
 ## Ingestion Pipeline
 

@@ -17,6 +17,7 @@ use justlog::app::{AppState, CommandService, resolve_channel_logins};
 use justlog::clock::FakeClock;
 use justlog::compact::spawn_compactor;
 use justlog::config::Config;
+use justlog::cors::CorsRuntime;
 use justlog::debug_sync::DebugRuntime;
 use justlog::helix::{HelixClient, UserData};
 use justlog::ingest::IngestManager;
@@ -498,6 +499,7 @@ impl TestHarness {
             helix: helix.clone(),
             legacy_txt: Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory)),
             debug_runtime: options.debug_runtime,
+            cors: Arc::new(CorsRuntime::from_env()),
             ingest: ingest_slot.clone(),
             clock: shared_clock.clone(),
             start_time: shared_clock.now_instant(),

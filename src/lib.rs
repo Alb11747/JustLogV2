@@ -3,6 +3,7 @@ pub mod app;
 pub mod clock;
 pub mod compact;
 pub mod config;
+pub mod cors;
 pub mod debug_sync;
 pub mod helix;
 pub mod import;

@@ -20,6 +20,7 @@ use crate::api;
 use crate::clock::SharedClock;
 use crate::compact::spawn_compactor;
 use crate::config::{Config, SharedConfig};
+use crate::cors::CorsRuntime;
 use crate::debug_sync::{DebugRuntime, run_startup_validation};
 use crate::helix::HelixClient;
 use crate::import::import_legacy_logs;
@@ -50,6 +51,7 @@ pub struct AppState {
     pub helix: HelixClient,
     pub legacy_txt: Arc<LegacyTxtRuntime>,
     pub debug_runtime: Arc<DebugRuntime>,
+    pub cors: Arc<CorsRuntime>,
     pub ingest: Arc<RwLock<Option<IngestManager>>>,
     pub clock: SharedClock,
     pub start_time: Instant,
@@ -61,6 +63,7 @@ pub async fn run_cli() -> Result<()> {
     let config = Config::load(&cli.config)?;
     init_tracing(&config.log_level);
     let debug_runtime = Arc::new(DebugRuntime::from_env(&config.logs_directory)?);
+    let cors = Arc::new(CorsRuntime::from_env());
     let legacy_txt = Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory));
     let recent_messages = Arc::new(RecentMessagesRuntime::from_env());
     let clock = SharedClock::real();
@@ -84,6 +87,7 @@ pub async fn run_cli() -> Result<()> {
         helix: helix.clone(),
         legacy_txt,
         debug_runtime: debug_runtime.clone(),
+        cors,
         ingest: ingest_slot.clone(),
         clock: clock.clone(),
         start_time: clock.now_instant(),

@@ -56,6 +56,24 @@ For Postman or similar tools, import `openapi.yaml` directly from the repo or po
 
 Any HTTP API change must update `openapi.yaml` in the same change. Treat route additions, removals, request or response shape changes, status code changes, auth changes, and path/query contract changes as OpenAPI-sensitive by default.
 
+## CORS
+
+JustLogV2 enables browser CORS by default for public, non-credentialed requests. Out of the box, the API is readable from any origin with `Access-Control-Allow-Origin: *`, which makes it easy to call from a frontend hosted on a different domain.
+
+Supported env flags:
+
+- `JUSTLOG_CORS_ENABLED=0|1`: enable or disable CORS handling. Default is `1`.
+- `JUSTLOG_CORS_ALLOW_ORIGINS=*|<comma-separated origins>`: allowed origins. Default is `*`.
+- `JUSTLOG_CORS_ALLOW_METHODS=<comma-separated methods>`: advertised cross-origin methods. Default is `GET,POST,DELETE,OPTIONS`.
+- `JUSTLOG_CORS_ALLOW_HEADERS=*|<comma-separated headers>`: advertised allowed request headers. Default is `Content-Type,X-Api-Key`.
+- `JUSTLOG_CORS_EXPOSE_HEADERS=<comma-separated headers>`: response headers exposed to browser JavaScript. Default is empty.
+- `JUSTLOG_CORS_MAX_AGE_SECONDS=<n>`: preflight cache TTL in seconds. Default is `86400`.
+
+Important limitation:
+
+- The default wildcard origin mode is for non-credentialed browser access. It does not enable credentialed CORS and does not emit `Access-Control-Allow-Credentials: true`.
+- If you need stricter browser access control, set `JUSTLOG_CORS_ALLOW_ORIGINS` to an explicit allowlist instead of `*`.
+
 ## Recent Message Backfill
 
 JustLogV2 can optionally fetch short-gap missed chat from Robotty's recent-messages API and store it through the normal ingest pipeline. This path is env-driven, off by default, and best-effort only.

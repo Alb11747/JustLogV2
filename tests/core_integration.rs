@@ -3,6 +3,7 @@ mod common;
 
 use std::io::Read as _;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
@@ -13,6 +14,11 @@ use serde_json::Value;
 use tokio::time::timeout;
 
 use common::{MockJustLogServer, TestHarness, TestHarnessOptions, privmsg};
+
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 fn decode_brotli(bytes: &[u8]) -> String {
     let mut output = String::new();
@@ -49,7 +55,14 @@ async fn meta_docs_and_metrics_routes_are_served() {
     assert_eq!(root.status(), StatusCode::FOUND);
     assert_eq!(root.headers().get("location").unwrap(), "/docs");
 
-    for path in ["/healthz", "/readyz", "/openapi.yaml", "/docs", "/docs/rapidoc-min.js", "/metrics"] {
+    for path in [
+        "/healthz",
+        "/readyz",
+        "/openapi.yaml",
+        "/docs",
+        "/docs/rapidoc-min.js",
+        "/metrics",
+    ] {
         let response = harness
             .request(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await;
@@ -76,7 +89,12 @@ async fn meta_docs_and_metrics_routes_are_served() {
     assert!(docs.contains("src=\"/docs/rapidoc-min.js\""));
 
     let metrics = harness
-        .response_text(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .response_text(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await;
     assert!(metrics.contains("justlog_events_total"));
 }
@@ -87,7 +105,12 @@ async fn channel_admin_list_and_optout_routes_cover_core_controls() {
     harness.irc.wait_for_connections(2).await;
 
     let channels = harness
-        .request(Request::builder().uri("/channels").body(Body::empty()).unwrap())
+        .request(
+            Request::builder()
+                .uri("/channels")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await;
     assert_eq!(channels.status(), StatusCode::OK);
 
@@ -103,7 +126,10 @@ async fn channel_admin_list_and_optout_routes_cover_core_controls() {
         )
         .await;
     assert_eq!(add.status(), StatusCode::OK);
-    harness.irc.wait_for_client_line_contains("JOIN #channeltwo").await;
+    harness
+        .irc
+        .wait_for_client_line_contains("JOIN #channeltwo")
+        .await;
 
     let list_by_login = harness
         .request(
@@ -159,7 +185,13 @@ async fn channel_admin_list_and_optout_routes_cover_core_controls() {
                 .unwrap(),
         )
         .await;
-    let code = String::from_utf8(to_bytes(optout.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    let code = String::from_utf8(
+        to_bytes(optout.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     let code = serde_json::from_str::<String>(&code).unwrap();
 
     harness
@@ -175,7 +207,10 @@ async fn channel_admin_list_and_optout_routes_cover_core_controls() {
             &format!("!justlog optout {code}"),
         ))
         .await;
-    harness.irc.wait_for_client_line_contains("opted you out").await;
+    harness
+        .irc
+        .wait_for_client_line_contains("opted you out")
+        .await;
 
     let blocked = harness
         .request(
@@ -199,7 +234,174 @@ async fn channel_admin_list_and_optout_routes_cover_core_controls() {
         )
         .await;
     assert_eq!(remove.status(), StatusCode::OK);
-    harness.irc.wait_for_client_line_contains("PART #channeltwo").await;
+    harness
+        .irc
+        .wait_for_client_line_contains("PART #channeltwo")
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cors_defaults_allow_any_origin_and_preflight() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::remove_var("JUSTLOG_CORS_ENABLED");
+        std::env::remove_var("JUSTLOG_CORS_ALLOW_ORIGINS");
+        std::env::remove_var("JUSTLOG_CORS_ALLOW_METHODS");
+        std::env::remove_var("JUSTLOG_CORS_ALLOW_HEADERS");
+        std::env::remove_var("JUSTLOG_CORS_EXPOSE_HEADERS");
+        std::env::remove_var("JUSTLOG_CORS_MAX_AGE_SECONDS");
+    }
+
+    let harness = TestHarness::start_with_options(TestHarnessOptions {
+        start_ingest: false,
+        ..Default::default()
+    })
+    .await;
+
+    let get_response = harness
+        .request(
+            Request::builder()
+                .uri("/healthz")
+                .header("Origin", "https://app.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        get_response
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+
+    let preflight = harness
+        .request(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/admin/channels")
+                .header("Origin", "https://app.example")
+                .header("Access-Control-Request-Method", "POST")
+                .header("Access-Control-Request-Headers", "content-type,x-api-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-methods")
+            .unwrap(),
+        "GET,POST,DELETE,OPTIONS"
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-headers")
+            .unwrap(),
+        "Content-Type,X-Api-Key"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cors_can_be_disabled_or_restricted_by_env() {
+    let _guard = env_lock().lock().await;
+    unsafe {
+        std::env::set_var("JUSTLOG_CORS_ENABLED", "0");
+    }
+    let disabled = TestHarness::start_with_options(TestHarnessOptions {
+        start_ingest: false,
+        ..Default::default()
+    })
+    .await;
+    let disabled_response = disabled
+        .request(
+            Request::builder()
+                .uri("/healthz")
+                .header("Origin", "https://app.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(
+        disabled_response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+
+    unsafe {
+        std::env::set_var(
+            "JUSTLOG_CORS_ALLOW_ORIGINS",
+            "https://allowed.example, https://other.example",
+        );
+        std::env::set_var("JUSTLOG_CORS_ENABLED", "1");
+        std::env::set_var("JUSTLOG_CORS_EXPOSE_HEADERS", "ETag");
+    }
+    let restricted = TestHarness::start_with_options(TestHarnessOptions {
+        start_ingest: false,
+        ..Default::default()
+    })
+    .await;
+
+    let allowed = restricted
+        .request(
+            Request::builder()
+                .uri("/healthz")
+                .header("Origin", "https://allowed.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "https://allowed.example"
+    );
+    assert_eq!(allowed.headers().get("vary").unwrap(), "Origin");
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-expose-headers")
+            .unwrap(),
+        "ETag"
+    );
+
+    let denied = restricted
+        .request(
+            Request::builder()
+                .uri("/healthz")
+                .header("Origin", "https://denied.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(
+        denied
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+    assert_eq!(denied.headers().get("vary").unwrap(), "Origin");
+
+    unsafe {
+        std::env::remove_var("JUSTLOG_CORS_ENABLED");
+        std::env::remove_var("JUSTLOG_CORS_ALLOW_ORIGINS");
+        std::env::remove_var("JUSTLOG_CORS_ALLOW_METHODS");
+        std::env::remove_var("JUSTLOG_CORS_ALLOW_HEADERS");
+        std::env::remove_var("JUSTLOG_CORS_EXPOSE_HEADERS");
+        std::env::remove_var("JUSTLOG_CORS_MAX_AGE_SECONDS");
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -356,13 +558,28 @@ async fn ingest_is_event_driven_and_recovers_with_backfill() {
     .await;
 
     harness.irc.wait_for_connections(2).await;
-    harness.irc.wait_for_client_line_contains("PASS oauth:").await;
-    harness.irc.wait_for_client_line_contains("NICK justinfan777777").await;
+    harness
+        .irc
+        .wait_for_client_line_contains("PASS oauth:")
+        .await;
+    harness
+        .irc
+        .wait_for_client_line_contains("NICK justinfan777777")
+        .await;
     harness.irc.wait_for_client_line_contains("CAP REQ").await;
-    harness.irc.wait_for_client_line_contains("JOIN #channelone").await;
+    harness
+        .irc
+        .wait_for_client_line_contains("JOIN #channelone")
+        .await;
 
-    harness.irc.send_to_connection(0, "PING :tmi.twitch.tv").await;
-    harness.irc.wait_for_client_line_contains("PONG :tmi.twitch.tv").await;
+    harness
+        .irc
+        .send_to_connection(0, "PING :tmi.twitch.tv")
+        .await;
+    harness
+        .irc
+        .wait_for_client_line_contains("PONG :tmi.twitch.tv")
+        .await;
 
     harness
         .irc
@@ -418,7 +635,10 @@ async fn ingest_is_event_driven_and_recovers_with_backfill() {
         )
         .await;
     assert_eq!(join.status(), StatusCode::OK);
-    harness.irc.wait_for_client_line_contains("JOIN #channeltwo").await;
+    harness
+        .irc
+        .wait_for_client_line_contains("JOIN #channeltwo")
+        .await;
 
     harness
         .irc
@@ -433,7 +653,10 @@ async fn ingest_is_event_driven_and_recovers_with_backfill() {
             "!justlog part channeltwo",
         ))
         .await;
-    harness.irc.wait_for_client_line_contains("PART #channeltwo").await;
+    harness
+        .irc
+        .wait_for_client_line_contains("PART #channeltwo")
+        .await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -441,8 +664,16 @@ async fn anonymous_ingest_stop_and_optout_expiry_do_not_wait_on_wall_clock() {
     let harness = TestHarness::start_anonymous(vec!["1".to_string()]).await;
     harness.irc.wait_for_connections(2).await;
     harness.irc.wait_for_client_line_contains("PASS _").await;
-    let nick_line = harness.irc.wait_for_client_line_contains("NICK justinfan").await;
-    assert!(nick_line.trim_start_matches("NICK justinfan").chars().all(|ch| ch.is_ascii_digit()));
+    let nick_line = harness
+        .irc
+        .wait_for_client_line_contains("NICK justinfan")
+        .await;
+    assert!(
+        nick_line
+            .trim_start_matches("NICK justinfan")
+            .chars()
+            .all(|ch| ch.is_ascii_digit())
+    );
 
     let optout = harness
         .request(
@@ -453,7 +684,13 @@ async fn anonymous_ingest_stop_and_optout_expiry_do_not_wait_on_wall_clock() {
                 .unwrap(),
         )
         .await;
-    let code = String::from_utf8(to_bytes(optout.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    let code = String::from_utf8(
+        to_bytes(optout.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     let code = serde_json::from_str::<String>(&code).unwrap();
     assert!(harness.state.optout_codes.lock().await.contains_key(&code));
     tokio::task::yield_now().await;
@@ -470,14 +707,7 @@ async fn anonymous_ingest_stop_and_optout_expiry_do_not_wait_on_wall_clock() {
     .unwrap();
 
     harness.irc.reconnect_first().await;
-    harness
-        .state
-        .ingest
-        .read()
-        .await
-        .clone()
-        .unwrap()
-        .stop();
+    harness.state.ingest.read().await.clone().unwrap().stop();
     harness.advance_time(Duration::from_secs(1)).await;
     assert_eq!(harness.irc.connection_count().await, 2);
 }

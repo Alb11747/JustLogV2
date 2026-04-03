@@ -91,66 +91,86 @@ async fn dispatch_router(State(state): State<AppState>, request: Request) -> Res
 }
 
 pub async fn dispatch(state: AppState, request: Request) -> Response {
+    let request_headers = request.headers().clone();
+    let request_method = request.method().clone();
+
+    if let Some(response) = state
+        .cors
+        .preflight_response(&request_method, &request_headers)
+    {
+        return response;
+    }
+
     let path = request.uri().path().to_string();
     info!("HTTP request start: {} {}", request.method(), path);
-    {
+    let mut response = {
         let config = state.config.read().await;
         if config.ops.metrics_enabled && path == config.ops.metrics_route {
             let count = state.store.event_count().unwrap_or_default();
-            return Response::builder()
+            Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "text/plain; charset=utf-8")
                 .body(Body::from(format!("justlog_events_total {count}\n")))
-                .unwrap();
-        }
-    }
-    match (request.method().clone(), path.as_str()) {
-        (_, "/healthz") => StatusCode::OK.into_response(),
-        (_, "/readyz") => StatusCode::OK.into_response(),
-        (_, "/") => docs_redirect_response(),
-        (_, "/openapi.yaml") => openapi_response(),
-        (_, "/docs") => docs_response(),
-        (_, "/docs/rapidoc-min.js") => docs_rapidoc_js_response(),
-        (_, "/channels") => match channels_handler(state).await {
-            Ok(response) => response,
-            Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-        },
-        (_, "/list") => match list_handler(state, request.uri()).await {
-            Ok(response) => response,
-            Err(error) => error_response(StatusCode::NOT_FOUND, &error.to_string()),
-        },
-        (Method::POST, "/optout") => match optout_handler(state).await {
-            Ok(response) => response,
-            Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-        },
-        (Method::POST, "/admin/channels") => {
-            match admin_channels_handler(state, request, true).await {
-                Ok(response) => response,
-                Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
-            }
-        }
-        (Method::DELETE, "/admin/channels") => {
-            match admin_channels_handler(state, request, false).await {
-                Ok(response) => response,
-                Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
-            }
-        }
-        (Method::POST, "/admin/import/raw") => match admin_import_raw_handler(state, request).await
-        {
-            Ok(response) => response,
-            Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
-        },
-        _ => match log_handler(state, request).await {
-            Ok(response) => response,
-            Err(error) => {
-                if error.to_string() == "route not found" {
-                    root_response().into_response()
-                } else {
-                    error_response(StatusCode::NOT_FOUND, &error.to_string())
+                .unwrap()
+        } else {
+            match (request.method().clone(), path.as_str()) {
+                (_, "/healthz") => StatusCode::OK.into_response(),
+                (_, "/readyz") => StatusCode::OK.into_response(),
+                (_, "/") => docs_redirect_response(),
+                (_, "/openapi.yaml") => openapi_response(),
+                (_, "/docs") => docs_response(),
+                (_, "/docs/rapidoc-min.js") => docs_rapidoc_js_response(),
+                (_, "/channels") => match channels_handler(state.clone()).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+                    }
+                },
+                (_, "/list") => match list_handler(state.clone(), request.uri()).await {
+                    Ok(response) => response,
+                    Err(error) => error_response(StatusCode::NOT_FOUND, &error.to_string()),
+                },
+                (Method::POST, "/optout") => match optout_handler(state.clone()).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+                    }
+                },
+                (Method::POST, "/admin/channels") => {
+                    match admin_channels_handler(state.clone(), request, true).await {
+                        Ok(response) => response,
+                        Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+                    }
                 }
+                (Method::DELETE, "/admin/channels") => {
+                    match admin_channels_handler(state.clone(), request, false).await {
+                        Ok(response) => response,
+                        Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+                    }
+                }
+                (Method::POST, "/admin/import/raw") => {
+                    match admin_import_raw_handler(state.clone(), request).await {
+                        Ok(response) => response,
+                        Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+                    }
+                }
+                _ => match log_handler(state.clone(), request).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if error.to_string() == "route not found" {
+                            root_response().into_response()
+                        } else {
+                            error_response(StatusCode::NOT_FOUND, &error.to_string())
+                        }
+                    }
+                },
             }
-        },
-    }
+        }
+    };
+    state
+        .cors
+        .apply_response_headers(&request_headers, &mut response);
+    response
 }
 
 async fn channels_handler(state: AppState) -> Result<Response> {
@@ -258,11 +278,10 @@ async fn list_handler(state: AppState, uri: &Uri) -> Result<Response> {
 async fn optout_handler(state: AppState) -> Result<Response> {
     let code = random_string(6);
     {
-        state
-            .optout_codes
-            .lock()
-            .await
-            .insert(code.clone(), state.clock.now_instant() + Duration::from_secs(60));
+        state.optout_codes.lock().await.insert(
+            code.clone(),
+            state.clock.now_instant() + Duration::from_secs(60),
+        );
     }
     let state_clone = state.clone();
     let code_clone = code.clone();
@@ -1150,6 +1169,7 @@ mod tests {
     use crate::app::AppState;
     use crate::clock::SharedClock;
     use crate::config::Config;
+    use crate::cors::CorsRuntime;
     use crate::debug_sync::DebugRuntime;
     use crate::helix::HelixClient;
     use crate::ingest::{ChatCommandService, IngestManager};
@@ -1215,6 +1235,7 @@ mod tests {
             helix: HelixClient::new(&config),
             legacy_txt: Arc::new(LegacyTxtRuntime::from_env(&config.logs_directory)),
             debug_runtime: Arc::new(DebugRuntime::disabled()),
+            cors: Arc::new(CorsRuntime::disabled()),
             ingest: Arc::new(RwLock::new(None)),
             clock: clock.clone(),
             start_time: clock.now_instant(),
