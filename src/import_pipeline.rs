@@ -1527,7 +1527,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "[0:00:04] SomeUser: hello").unwrap();
 
-        let events = parse_simple_text_file(&path).unwrap();
+        let events = parse_simple_text_file(&RealImportIo, &path).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].room_id, "1");
         assert_eq!(events[0].text, "hello");
@@ -1544,7 +1544,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = parse_json_file(&path).unwrap();
+        let events = parse_json_file(&RealImportIo, &path).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].room_id, "1");
         assert_eq!(events[0].text, "json imported");

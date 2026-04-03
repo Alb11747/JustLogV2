@@ -37,6 +37,7 @@ pub struct Store {
     db: Arc<Mutex<Connection>>,
     import_db: Arc<Mutex<Connection>>,
     root_dir: PathBuf,
+    sqlite_path: PathBuf,
     archive_enabled: bool,
     compact_after_channel_days: i64,
     compact_after_user_months: i64,
@@ -122,6 +123,23 @@ pub struct ReconciliationOutcome {
     pub unhealthy: i64,
     pub last_error: Option<String>,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatabaseSizeStats {
+    pub page_size: i64,
+    pub page_count: i64,
+    pub freelist_count: i64,
+    pub live_pages: i64,
+    pub main_bytes: u64,
+    pub free_bytes: u64,
+    pub live_bytes: u64,
+    pub wal_bytes: u64,
+}
+
+const DB_RECLAIM_INCREMENTAL_FREE_BYTES: u64 = 4 * 1024 * 1024;
+const DB_RECLAIM_FULL_VACUUM_FREE_BYTES: u64 = 16 * 1024 * 1024;
+const DB_RECLAIM_FREE_RATIO_NUMERATOR: u64 = 1;
+const DB_RECLAIM_FREE_RATIO_DENOMINATOR: u64 = 5;
 
 impl CompressionExecutor {
     fn new(worker_count: usize, quality: u32, lgwin: u32) -> Self {
@@ -404,6 +422,7 @@ impl Store {
             db: Arc::new(Mutex::new(connection)),
             import_db: Arc::new(Mutex::new(import_connection)),
             root_dir: config.logs_directory.clone(),
+            sqlite_path: config.storage.sqlite_path.clone(),
             archive_enabled: config.archive,
             compact_after_channel_days: config.storage.compact_after_channel_days,
             compact_after_user_months: config.storage.compact_after_user_months,
@@ -992,6 +1011,7 @@ impl Store {
             return Ok(());
         }
         self.compact_user_partitions_parallel(&user_keys)?;
+        self.reclaim_database_space_low_priority()?;
         Ok(())
     }
 
@@ -1040,6 +1060,45 @@ impl Store {
     pub fn event_count(&self) -> Result<i64> {
         let db = self.lock_db();
         Ok(db.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
+    }
+
+    pub fn database_size_stats(&self) -> Result<DatabaseSizeStats> {
+        let db = self.lock_db();
+        let page_size = db.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?;
+        let page_count = db.pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))?;
+        let freelist_count =
+            db.pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))?;
+        drop(db);
+
+        let live_pages = page_count.saturating_sub(freelist_count);
+        let main_bytes = fs::metadata(&self.sqlite_path)
+            .map(|meta| meta.len())
+            .unwrap_or_default();
+        let wal_path = self.sqlite_path.with_extension(format!(
+            "{}-wal",
+            self.sqlite_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+        ));
+        let wal_bytes = fs::metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or_default();
+        Ok(DatabaseSizeStats {
+            page_size,
+            page_count,
+            freelist_count,
+            live_pages,
+            main_bytes,
+            free_bytes: (page_size.max(0) as u64) * (freelist_count.max(0) as u64),
+            live_bytes: (page_size.max(0) as u64) * (live_pages.max(0) as u64),
+            wal_bytes,
+        })
+    }
+
+    pub fn reclaim_database_space_low_priority(&self) -> Result<()> {
+        let mut db = self.lock_import_db_low_priority("database maintenance");
+        self.reclaim_database_space_with_connection(&mut db)
     }
 
     pub fn request_shutdown(&self) {
@@ -1733,6 +1792,39 @@ impl Store {
             "Compression install completed: target={}",
             prepared.relative_path
         );
+        Ok(())
+    }
+
+    fn reclaim_database_space_with_connection(&self, db: &mut Connection) -> Result<()> {
+        db.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+        let page_size = db.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?;
+        let freelist_count =
+            db.pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))?;
+        let page_count = db.pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))?;
+        let auto_vacuum =
+            db.pragma_query_value(None, "auto_vacuum", |row| row.get::<_, i64>(0))?;
+
+        let free_bytes = (page_size.max(0) as u64) * (freelist_count.max(0) as u64);
+        let page_count_u64 = page_count.max(0) as u64;
+        let free_pages_u64 = freelist_count.max(0) as u64;
+        let high_free_ratio = page_count_u64 > 0
+            && free_pages_u64.saturating_mul(DB_RECLAIM_FREE_RATIO_DENOMINATOR)
+                >= page_count_u64.saturating_mul(DB_RECLAIM_FREE_RATIO_NUMERATOR);
+
+        if free_bytes < DB_RECLAIM_INCREMENTAL_FREE_BYTES {
+            return Ok(());
+        }
+
+        if auto_vacuum == 2 {
+            db.execute_batch("PRAGMA incremental_vacuum; PRAGMA wal_checkpoint(TRUNCATE);")?;
+            return Ok(());
+        }
+
+        if free_bytes >= DB_RECLAIM_FULL_VACUUM_FREE_BYTES && high_free_ratio {
+            db.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+            db.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")?;
+        }
         Ok(())
     }
 
@@ -3067,6 +3159,7 @@ mod tests {
             db: Arc::new(Mutex::new(Connection::open(&sqlite_path).unwrap())),
             import_db: Arc::new(Mutex::new(Connection::open(&sqlite_path).unwrap())),
             root_dir,
+            sqlite_path,
             archive_enabled: true,
             compact_after_channel_days: 30,
             compact_after_user_months: 6,
@@ -3265,5 +3358,43 @@ mod tests {
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].text, "archive me");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn reclaim_database_space_reduces_free_pages_after_archival_delete() {
+        let (store, _temp) = test_store();
+        let key = ChannelDayKey {
+            channel_id: "1".to_string(),
+            year: 2024,
+            month: 1,
+            day: 2,
+        };
+        let payload = "x".repeat(4096);
+        let mut events = Vec::new();
+        for index in 0..6000usize {
+            let raw = format!(
+                "@badge-info=;badges=;color=#1E90FF;display-name=viewer;emotes=;id=db-size-{index};room-id=1;subscriber=0;tmi-sent-ts={};turbo=0;user-id=200;user-type= :viewer!viewer@viewer.tmi.twitch.tv PRIVMSG #channelone :{}",
+                1_704_153_600_000i64 + index as i64,
+                payload
+            );
+            events.push(CanonicalEvent::from_raw(&raw).unwrap().unwrap());
+        }
+        let outcome = store.insert_events_batch(&events).unwrap();
+        assert_eq!(outcome.inserted, events.len());
+
+        store.compact_channel_partition(&key).unwrap();
+        let before = store.database_size_stats().unwrap();
+        assert_eq!(store.event_count().unwrap(), 0);
+        assert!(
+            before.free_bytes >= DB_RECLAIM_INCREMENTAL_FREE_BYTES,
+            "expected meaningful free space after compaction, stats={before:?}"
+        );
+
+        store.reclaim_database_space_low_priority().unwrap();
+        let after = store.database_size_stats().unwrap();
+        assert!(
+            after.free_bytes < before.free_bytes || after.main_bytes < before.main_bytes,
+            "database maintenance should reclaim space: before={before:?} after={after:?}"
+        );
     }
 }
