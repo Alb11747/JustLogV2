@@ -3,9 +3,10 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
@@ -23,6 +24,74 @@ use crate::store::Store;
 const DISCOVERY_QUEUE_CAPACITY: usize = 256;
 const PARSE_QUEUE_CAPACITY: usize = 64;
 const PROGRESS_INTERVAL: usize = 100;
+
+#[derive(Debug, Clone)]
+pub struct ImportWalkEntry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub is_file: bool,
+}
+
+pub trait ImportIo: Send + Sync {
+    fn path_exists(&self, path: &Path) -> bool;
+    fn walk(
+        &self,
+        root: &Path,
+        visitor: &mut dyn FnMut(ImportWalkEntry) -> Result<()>,
+    ) -> Result<()>;
+    fn fingerprint(&self, path: &Path) -> Result<String>;
+    fn read_lines(&self, path: &Path) -> Result<Vec<String>>;
+    fn read_to_string(&self, path: &Path) -> Result<String>;
+    fn remove_file(&self, path: &Path) -> Result<()>;
+    fn prune_empty_dir_and_parents(&self, root: &Path, start: Option<&Path>);
+}
+
+pub trait ImportArchive: Send + Sync {
+    fn read_channel_day(
+        &self,
+        store: &Store,
+        key: &ChannelDayKey,
+    ) -> Result<Vec<StoredEvent>>;
+    fn write_channel_day(
+        &self,
+        store: &Store,
+        key: &ChannelDayKey,
+        events: &[StoredEvent],
+    ) -> Result<()>;
+    fn read_user_month(
+        &self,
+        store: &Store,
+        key: &UserMonthKey,
+    ) -> Result<Vec<StoredEvent>>;
+    fn write_user_month(
+        &self,
+        store: &Store,
+        key: &UserMonthKey,
+        events: &[StoredEvent],
+    ) -> Result<()>;
+}
+
+pub trait ImportInstrumentation: Send + Sync {
+    fn on_discovered(&self, _path: &Path) {}
+    fn on_parse_queue_backpressure(&self, _path: &Path) {}
+    fn on_parse_start(&self, _path: &Path) {}
+    fn on_parse_finish(&self, _path: &Path) {}
+    fn on_commit_start(&self, _scope: &str, _key: &str) {}
+    fn on_commit_finish(&self, _scope: &str, _key: &str) {}
+}
+
+#[derive(Clone, Default)]
+pub struct ImportHooks {
+    pub io: Option<Arc<dyn ImportIo>>,
+    pub archive: Option<Arc<dyn ImportArchive>>,
+    pub instrumentation: Option<Arc<dyn ImportInstrumentation>>,
+    pub discovery_queue_capacity: Option<usize>,
+    pub parse_queue_capacity: Option<usize>,
+}
+
+struct RealImportIo;
+
+struct RealImportArchive;
 
 #[derive(Debug, Clone)]
 pub struct ImportPipelineConfig {
@@ -61,6 +130,15 @@ struct ParsedImportFile {
     events: Vec<CanonicalEvent>,
 }
 
+#[derive(Debug)]
+enum ParseWorkerMessage {
+    Parsed(ParsedImportFile),
+    Failed {
+        candidate: ImportCandidate,
+        error: String,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChannelDayImportResult {
     pub affected_channel_days: BTreeSet<ChannelDayKey>,
@@ -74,7 +152,35 @@ pub fn run_import(
     limit_files: Option<usize>,
     dry_run: bool,
 ) -> Result<BulkRawImportSummary> {
-    if !config.import_folder.exists() {
+    run_import_with_hooks(
+        store,
+        config,
+        target,
+        limit_files,
+        dry_run,
+        ImportHooks::default(),
+    )
+}
+
+pub fn run_import_with_hooks(
+    store: &Store,
+    config: &ImportPipelineConfig,
+    target: ImportTarget,
+    limit_files: Option<usize>,
+    dry_run: bool,
+    hooks: ImportHooks,
+) -> Result<BulkRawImportSummary> {
+    let io: Arc<dyn ImportIo> = hooks.io.unwrap_or_else(|| Arc::new(RealImportIo));
+    let archive: Arc<dyn ImportArchive> = hooks.archive.unwrap_or_else(|| Arc::new(RealImportArchive));
+    let instrumentation = hooks.instrumentation;
+    let discovery_queue_capacity = hooks
+        .discovery_queue_capacity
+        .unwrap_or(DISCOVERY_QUEUE_CAPACITY);
+    let parse_queue_capacity = hooks
+        .parse_queue_capacity
+        .unwrap_or(PARSE_QUEUE_CAPACITY);
+
+    if !io.path_exists(&config.import_folder) {
         return Ok(BulkRawImportSummary {
             dry_run,
             channel_id: target.channel_id.clone(),
@@ -86,14 +192,18 @@ pub fn run_import(
     let run_id = store.start_import_run(target.channel_id.as_deref(), limit_files, dry_run)?;
     let worker_count = default_worker_count();
     let (candidate_tx, candidate_rx) =
-        mpsc::sync_channel::<Option<ImportCandidate>>(DISCOVERY_QUEUE_CAPACITY);
-    let (parse_tx, parse_rx) = mpsc::sync_channel::<Option<ImportCandidate>>(PARSE_QUEUE_CAPACITY);
-    let (result_tx, result_rx) = mpsc::sync_channel::<Result<ParsedImportFile>>(PARSE_QUEUE_CAPACITY);
+        mpsc::sync_channel::<Option<ImportCandidate>>(discovery_queue_capacity);
+    let (parse_tx, parse_rx) = mpsc::sync_channel::<Option<ImportCandidate>>(parse_queue_capacity);
+    let (result_tx, result_rx) = mpsc::sync_channel::<ParseWorkerMessage>(parse_queue_capacity);
 
     let discovery_root = config.import_folder.clone();
     let discovery_target = target.clone();
+    let discovery_io = io.clone();
+    let discovery_instrumentation = instrumentation.clone();
     let discovery_handle = thread::spawn(move || {
         discover_candidates(
+            discovery_io.as_ref(),
+            discovery_instrumentation.as_deref(),
             &discovery_root,
             discovery_target,
             limit_files,
@@ -107,7 +217,11 @@ pub fn run_import(
         let rx = shared_parse_rx.clone();
         let tx = result_tx.clone();
         let target = target.clone();
-        parser_handles.push(thread::spawn(move || parse_worker_loop(rx, tx, target)));
+        let parse_io = io.clone();
+        let instrumentation = instrumentation.clone();
+        parser_handles.push(thread::spawn(move || {
+            parse_worker_loop(parse_io.as_ref(), instrumentation, rx, tx, target)
+        }));
     }
     drop(result_tx);
 
@@ -121,12 +235,97 @@ pub fn run_import(
     let mut failures = 0usize;
     let mut affected_channel_days = BTreeSet::new();
     let mut affected_user_months = BTreeSet::new();
+    let mut discovery_done = false;
+    let mut pending_candidate: Option<ImportCandidate> = None;
+    while !discovery_done || in_flight > 0 || pending_candidate.is_some() {
+        while let Ok(message) = result_rx.try_recv() {
+            handle_parse_result_message(
+                store,
+                run_id,
+                config,
+                io.as_ref(),
+                archive.as_ref(),
+                instrumentation.as_deref(),
+                message,
+                &mut summary,
+                &mut completed,
+                &mut failures,
+                &mut in_flight,
+                &mut affected_channel_days,
+                &mut affected_user_months,
+            )?;
+        }
 
-    loop {
-        match candidate_rx.recv() {
+        if let Some(candidate) = pending_candidate.take() {
+            pending_candidate = process_discovered_candidate(
+                store,
+                io.as_ref(),
+                config,
+                run_id,
+                dry_run,
+                &candidate,
+                &mut summary,
+                &parse_tx,
+                &mut in_flight,
+                instrumentation.as_deref(),
+            )?;
+            if pending_candidate.is_some() {
+                if in_flight > 0 {
+                    let message = result_rx
+                        .recv()
+                        .map_err(|_| anyhow!("import parser channel closed unexpectedly"))?;
+                    handle_parse_result_message(
+                        store,
+                        run_id,
+                        config,
+                        io.as_ref(),
+                        archive.as_ref(),
+                        instrumentation.as_deref(),
+                        message,
+                        &mut summary,
+                        &mut completed,
+                        &mut failures,
+                        &mut in_flight,
+                        &mut affected_channel_days,
+                        &mut affected_user_months,
+                    )?;
+                } else {
+                    thread::yield_now();
+                }
+            }
+            continue;
+        }
+
+        if discovery_done {
+            if in_flight == 0 && pending_candidate.is_none() {
+                break;
+            }
+            let message = result_rx
+                .recv()
+                .map_err(|_| anyhow!("import parser channel closed unexpectedly"))?;
+            handle_parse_result_message(
+                store,
+                run_id,
+                config,
+                io.as_ref(),
+                archive.as_ref(),
+                instrumentation.as_deref(),
+                message,
+                &mut summary,
+                &mut completed,
+                &mut failures,
+                &mut in_flight,
+                &mut affected_channel_days,
+                &mut affected_user_months,
+            )?;
+            continue;
+        }
+
+        match candidate_rx.recv_timeout(Duration::from_millis(10)) {
             Ok(Some(candidate)) => {
-                process_discovered_candidate(
+                pending_candidate = process_discovered_candidate(
                     store,
+                    io.as_ref(),
                     config,
                     run_id,
                     dry_run,
@@ -134,51 +333,44 @@ pub fn run_import(
                     &mut summary,
                     &parse_tx,
                     &mut in_flight,
+                    instrumentation.as_deref(),
                 )?;
             }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-
-    for _ in 0..worker_count {
-        parse_tx.send(None)?;
-    }
-
-    while in_flight > 0 {
-        let parsed = result_rx
-            .recv()
-            .map_err(|_| anyhow!("import parser channel closed unexpectedly"))??;
-        in_flight = in_flight.saturating_sub(1);
-        let path_key = parsed.candidate.path.to_string_lossy().to_string();
-        match commit_or_finalize_parsed_file(store, run_id, config, parsed, &mut summary) {
-            Ok(result) => {
-                completed += 1;
-                affected_channel_days.extend(result.affected_channel_days);
-                affected_user_months.extend(result.affected_user_months);
+            Ok(None) => {
+                discovery_done = true;
+                let mut sent_stops = 0usize;
+                while sent_stops < worker_count {
+                    match parse_tx.try_send(None) {
+                        Ok(()) => sent_stops += 1,
+                        Err(TrySendError::Full(_)) => {
+                            if in_flight == 0 {
+                                break;
+                            }
+                            let message = result_rx
+                                .recv()
+                                .map_err(|_| anyhow!("import parser channel closed unexpectedly"))?;
+                            handle_parse_result_message(
+                                store,
+                                run_id,
+                                config,
+                                io.as_ref(),
+                                archive.as_ref(),
+                                instrumentation.as_deref(),
+                                message,
+                                &mut summary,
+                                &mut completed,
+                                &mut failures,
+                                &mut in_flight,
+                                &mut affected_channel_days,
+                                &mut affected_user_months,
+                            )?;
+                        }
+                        Err(TrySendError::Disconnected(_)) => break,
+                    }
+                }
             }
-            Err(error) => {
-                failures += 1;
-                summary.files_failed += 1;
-                let _ = store.upsert_import_file_state(
-                    run_id,
-                    &path_key,
-                    "",
-                    "unknown",
-                    "failed",
-                    Some(&error.to_string()),
-                );
-            }
-        }
-        if completed % PROGRESS_INTERVAL == 0 || in_flight == 0 {
-            store.update_import_run_progress(
-                run_id,
-                summary.directories_visited,
-                summary.files_discovered,
-                completed,
-                failures,
-                Some(&path_key),
-            )?;
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => discovery_done = true,
         }
     }
 
@@ -200,6 +392,7 @@ pub fn run_import(
     )?;
     store.finish_import_run(run_id, if failures == 0 { "completed" } else { "completed_with_errors" })?;
 
+    drop(parse_tx);
     for handle in parser_handles {
         let _ = handle.join();
     }
@@ -207,8 +400,88 @@ pub fn run_import(
     Ok(summary)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn handle_parse_result_message(
+    store: &Store,
+    run_id: i64,
+    config: &ImportPipelineConfig,
+    io: &dyn ImportIo,
+    archive: &dyn ImportArchive,
+    instrumentation: Option<&dyn ImportInstrumentation>,
+    message: ParseWorkerMessage,
+    summary: &mut BulkRawImportSummary,
+    completed: &mut usize,
+    failures: &mut usize,
+    in_flight: &mut usize,
+    affected_channel_days: &mut BTreeSet<ChannelDayKey>,
+    affected_user_months: &mut BTreeSet<UserMonthKey>,
+) -> Result<()> {
+    *in_flight = in_flight.saturating_sub(1);
+    let path_key = match message {
+        ParseWorkerMessage::Parsed(parsed) => {
+            let path_key = parsed.candidate.path.to_string_lossy().to_string();
+            match commit_or_finalize_parsed_file(
+                store,
+                run_id,
+                config,
+                io,
+                archive,
+                instrumentation,
+                parsed,
+                summary,
+            ) {
+                Ok(result) => {
+                    *completed += 1;
+                    affected_channel_days.extend(result.affected_channel_days);
+                    affected_user_months.extend(result.affected_user_months);
+                }
+                Err(error) => {
+                    *failures += 1;
+                    summary.files_failed += 1;
+                    let _ = store.upsert_import_file_state(
+                        run_id,
+                        &path_key,
+                        "",
+                        "unknown",
+                        "failed",
+                        Some(&error.to_string()),
+                    );
+                }
+            }
+            path_key
+        }
+        ParseWorkerMessage::Failed { candidate, error } => {
+            let path_key = candidate.path.to_string_lossy().to_string();
+            *failures += 1;
+            summary.files_failed += 1;
+            let _ = store.upsert_import_file_state(
+                run_id,
+                &path_key,
+                &candidate.fingerprint,
+                family_name(candidate.family),
+                "failed",
+                Some(&error),
+            );
+            path_key
+        }
+    };
+
+    if *completed % PROGRESS_INTERVAL == 0 || *in_flight == 0 {
+        store.update_import_run_progress(
+            run_id,
+            summary.directories_visited,
+            summary.files_discovered,
+            *completed,
+            *failures,
+            Some(&path_key),
+        )?;
+    }
+    Ok(())
+}
+
 fn process_discovered_candidate(
     store: &Store,
+    io: &dyn ImportIo,
     config: &ImportPipelineConfig,
     run_id: i64,
     dry_run: bool,
@@ -216,7 +489,8 @@ fn process_discovered_candidate(
     summary: &mut BulkRawImportSummary,
     parse_tx: &SyncSender<Option<ImportCandidate>>,
     in_flight: &mut usize,
-) -> Result<()> {
+    instrumentation: Option<&dyn ImportInstrumentation>,
+) -> Result<Option<ImportCandidate>> {
     summary.files_discovered += 1;
     summary.files_scanned += 1;
     summary.files_selected += 1;
@@ -224,15 +498,15 @@ fn process_discovered_candidate(
         summary.raw_candidates += 1;
     }
     if candidate.family == ImportFamily::SimpleText && config.mode == LegacyTxtMode::Off {
-        return Ok(());
+        return Ok(None);
     }
 
     let path_key = candidate.path.to_string_lossy().to_string();
     if let Some((stored_fingerprint, state)) = store.import_file_state(&path_key)? {
         if stored_fingerprint == candidate.fingerprint && state == "done" {
             summary.files_current += 1;
-            maybe_delete_current_source(config, candidate, summary);
-            return Ok(());
+            maybe_delete_current_source(io, config, candidate, summary);
+            return Ok(None);
         }
         if stored_fingerprint == candidate.fingerprint && state != "done" {
             summary.files_resumed += 1;
@@ -241,7 +515,7 @@ fn process_discovered_candidate(
 
     if dry_run {
         summary.files_pending += 1;
-        return Ok(());
+        return Ok(None);
     }
 
     store.upsert_import_file_state(
@@ -253,15 +527,31 @@ fn process_discovered_candidate(
         None,
     )?;
     summary.files_pending += 1;
-    parse_tx.send(Some(candidate.clone()))?;
-    *in_flight += 1;
-    Ok(())
+    let send_result = match parse_tx.try_send(Some(candidate.clone())) {
+        Ok(()) => Ok(None),
+        Err(TrySendError::Full(item)) => {
+            if let Some(instrumentation) = instrumentation {
+                instrumentation.on_parse_queue_backpressure(&candidate.path);
+            }
+            Ok(item)
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            Err(anyhow!("import parse queue disconnected"))
+        }
+    }?;
+    if send_result.is_none() {
+        *in_flight += 1;
+    }
+    Ok(send_result)
 }
 
 fn commit_or_finalize_parsed_file(
     store: &Store,
     run_id: i64,
     config: &ImportPipelineConfig,
+    io: &dyn ImportIo,
+    archive: &dyn ImportArchive,
+    instrumentation: Option<&dyn ImportInstrumentation>,
     parsed: ParsedImportFile,
     summary: &mut BulkRawImportSummary,
 ) -> Result<ChannelDayImportResult> {
@@ -280,9 +570,18 @@ fn commit_or_finalize_parsed_file(
         return Ok(ChannelDayImportResult::default());
     }
 
-    let result = commit_parsed_file(store, run_id, config, &parsed, summary)?;
+    let result = commit_parsed_file(
+        store,
+        run_id,
+        config,
+        io,
+        archive,
+        instrumentation,
+        &parsed,
+        summary,
+    )?;
     summary.files_imported += 1;
-    maybe_delete_consumed_source(config, &parsed.candidate, summary)?;
+    maybe_delete_consumed_source(io, config, &parsed.candidate, summary)?;
     Ok(result)
 }
 
@@ -290,6 +589,9 @@ fn commit_parsed_file(
     store: &Store,
     run_id: i64,
     _config: &ImportPipelineConfig,
+    _io: &dyn ImportIo,
+    archive: &dyn ImportArchive,
+    instrumentation: Option<&dyn ImportInstrumentation>,
     parsed: &ParsedImportFile,
     summary: &mut BulkRawImportSummary,
 ) -> Result<ChannelDayImportResult> {
@@ -330,6 +632,13 @@ fn commit_parsed_file(
     if !archive_by_day.is_empty() {
         let mut archive_user_months = BTreeSet::new();
         for (day_key, events) in archive_by_day {
+            let commit_key = format!(
+                "{}:{}/{}/{}",
+                day_key.channel_id, day_key.year, day_key.month, day_key.day
+            );
+            if let Some(instrumentation) = instrumentation {
+                instrumentation.on_commit_start("channel", &commit_key);
+            }
             store.record_import_partition_state(
                 "channel",
                 &day_key.channel_id,
@@ -350,21 +659,10 @@ fn commit_parsed_file(
                 day_key.month,
                 Some(day_key.day),
             )?;
-            let mut merged = store.read_channel_logs(
-                &day_key.channel_id,
-                day_key.year,
-                day_key.month,
-                day_key.day,
-            )?;
+            let mut merged = archive.read_channel_day(store, &day_key)?;
             merged.extend(events.into_iter().map(stored_from_canonical));
             dedupe_and_sort(&mut merged);
-            store.import_replace_or_create_channel_segment(
-                &day_key.channel_id,
-                day_key.year,
-                day_key.month,
-                day_key.day,
-                &merged,
-            )?;
+            archive.write_channel_day(store, &day_key, &merged)?;
             store.record_import_partition_state(
                 "channel",
                 &day_key.channel_id,
@@ -376,6 +674,9 @@ fn commit_parsed_file(
                 None,
                 false,
             )?;
+            if let Some(instrumentation) = instrumentation {
+                instrumentation.on_commit_finish("channel", &commit_key);
+            }
             summary.archive_partitions_committed += 1;
             result.affected_channel_days.insert(day_key.clone());
             for event in &merged {
@@ -386,6 +687,13 @@ fn commit_parsed_file(
         }
 
         for month_key in archive_user_months {
+            let commit_key = format!(
+                "{}:{}:{}/{}",
+                month_key.channel_id, month_key.user_id, month_key.year, month_key.month
+            );
+            if let Some(instrumentation) = instrumentation {
+                instrumentation.on_commit_start("user", &commit_key);
+            }
             store.record_import_partition_state(
                 "user",
                 &month_key.channel_id,
@@ -406,20 +714,9 @@ fn commit_parsed_file(
                 month_key.month,
                 None,
             )?;
-            let mut merged = store.read_user_logs(
-                &month_key.channel_id,
-                &month_key.user_id,
-                month_key.year,
-                month_key.month,
-            )?;
+            let mut merged = archive.read_user_month(store, &month_key)?;
             dedupe_and_sort(&mut merged);
-            store.import_replace_or_create_user_segment(
-                &month_key.channel_id,
-                &month_key.user_id,
-                month_key.year,
-                month_key.month,
-                &merged,
-            )?;
+            archive.write_user_month(store, &month_key, &merged)?;
             store.record_import_partition_state(
                 "user",
                 &month_key.channel_id,
@@ -431,6 +728,9 @@ fn commit_parsed_file(
                 None,
                 false,
             )?;
+            if let Some(instrumentation) = instrumentation {
+                instrumentation.on_commit_finish("user", &commit_key);
+            }
             result.affected_user_months.insert(month_key);
         }
     }
@@ -452,6 +752,8 @@ fn commit_parsed_file(
 }
 
 fn discover_candidates(
+    io: &dyn ImportIo,
+    instrumentation: Option<&dyn ImportInstrumentation>,
     root: &Path,
     target: ImportTarget,
     limit_files: Option<usize>,
@@ -459,41 +761,47 @@ fn discover_candidates(
 ) -> Result<(usize, usize)> {
     let mut directories = 0usize;
     let mut files = 0usize;
-    for entry in WalkDir::new(root).sort_by_file_name().into_iter().filter_map(Result::ok) {
-        if entry.file_type().is_dir() {
+    io.walk(root, &mut |entry| {
+        if entry.is_dir {
             directories += 1;
-            continue;
+            return Ok(());
         }
-        if !entry.file_type().is_file() {
-            continue;
+        if !entry.is_file {
+            return Ok(());
         }
         if limit_files.is_some_and(|limit| files >= limit) {
-            break;
+            return Ok(());
         }
-        let path = entry.into_path();
-        let Some(family) = classify_import_file(&path)? else {
-            continue;
+        let path = entry.path;
+        let Some(family) = classify_import_file(io, &path)? else {
+            return Ok(());
         };
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.on_discovered(&path);
+        }
         if let Some(channel_id) = target.channel_id.as_deref() {
             if !candidate_might_match_channel(&path, family, channel_id) {
-                continue;
+                return Ok(());
             }
         }
-        let fingerprint = file_fingerprint(&path)?;
+        let fingerprint = io.fingerprint(&path)?;
         sender.send(Some(ImportCandidate {
             path,
             fingerprint,
             family,
         }))?;
         files += 1;
-    }
+        Ok(())
+    })?;
     let _ = sender.send(None);
     Ok((directories, files))
 }
 
 fn parse_worker_loop(
+    io: &dyn ImportIo,
+    instrumentation: Option<Arc<dyn ImportInstrumentation>>,
     receiver: std::sync::Arc<std::sync::Mutex<Receiver<Option<ImportCandidate>>>>,
-    sender: SyncSender<Result<ParsedImportFile>>,
+    sender: SyncSender<ParseWorkerMessage>,
     target: ImportTarget,
 ) {
     loop {
@@ -507,17 +815,34 @@ fn parse_worker_loop(
         let Some(candidate) = message else {
             return;
         };
-        let result = parse_candidate(candidate, &target);
-        let _ = sender.send(result);
+        if let Some(instrumentation) = instrumentation.as_deref() {
+            instrumentation.on_parse_start(&candidate.path);
+        }
+        let result = parse_candidate(io, candidate.clone(), &target);
+        if let Some(instrumentation) = instrumentation.as_deref() {
+            instrumentation.on_parse_finish(&candidate.path);
+        }
+        let message = match result {
+            Ok(parsed) => ParseWorkerMessage::Parsed(parsed),
+            Err(error) => ParseWorkerMessage::Failed {
+                candidate,
+                error: error.to_string(),
+            },
+        };
+        let _ = sender.send(message);
     }
 }
 
-fn parse_candidate(candidate: ImportCandidate, target: &ImportTarget) -> Result<ParsedImportFile> {
+fn parse_candidate(
+    io: &dyn ImportIo,
+    candidate: ImportCandidate,
+    target: &ImportTarget,
+) -> Result<ParsedImportFile> {
     let all_matching = target.day.is_none();
     let mut events = match candidate.family {
-        ImportFamily::Raw => parse_raw_file(&candidate.path)?,
-        ImportFamily::SimpleText => parse_simple_text_file(&candidate.path)?,
-        ImportFamily::JsonExport => parse_json_file(&candidate.path)?,
+        ImportFamily::Raw => parse_raw_file(io, &candidate.path)?,
+        ImportFamily::SimpleText => parse_simple_text_file(io, &candidate.path)?,
+        ImportFamily::JsonExport => parse_json_file(io, &candidate.path)?,
     };
 
     if let Some(channel_id) = target.channel_id.as_deref() {
@@ -541,23 +866,28 @@ fn parse_candidate(candidate: ImportCandidate, target: &ImportTarget) -> Result<
 }
 
 fn maybe_delete_current_source(
+    io: &dyn ImportIo,
     config: &ImportPipelineConfig,
     candidate: &ImportCandidate,
     summary: &mut BulkRawImportSummary,
 ) {
     let delete = match candidate.family {
-        ImportFamily::Raw => config.delete_current_raw_on_discovery,
+        ImportFamily::Raw => {
+            config.delete_current_raw_on_discovery || config.delete_raw_after_import
+        }
         ImportFamily::SimpleText | ImportFamily::JsonExport => {
             config.delete_current_reconstructed_on_discovery
+                || config.delete_reconstructed_after_import
         }
     };
-    if delete && fs::remove_file(&candidate.path).is_ok() {
+    if delete && io.remove_file(&candidate.path).is_ok() {
         summary.files_deleted += 1;
-        remove_empty_dir_and_parents(&config.import_folder, candidate.path.parent());
+        io.prune_empty_dir_and_parents(&config.import_folder, candidate.path.parent());
     }
 }
 
 fn maybe_delete_consumed_source(
+    io: &dyn ImportIo,
     config: &ImportPipelineConfig,
     candidate: &ImportCandidate,
     summary: &mut BulkRawImportSummary,
@@ -568,10 +898,10 @@ fn maybe_delete_consumed_source(
             config.delete_reconstructed_after_import
         }
     };
-    if delete && candidate.path.exists() {
-        fs::remove_file(&candidate.path)?;
+    if delete && io.path_exists(&candidate.path) {
+        io.remove_file(&candidate.path)?;
         summary.files_deleted += 1;
-        remove_empty_dir_and_parents(&config.import_folder, candidate.path.parent());
+        io.prune_empty_dir_and_parents(&config.import_folder, candidate.path.parent());
     }
     Ok(())
 }
@@ -652,7 +982,7 @@ fn dedupe_and_sort(events: &mut Vec<StoredEvent>) {
     events.sort_by_key(|event| event.timestamp.timestamp_millis());
 }
 
-fn classify_import_file(path: &Path) -> Result<Option<ImportFamily>> {
+fn classify_import_file(io: &dyn ImportIo, path: &Path) -> Result<Option<ImportFamily>> {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -668,16 +998,16 @@ fn classify_import_file(path: &Path) -> Result<Option<ImportFamily>> {
     {
         return Ok(None);
     }
-    if behaves_like_raw_irc_path(path)? {
+    if behaves_like_raw_irc_path(io, path)? {
         Ok(Some(ImportFamily::Raw))
     } else {
         Ok(Some(ImportFamily::SimpleText))
     }
 }
 
-fn parse_raw_file(path: &Path) -> Result<Vec<CanonicalEvent>> {
+fn parse_raw_file(io: &dyn ImportIo, path: &Path) -> Result<Vec<CanonicalEvent>> {
     let mut events = Vec::new();
-    for_each_line_in_supported_file(path, |line| {
+    for_each_line_in_supported_file(io, path, |line| {
         let Some(raw) = extract_raw_irc_line(&line) else {
             return Ok(());
         };
@@ -689,21 +1019,21 @@ fn parse_raw_file(path: &Path) -> Result<Vec<CanonicalEvent>> {
     Ok(events)
 }
 
-fn parse_simple_text_file(path: &Path) -> Result<Vec<CanonicalEvent>> {
+fn parse_simple_text_file(io: &dyn ImportIo, path: &Path) -> Result<Vec<CanonicalEvent>> {
     let (channel_id, year, month, day) = infer_legacy_path_channel_day(path)
         .ok_or_else(|| anyhow!("simple text import path must end with <channel>/<year>/<month>/<day>"))?;
     let channel_login = infer_channel_login_from_rawish_name(path).unwrap_or_default();
-    let messages = parse_sparse_txt_file(path, &channel_login, year, month, day)?;
+    let messages = parse_sparse_txt_file(io, path, &channel_login, year, month, day)?;
     Ok(messages
         .into_iter()
         .map(|message| CanonicalEvent::from_chat_message(&channel_id, &channel_login, &message))
         .collect())
 }
 
-fn parse_json_file(path: &Path) -> Result<Vec<CanonicalEvent>> {
+fn parse_json_file(io: &dyn ImportIo, path: &Path) -> Result<Vec<CanonicalEvent>> {
     let inferred = infer_legacy_path_channel_day(path);
     let default_channel_login = infer_channel_login_from_rawish_name(path).unwrap_or_default();
-    let messages = parse_json_export_file(path, &default_channel_login)?;
+    let messages = parse_json_export_file(io, path, &default_channel_login)?;
     let default_channel_id = inferred
         .as_ref()
         .map(|value| value.0.clone())
@@ -727,9 +1057,9 @@ fn parse_json_file(path: &Path) -> Result<Vec<CanonicalEvent>> {
         .collect())
 }
 
-fn behaves_like_raw_irc_path(path: &Path) -> Result<bool> {
+fn behaves_like_raw_irc_path(io: &dyn ImportIo, path: &Path) -> Result<bool> {
     let mut matched = false;
-    for_each_line_in_supported_file(path, |line| {
+    for_each_line_in_supported_file(io, path, |line| {
         let Some(raw) = extract_raw_irc_line(&line) else {
             return Ok(());
         };
@@ -763,66 +1093,25 @@ fn extract_raw_irc_line(line: &str) -> Option<String> {
     }
 }
 
-fn for_each_line_in_supported_file<F>(path: &Path, mut f: F) -> Result<()>
+fn for_each_line_in_supported_file<F>(io: &dyn ImportIo, path: &Path, mut f: F) -> Result<()>
 where
     F: FnMut(String) -> Result<()>,
 {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name.ends_with(".gz") {
-        let file = File::open(path)?;
-        let decoder = GzDecoder::new(file);
-        let reader = BufReader::new(decoder);
-        for line in reader.lines() {
-            f(line?)?;
-        }
-        return Ok(());
-    }
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    for line in reader.lines() {
-        f(line?)?;
+    for line in io.read_lines(path)? {
+        f(line)?;
     }
     Ok(())
 }
 
-fn load_lines_from_supported_file(path: &Path) -> Result<Vec<String>> {
-    let mut lines = Vec::new();
-    for_each_line_in_supported_file(path, |line| {
-        lines.push(line);
-        Ok(())
-    })?;
-    Ok(lines)
-}
-
-fn load_string_from_supported_file(path: &Path) -> Result<String> {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let mut output = String::new();
-    if name.ends_with(".gz") {
-        let file = File::open(path)?;
-        let mut decoder = GzDecoder::new(file);
-        decoder.read_to_string(&mut output)?;
-    } else {
-        File::open(path)?.read_to_string(&mut output)?;
-    }
-    Ok(output)
-}
-
 fn parse_sparse_txt_file(
+    io: &dyn ImportIo,
     path: &Path,
     channel_login: &str,
     year: i32,
     month: u32,
     day: u32,
 ) -> Result<Vec<ChatMessage>> {
-    let lines = load_lines_from_supported_file(path)?;
+    let lines = io.read_lines(path)?;
     let base = Utc
         .with_ymd_and_hms(year, month, day, 0, 0, 0)
         .single()
@@ -863,8 +1152,8 @@ fn parse_sparse_txt_file(
     Ok(messages)
 }
 
-fn parse_json_export_file(path: &Path, channel_login: &str) -> Result<Vec<ChatMessage>> {
-    let content = load_string_from_supported_file(path)?;
+fn parse_json_export_file(io: &dyn ImportIo, path: &Path, channel_login: &str) -> Result<Vec<ChatMessage>> {
+    let content = io.read_to_string(path)?;
     let export: JsonExport = serde_json::from_str(&content)?;
     let fallback_channel = export
         .streamer
@@ -1050,6 +1339,134 @@ fn remove_empty_dir_and_parents(root: &Path, start: Option<&Path>) {
             break;
         }
         current = parent.to_path_buf();
+    }
+}
+
+impl ImportIo for RealImportIo {
+    fn path_exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    fn walk(
+        &self,
+        root: &Path,
+        visitor: &mut dyn FnMut(ImportWalkEntry) -> Result<()>,
+    ) -> Result<()> {
+        for entry in WalkDir::new(root).sort_by_file_name().into_iter().filter_map(Result::ok) {
+            let is_dir = entry.file_type().is_dir();
+            let is_file = entry.file_type().is_file();
+            let path = entry.into_path();
+            visitor(ImportWalkEntry {
+                path,
+                is_dir,
+                is_file,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fingerprint(&self, path: &Path) -> Result<String> {
+        file_fingerprint(path)
+    }
+
+    fn read_lines(&self, path: &Path) -> Result<Vec<String>> {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name.ends_with(".gz") {
+            let file = File::open(path)?;
+            let decoder = GzDecoder::new(file);
+            let reader = BufReader::new(decoder);
+            return reader
+                .lines()
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(Into::into);
+        }
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn read_to_string(&self, path: &Path) -> Result<String> {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut output = String::new();
+        if name.ends_with(".gz") {
+            let file = File::open(path)?;
+            let mut decoder = GzDecoder::new(file);
+            decoder.read_to_string(&mut output)?;
+        } else {
+            File::open(path)?.read_to_string(&mut output)?;
+        }
+        Ok(output)
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        fs::remove_file(path).map_err(Into::into)
+    }
+
+    fn prune_empty_dir_and_parents(&self, root: &Path, start: Option<&Path>) {
+        remove_empty_dir_and_parents(root, start);
+    }
+}
+
+impl ImportArchive for RealImportArchive {
+    fn read_channel_day(
+        &self,
+        store: &Store,
+        key: &ChannelDayKey,
+    ) -> Result<Vec<StoredEvent>> {
+        store.read_channel_logs(&key.channel_id, key.year, key.month, key.day)
+    }
+
+    fn write_channel_day(
+        &self,
+        store: &Store,
+        key: &ChannelDayKey,
+        events: &[StoredEvent],
+    ) -> Result<()> {
+        store
+            .import_replace_or_create_channel_segment(
+                &key.channel_id,
+                key.year,
+                key.month,
+                key.day,
+                events,
+            )
+            .map(|_| ())
+    }
+
+    fn read_user_month(
+        &self,
+        store: &Store,
+        key: &UserMonthKey,
+    ) -> Result<Vec<StoredEvent>> {
+        store.read_user_logs(&key.channel_id, &key.user_id, key.year, key.month)
+    }
+
+    fn write_user_month(
+        &self,
+        store: &Store,
+        key: &UserMonthKey,
+        events: &[StoredEvent],
+    ) -> Result<()> {
+        store
+            .import_replace_or_create_user_segment(
+                &key.channel_id,
+                &key.user_id,
+                key.year,
+                key.month,
+                events,
+            )
+            .map(|_| ())
     }
 }
 
