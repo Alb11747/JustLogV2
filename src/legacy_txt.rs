@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};

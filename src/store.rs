@@ -40,7 +40,6 @@ pub struct Store {
     sqlite_path: PathBuf,
     archive_enabled: bool,
     compact_after_channel_days: i64,
-    compact_after_user_months: i64,
     compression_executor: Arc<CompressionExecutor>,
     compression_paths: Arc<CompressionPathLocks>,
     db_priority: Arc<DbPriorityScheduler>,
@@ -425,7 +424,6 @@ impl Store {
             sqlite_path: config.storage.sqlite_path.clone(),
             archive_enabled: config.archive,
             compact_after_channel_days: config.storage.compact_after_channel_days,
-            compact_after_user_months: config.storage.compact_after_user_months,
             compression_executor: Arc::new(CompressionExecutor::new(
                 compression_threads,
                 config.compression.quality,
@@ -3162,7 +3160,6 @@ mod tests {
             sqlite_path,
             archive_enabled: true,
             compact_after_channel_days: 30,
-            compact_after_user_months: 6,
             compression_executor: Arc::new(CompressionExecutor::new(1, 5, 22)),
             compression_paths: Arc::new(CompressionPathLocks::default()),
             db_priority: Arc::new(DbPriorityScheduler::default()),
