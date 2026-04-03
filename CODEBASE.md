@@ -72,7 +72,8 @@ At runtime:
 - `src/model.rs`: canonical event model, API response structs, and raw IRC parsing helpers.
 - `src/compact.rs`: background loop that periodically archives old partitions.
 - `src/import.rs`: CLI import path for legacy plain-text or gzip-compressed log files.
-- `src/legacy_txt.rs`: import-folder compatibility layer for raw IRC imports plus reconstructed TXT/JSON overlays during API reads.
+- `src/legacy_txt.rs`: import-folder compatibility edge that now delegates request-time and bulk import work into the unified streaming importer.
+- `src/import_pipeline.rs`: unified streaming import engine for raw IRC, sparse TXT, and JSON import-folder files.
 - `src/debug_sync.rs`: reconciliation jobs, trusted/compare debug runtime, startup consistency validation, and trusted API fallback helpers.
 
 ## Startup and Lifecycle
@@ -181,12 +182,12 @@ Behavior summary:
 
 - Raw IRC `.txt` and `.txt.gz` files found under the import folder are imported into native storage.
 - Wrapped debug-log TXT files are also accepted when they contain embedded raw IRC payloads, such as `FROM SERVER: @badge-info=... PRIVMSG ...`. Non-IRC wrapper lines are ignored.
-- Simple sparse TXT and JSON exports stay separate and are merged at read time.
-- `JUSTLOG_LEGACY_TXT_MODE` only controls reconstructed overlays.
+- Simple sparse TXT and JSON exports are imported through the same durable pipeline as raw IRC files.
+- `JUSTLOG_LEGACY_TXT_MODE=off` only disables simple sparse TXT imports.
 - `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1` only affects reconstructed-file discovery freshness.
 - `JUSTLOG_IMPORT_DELETE_RAW=1` removes successfully imported raw source files.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1` also removes raw source files whose path and fingerprint are already marked current in SQLite. This defaults to on.
-- `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` removes successfully consumed reconstructed TXT / JSON files.
+- `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` removes successfully imported reconstructed TXT / JSON files.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1` also removes reconstructed TXT / JSON files whose path and fingerprint are already marked consumed in SQLite. This defaults to off.
 - `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS` caps concurrent archive compression jobs globally for import merges and background compaction. Default is `min(available_parallelism, 4)`.
 - `JUSTLOG_IMPORT_MAX_RAW_WORKERS` caps concurrent raw-file parsing workers during `POST /admin/import/raw`. Default is `min(available_parallelism, 8)`.
@@ -271,7 +272,7 @@ Because the store uses one non-reentrant mutex around the SQLite connection, sto
 
 This is not hypothetical. A production HTTP/import stall on March 27, 2026 was caused by the compactor holding the DB mutex in `compactable_channel_days()` and `compactable_user_months()` while calling `segment_for_channel_day()` / `segment_for_user_month()`, which attempted to lock the same mutex again. The visible symptom was hanging request-time raw-import bookkeeping in `legacy_txt`, even though the true owner was background compaction.
 
-Reconstructed import-folder overlays do not enter SQLite hot storage. Raw IRC files from the import folder can be imported into SQLite because they already carry stable native message identities.
+Import-folder files now share one journaled importer. Older partitions bypass SQLite hot storage entirely and are written straight into archive segments; newer partitions can still use bounded hot-store inserts.
 
 ### Archived Storage
 
@@ -390,7 +391,7 @@ Behavior notes:
 - missing date segments redirect to a canonical path using the latest/default period
 - opted-out users and channels return `403`
 - Brotli can be used either as direct file passthrough or on-the-fly response compression
-- channel-day reads can consult the import-folder compatibility layer
+- channel-day reads can trigger the import-folder pipeline before native reads
 - `/list` can include channel-days discovered from import-folder files
 ### Import Folder Compatibility Reads
 
@@ -422,14 +423,14 @@ Supported import families:
 
 - raw IRC TXT or TXT.GZ: inserted into native storage with full parsed metadata
 - debug-wrapper TXT or TXT.GZ with embedded raw IRC lines: inserted into native storage using only extracted IRC payloads
-- simple sparse TXT: reconstructed overlay messages
-- JSON chat exports: reconstructed overlay messages with useful metadata preserved in tags
+- simple sparse TXT: normalized into canonical events and imported
+- JSON chat exports: normalized into canonical events with useful metadata preserved in tags
 
 If multiple matching files exist, imported and reconstructed messages are stable-sorted by timestamp. Parse failures are ignored and do not fail requests.
 
-For large migrations, `POST /admin/import/raw` is the preferred path. It reuses the same raw-file classification, imports raw IRC files in bulk, merges affected channel-day archives immediately, refreshes related user-month archives, and returns a summary JSON payload.
+For large migrations, `POST /admin/import/raw` is the preferred path. It drives the unified importer for raw IRC, sparse TXT, and JSON files and returns a summary JSON payload.
 
-For large import folders, raw IRC imports are streamed line-by-line instead of buffering full files in memory. Bulk raw import is now a one-file-at-a-time streaming pipeline, so it can begin importing before a whole-tree discovery pass finishes. The module logs start, periodic progress, and completion summaries through tracing, writes only durable raw-file states (`importing`, terminal success, terminal failure) into `imported_raw_files`, and only treats a file as current when its fingerprint matches a terminal status (`imported` or `seen`). If the process crashes or Docker stops mid-import, unfinished raw files are retried on the next matching request. Bulk raw import coalesces tiny-file event chunks into larger SQLite commits, recognizes v1-style raw layouts by trailing folder structure instead of a literal root folder name, and runs its batch/status/archive work as low-priority store traffic so normal requests and live ingest writes can preempt it between bounded units. Both plain `.txt` files and historical `.txt.gz` files participate in that layout detection. When `JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION=1`, month-level numeric shard files like `.../<channel>/<year>/<month>/<user_id>.txt(.gz)` are skipped only after sampling `JUSTLOG_IMPORT_V1_SKIP_SAMPLE_LINES` raw lines and proving that every sampled IRC `id` already exists in that month’s day-level `channel.txt(.gz)` data. If the proof is ambiguous, the shard is kept and imported. Archive compression for imported-day merges and background compaction now runs in parallel across independent segment files, capped by `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS`. When the delete flags are enabled, consumed files are removed after successful raw import, already-current raw files can also be removed during preflight, including refetched files whose current fingerprint is already stored, and reconstructed files are removed after successful overlay parsing, then empty parent directories are pruned.
+For large import folders, the unified importer discovers files incrementally while parsing work is already in flight, uses bounded queues plus persisted file state in SQLite, writes older partitions directly to archive segments with same-filesystem swaps, and deletes source files only after the durable commit succeeds.
 
 Whenever the import folder is checked, the module also prunes empty directories below that root and removes empty parent layers upward when possible.
 
@@ -443,7 +444,7 @@ Debugging note:
 - `POST /optout`: create a short-lived confirmation code for chat-based self opt-out
 - `POST /admin/channels`: add channel IDs, requires `X-Api-Key`
 - `DELETE /admin/channels`: remove channel IDs, requires `X-Api-Key`
-- `POST /admin/import/raw`: bulk raw import under `JUSTLOG_IMPORT_FOLDER`, requires `X-Api-Key`
+- `POST /admin/import/raw`: unified bulk import under `JUSTLOG_IMPORT_FOLDER`, requires `X-Api-Key`
 
 ### Metrics
 
@@ -493,7 +494,7 @@ It:
 This import path is distinct from the import-folder compatibility layer:
 
 - `src/import.rs` imports raw IRC-style history into normal storage
-- `src/legacy_txt.rs` handles recursive dropped import files during API reads, importing raw IRC files and overlaying reconstructed TXT/JSON data
+- `src/legacy_txt.rs` handles recursive dropped import files during API reads by delegating to the unified importer
 
 ## Testing Strategy
 

@@ -21,6 +21,7 @@ use walkdir::WalkDir;
 use crate::model::{
     CanonicalEvent, ChannelDayKey, ChannelLogFile, ChatMessage, PRIVMSG_TYPE, UserMonthKey,
 };
+use crate::import_pipeline::{ImportPipelineConfig, ImportTarget, run_import};
 use crate::store::{InsertEventsBatchOutcome, Store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,14 +126,22 @@ pub struct RawImportOutcome {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct BulkRawImportSummary {
     pub files_scanned: usize,
+    pub directories_visited: usize,
+    pub files_discovered: usize,
     pub raw_candidates: usize,
     pub files_selected: usize,
     pub files_skipped_v1_preferred: usize,
     pub files_current: usize,
     pub files_pending: usize,
+    pub files_resumed: usize,
     pub files_imported: usize,
     pub files_failed: usize,
     pub files_deleted: usize,
+    pub files_parsed_raw: usize,
+    pub files_parsed_simple: usize,
+    pub files_parsed_json: usize,
+    pub archive_partitions_committed: usize,
+    pub hot_partitions_inserted: usize,
     pub affected_channel_days: usize,
     pub affected_user_months: usize,
     pub elapsed_ms: u128,
@@ -156,6 +165,20 @@ const BULK_IMPORT_DISCOVERY_LOG_INTERVAL: usize = 500;
 const BULK_IMPORT_CHANNEL_WARN_THRESHOLD: usize = 200;
 
 impl LegacyTxtRuntime {
+    fn pipeline_config(&self) -> Result<ImportPipelineConfig> {
+        let import_folder = self
+            .import_folder_path()
+            .ok_or_else(|| anyhow!("import folder is not configured"))?;
+        Ok(ImportPipelineConfig {
+            import_folder,
+            mode: self.mode,
+            delete_raw_after_import: self.delete_raw_after_import,
+            delete_current_raw_on_discovery: self.delete_current_raw_on_discovery,
+            delete_reconstructed_after_import: self.delete_reconstructed_after_read,
+            delete_current_reconstructed_on_discovery: self.delete_current_reconstructed_on_discovery,
+        })
+    }
+
     pub fn from_env(_default_logs_directory: &Path) -> Self {
         let import_folder = env::var("JUSTLOG_IMPORT_FOLDER")
             .ok()
@@ -208,33 +231,38 @@ impl LegacyTxtRuntime {
         month: u32,
         day: u32,
     ) -> Result<RawImportOutcome> {
-        let files = self.discover_import_files()?;
-        let (raw_count, simple_count, json_count) = import_kind_counts(&files);
-        info!(
-            "Import-folder scan for channel-day {channel_id}/{year}/{month}/{day}: {} candidate file(s), raw={}, simple={}, json={}",
-            files.len(),
-            raw_count,
-            simple_count,
-            json_count
-        );
-        self.import_raw_files(
+        let config = self.pipeline_config()?;
+        let _summary = run_import(
             store,
-            files,
-            &format!("channel-day {channel_id}/{year}/{month}/{day}"),
-        )
+            &config,
+            ImportTarget {
+                channel_id: Some(channel_id.to_string()),
+                day: Some(ChannelDayKey {
+                    channel_id: channel_id.to_string(),
+                    year,
+                    month,
+                    day,
+                }),
+            },
+            None,
+            false,
+        )?;
+        Ok(RawImportOutcome::default())
     }
 
     pub fn import_raw_channel(&self, store: &Store, channel_id: &str) -> Result<RawImportOutcome> {
-        let files = self.discover_import_files()?;
-        let (raw_count, simple_count, json_count) = import_kind_counts(&files);
-        info!(
-            "Import-folder scan for channel {channel_id}: {} candidate file(s), raw={}, simple={}, json={}",
-            files.len(),
-            raw_count,
-            simple_count,
-            json_count
-        );
-        self.import_raw_files(store, files, &format!("channel {channel_id}"))
+        let config = self.pipeline_config()?;
+        let _summary = run_import(
+            store,
+            &config,
+            ImportTarget {
+                channel_id: Some(channel_id.to_string()),
+                day: None,
+            },
+            None,
+            false,
+        )?;
+        Ok(RawImportOutcome::default())
     }
 
     pub fn load_channel_day_import(
@@ -246,82 +274,9 @@ impl LegacyTxtRuntime {
         month: u32,
         day: u32,
     ) -> Result<ChannelDayImport> {
-        let mut result = ChannelDayImport::default();
-        let files = self.discover_import_files()?;
-        let (raw_count, simple_count, json_count) = import_kind_counts(&files);
-        let mut matched_simple_files = 0usize;
-        let mut matched_json_files = 0usize;
-        for file in files {
-            match file.kind {
-                ImportKind::RawIrc => {}
-                ImportKind::SimpleText => {
-                    if self.mode == LegacyTxtMode::Off {
-                        continue;
-                    }
-                    if !simple_text_file_matches_request(
-                        &file.path,
-                        channel_id,
-                        channel_login,
-                        year,
-                        month,
-                        day,
-                    ) {
-                        continue;
-                    }
-                    if self.handle_already_consumed_reconstructed_file(store, &file)? {
-                        continue;
-                    }
-                    if let Ok(messages) =
-                        parse_sparse_txt_file(&file.path, channel_login, year, month, day)
-                    {
-                        if !messages.is_empty() {
-                            matched_simple_files += 1;
-                            result.simple_messages.extend(messages);
-                            self.record_consumed_reconstructed_file(store, &file)?;
-                            self.delete_import_file_if_configured(&file, false);
-                        }
-                    }
-                }
-                ImportKind::JsonExport => {
-                    if self.handle_already_consumed_reconstructed_file(store, &file)? {
-                        continue;
-                    }
-                    if let Ok(messages) = parse_json_export_file(&file.path, channel_login) {
-                        let matching = messages
-                            .into_iter()
-                            .filter(|message| {
-                                chat_message_matches_channel_day(
-                                    message, channel_id, year, month, day,
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        if !matching.is_empty() {
-                            matched_json_files += 1;
-                            result.complete_messages.extend(matching);
-                            self.record_consumed_reconstructed_file(store, &file)?;
-                            self.delete_import_file_if_configured(&file, false);
-                        }
-                    }
-                }
-            }
-        }
-        result
-            .complete_messages
-            .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
-        result
-            .simple_messages
-            .sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
-        info!(
-            "Overlay scan for channel-day {channel_id}/{year}/{month}/{day}: candidate file(s) raw={}, simple={}, json={}; matched file(s) simple={}, json={}; message(s) simple={}, complete={}",
-            raw_count,
-            simple_count,
-            json_count,
-            matched_simple_files,
-            matched_json_files,
-            result.simple_messages.len(),
-            result.complete_messages.len()
-        );
-        Ok(result)
+        let _ = channel_login;
+        let _ = self.import_raw_channel_day(store, channel_id, year, month, day)?;
+        Ok(ChannelDayImport::default())
     }
 
     pub fn available_channel_logs(
@@ -425,303 +380,17 @@ impl LegacyTxtRuntime {
         limit_files: Option<usize>,
         dry_run: bool,
     ) -> Result<BulkRawImportSummary> {
-        let started = Instant::now();
-        let mut summary = BulkRawImportSummary {
-            dry_run,
-            channel_id: channel_id.map(str::to_string),
-            ..BulkRawImportSummary::default()
-        };
-        info!(
-            "Starting streaming bulk raw import: channel_filter={:?}, limit_files={:?}, dry_run={dry_run}",
-            channel_id, limit_files
-        );
-
-        let mut files = Vec::<ImportFile>::new();
-        let mut states = HashMap::<usize, RawFileImportState>::new();
-        let mut all_channel_days = BTreeSet::new();
-        let mut all_user_months = BTreeSet::new();
-        let mut pending_batch = PendingIndexedRawBatch::default();
-        let mut finished = 0usize;
-        let mut workers = Vec::new();
-        let mut work_tx_opt = None;
-        let mut result_rx_opt = None;
-        let mut worker_count = 0usize;
-        let compression_threads = std::env::var("JUSTLOG_IMPORT_MAX_COMPRESS_THREADS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(4);
-        let shutdown = Arc::new(AtomicBool::new(store.shutdown_requested()));
-
-        if !dry_run {
-            worker_count = default_bulk_raw_worker_count();
-            let planned_workers = worker_count.max(1);
-            info!(
-                "Starting streaming raw worker pool with {} raw worker(s), {} compression worker(s); coalesced_commit_events={}, coalesced_commit_files={}; SQLite progress writes disabled",
-                planned_workers,
-                compression_threads,
-                BULK_IMPORT_COMMIT_EVENTS,
-                BULK_IMPORT_COMMIT_FILES
-            );
-            let (work_tx, work_rx) =
-                mpsc::sync_channel::<Option<(usize, ImportFile)>>(planned_workers * 2);
-            let (result_tx, result_rx) =
-                mpsc::sync_channel::<RawWorkerMessage>(planned_workers * 8);
-            let shared_rx = Arc::new(Mutex::new(work_rx));
-            for _ in 0..planned_workers {
-                let sender = result_tx.clone();
-                let receiver = Arc::clone(&shared_rx);
-                let shutdown = Arc::clone(&shutdown);
-                workers.push(thread::spawn(move || {
-                    raw_import_worker_loop(receiver, sender, shutdown)
-                }));
-            }
-            drop(result_tx);
-            work_tx_opt = Some(work_tx);
-            result_rx_opt = Some(result_rx);
-        }
-
-        let mut active_month_state = None;
-        let root = match self.import_folder_path() {
-            Some(root) => root,
-            None => {
-                summary.elapsed_ms = started.elapsed().as_millis();
-                return Ok(summary);
-            }
-        };
-
-        for entry in WalkDir::new(&root)
-            .sort_by_file_name()
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if limit_files.is_some_and(|limit| summary.files_selected >= limit) {
-                break;
-            }
-            if store.shutdown_requested() {
-                shutdown.store(true, Ordering::SeqCst);
-                info!("store shutdown requested; stopping streaming bulk raw discovery");
-                break;
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.into_path();
-            let month_location = infer_v1_raw_location(&path);
-            if active_month_state
-                .as_ref()
-                .is_some_and(|state: &StreamingMonthState| {
-                    Some(&state.month_root)
-                        != month_location.as_ref().map(|location| &location.month_root)
-                })
-            {
-                self.flush_streaming_month_state(
-                    store,
-                    &mut active_month_state,
-                    &mut summary,
-                    dry_run,
-                    &mut files,
-                    work_tx_opt.as_ref(),
-                    result_rx_opt.as_ref(),
-                    &mut states,
-                    &mut pending_batch,
-                    &mut finished,
-                    &mut all_channel_days,
-                    &mut all_user_months,
-                )?;
-            }
-            if !is_supported_raw_import_path(&path) {
-                continue;
-            }
-
-            summary.files_scanned += 1;
-            if summary.files_scanned % BULK_IMPORT_DISCOVERY_LOG_INTERVAL == 0 {
-                info!(
-                    "Streaming bulk raw discovery progress: scanned={} raw_candidates={} selected={} current={} skipped_v1_preferred={}",
-                    summary.files_scanned,
-                    summary.raw_candidates,
-                    summary.files_selected,
-                    summary.files_current,
-                    summary.files_skipped_v1_preferred
-                );
-            }
-
-            let fingerprint = match file_fingerprint(&path) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    warn!(
-                        "Skipping raw import candidate {}: {error:#}",
-                        path.display()
-                    );
-                    continue;
-                }
-            };
-            let file = ImportFile {
-                path,
-                fingerprint,
-                kind: ImportKind::RawIrc,
-            };
-            let is_raw = if looks_like_v1_raw_import_path(&file.path) {
-                true
-            } else {
-                match behaves_like_raw_irc_path(&file.path) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(
-                            "Skipping raw import candidate {} during classification: {error:#}",
-                            file.path.display()
-                        );
-                        false
-                    }
-                }
-            };
-            if !is_raw {
-                continue;
-            }
-            summary.raw_candidates += 1;
-            if channel_id.is_some_and(|value| !raw_file_matches_channel(&file, value)) {
-                continue;
-            }
-            info!("Discovered raw import file {}", file.path.display());
-
-            let path_key = file.path.to_string_lossy().to_string();
-            let is_current =
-                store.imported_raw_file_is_current_low_priority(&path_key, &file.fingerprint)?;
-            if let Some(location) = month_location.as_ref() {
-                if matches!(location.kind, V1RawPathKind::ChannelDay) && is_v1_shard_skip_enabled()
-                {
-                    let state = ensure_streaming_month_state(&mut active_month_state, location);
-                    collect_channel_file_event_ids_into(&file.path, &mut state.month_channel_ids);
-                }
-            }
-            if is_current {
-                summary.files_current += 1;
-                info!("Skipping already-current raw file {}", file.path.display());
-                if !dry_run && self.delete_current_raw_if_configured(&file) {
-                    summary.files_deleted += 1;
-                }
-                if let Some(result_rx) = result_rx_opt.as_ref() {
-                    process_ready_worker_messages(
-                        self,
-                        store,
-                        result_rx,
-                        &files,
-                        &mut states,
-                        &mut pending_batch,
-                        &mut finished,
-                        &mut summary,
-                        &mut all_channel_days,
-                        &mut all_user_months,
-                    )?;
-                }
-                continue;
-            }
-
-            if let Some(location) = month_location.as_ref() {
-                if is_v1_shard_skip_enabled()
-                    && matches!(location.kind, V1RawPathKind::MonthUserShard)
-                {
-                    let state = ensure_streaming_month_state(&mut active_month_state, location);
-                    info!(
-                        "Parking month user shard {} until month proof is ready",
-                        file.path.display()
-                    );
-                    state.pending_shards.push(file);
-                    continue;
-                }
-            }
-
-            if dry_run {
-                summary.files_selected += 1;
-                summary.files_pending += 1;
-            } else if let (Some(work_tx), Some(result_rx)) =
-                (work_tx_opt.as_ref(), result_rx_opt.as_ref())
-            {
-                self.schedule_streaming_raw_file(
-                    store,
-                    work_tx,
-                    result_rx,
-                    file,
-                    &mut files,
-                    &mut states,
-                    &mut pending_batch,
-                    &mut finished,
-                    &mut summary,
-                    &mut all_channel_days,
-                    &mut all_user_months,
-                )?;
-            }
-        }
-
-        self.flush_streaming_month_state(
+        let config = self.pipeline_config()?;
+        run_import(
             store,
-            &mut active_month_state,
-            &mut summary,
+            &config,
+            ImportTarget {
+                channel_id: channel_id.map(str::to_string),
+                day: None,
+            },
+            limit_files,
             dry_run,
-            &mut files,
-            work_tx_opt.as_ref(),
-            result_rx_opt.as_ref(),
-            &mut states,
-            &mut pending_batch,
-            &mut finished,
-            &mut all_channel_days,
-            &mut all_user_months,
-        )?;
-
-        if let Some(work_tx) = work_tx_opt.take() {
-            for _ in 0..worker_count.max(1) {
-                work_tx.send(None)?;
-            }
-        }
-
-        if let Some(result_rx) = result_rx_opt.as_ref() {
-            while finished < summary.files_pending {
-                process_next_worker_message(
-                    self,
-                    store,
-                    result_rx.recv().map_err(|_| {
-                        anyhow!("bulk raw import worker channel closed unexpectedly")
-                    })?,
-                    &files,
-                    &mut states,
-                    &mut pending_batch,
-                    &mut finished,
-                    &mut summary,
-                    &mut all_channel_days,
-                    &mut all_user_months,
-                )?;
-            }
-            flush_pending_indexed_raw_batch(
-                store,
-                &mut pending_batch,
-                &mut states,
-                summary.files_pending,
-            )?;
-        }
-
-        for worker in workers {
-            let _ = worker.join();
-        }
-
-        summary.affected_channel_days = all_channel_days.len();
-        summary.affected_user_months = all_user_months.len();
-
-        summary.elapsed_ms = started.elapsed().as_millis();
-        info!(
-            "Completed bulk raw import: scanned={}, selected={}, skipped_v1_preferred={}, current={}, pending={}, imported={}, failed={}, deleted={}, channel_days={}, user_months={}, elapsed_ms={}",
-            summary.files_scanned,
-            summary.files_selected,
-            summary.files_skipped_v1_preferred,
-            summary.files_current,
-            summary.files_pending,
-            summary.files_imported,
-            summary.files_failed,
-            summary.files_deleted,
-            summary.affected_channel_days,
-            summary.affected_user_months,
-            summary.elapsed_ms
-        );
-        Ok(summary)
+        )
     }
 
     fn discover_import_files(&self) -> Result<Vec<ImportFile>> {

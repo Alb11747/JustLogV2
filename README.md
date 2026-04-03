@@ -87,7 +87,7 @@ Supported env flags:
 - `JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST=1`: re-check reconstructed-file availability on each request.
 - `JUSTLOG_IMPORT_DELETE_RAW=1`: delete raw IRC source files after they are successfully imported into native storage.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=0|1`: delete raw IRC source files that are already marked current in native storage. Default is `1`.
-- `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`: delete reconstructed TXT / JSON source files after they are successfully consumed on read.
+- `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`: delete reconstructed TXT / JSON source files after they are durably imported.
 - `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=0|1`: delete reconstructed TXT / JSON source files that are already marked consumed with the same fingerprint. Default is `0`.
 - `JUSTLOG_IMPORT_MAX_COMPRESS_THREADS=<n>`: global cap for concurrent archive compression jobs. Default is `min(available_parallelism, 4)`.
 - `JUSTLOG_IMPORT_MAX_RAW_WORKERS=<n>`: global cap for concurrent raw-file parsing workers during bulk raw import. Default is `min(available_parallelism, 8)`.
@@ -99,10 +99,10 @@ Behavior summary:
 - Raw IRC `.txt` and `.txt.gz` files are imported into the native store when found.
 - Today’s live/raw `.txt` files and older `.txt.gz` files are both supported; the importer does not require gzip.
 - Wrapped debug logs that contain embedded IRC payloads such as `... FROM SERVER: @badge-info=... PRIVMSG ...` are also treated as raw IRC sources. Other log lines in those files are ignored.
-- Simple sparse TXT files like `[0:04:26] user: msg` stay separate and are controlled by `JUSTLOG_LEGACY_TXT_MODE`.
-- JSON `.json` and `.json.gz` chat exports stay separate and are merged at read time.
-- `off` only disables reconstructed overlays. It does not disable raw IRC imports.
-- Large raw migrations should use `POST /admin/import/raw` instead of relying on a normal log request to do the work.
+- Simple sparse TXT files like `[0:04:26] user: msg` and JSON `.json` / `.json.gz` chat exports are imported through the same durable pipeline as raw IRC files.
+- `off` only disables simple sparse TXT imports. It does not disable raw IRC or JSON imports.
+- Discovery runs incrementally while import work is already in flight; the importer does not wait for a full tree scan before starting.
+- Large migrations should use `POST /admin/import/raw` instead of relying on a normal log request to do the work.
 
 The current scope is channel-day reads and `/list`. User-month, random, and range reads still use native data only.
 
@@ -125,8 +125,8 @@ That folder is mounted into the container as:
 The easiest workflow is:
 
 1. Set `JUSTLOG_IMPORT_FOLDER=/import-folder` in `.env`.
-2. Choose `JUSTLOG_LEGACY_TXT_MODE` for reconstructed simple TXT and JSON overlays.
-3. Optionally set `JUSTLOG_IMPORT_DELETE_RAW=1`, adjust `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW`, and/or set `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` plus `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1` if you want consumed source files removed automatically.
+2. Choose `JUSTLOG_LEGACY_TXT_MODE` only if you want to suppress simple sparse TXT imports with `off`.
+3. Optionally set `JUSTLOG_IMPORT_DELETE_RAW=1`, adjust `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW`, and/or set `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1` plus `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1` if you want source files removed after durable import.
 4. Copy files anywhere under `./data/import-folder`.
 5. Restart the service with `docker compose up -d --build` or `docker compose restart`.
 
@@ -175,9 +175,9 @@ TXT files are classified per file:
 
 - Raw IRC text with stable Twitch metadata is imported into native storage and keeps all parsed fields.
 - Debug-style wrapper logs are accepted when they contain embedded raw IRC lines; unrelated wrapper/debug lines are skipped.
-- Simple sparse text is reconstructed into overlay messages.
+- Simple sparse text is normalized into canonical events and imported through the same journaled pipeline.
 
-JSON exports are reconstructed into overlay messages using fields such as:
+JSON exports are normalized into canonical events using fields such as:
 
 - `comments[]._id`
 - `comments[].created_at`
@@ -194,7 +194,7 @@ Useful extra JSON metadata is preserved in message tags when available, such as 
 Large import folders are handled incrementally:
 
 - Raw IRC imports are streamed line-by-line instead of loading full files into memory.
-- Bulk raw import is a streaming one-file-at-a-time pipeline, so it can begin importing before a whole-tree discovery pass finishes.
+- Bulk import is a streaming pipeline, so it can begin importing before a whole-tree discovery pass finishes.
 - Bulk raw import recognizes v1-style raw layouts by trailing folder structure, not by a literal `v1` directory name.
 - Month-level numeric shard files like `.../<channel>/<year>/<month>/<user_id>.txt(.gz)` are only skipped when `JUSTLOG_IMPORT_V1_SKIP_OPTIMIZATION=1`.
 - When that optimization is enabled, a shard is skipped only after a sanity check proves its sampled IRC `id` values already exist in that month’s `.../<channel>/<year>/<month>/<day>/channel.txt(.gz)` data.
@@ -209,9 +209,9 @@ Large import folders are handled incrementally:
 - Re-importing an already completed raw file is skipped when its fingerprint is unchanged.
 - If `JUSTLOG_IMPORT_DELETE_RAW=1`, successfully imported raw files are deleted after completion.
 - If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RAW=1`, raw files that are already current in native storage are also deleted during the preflight scan. This also applies to files you refetched and re-imported successfully once their current fingerprint is already in native storage. This flag defaults to `1`.
-- If `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`, successfully parsed reconstructed TXT / JSON files are deleted after the request that consumed them.
+- If `JUSTLOG_IMPORT_DELETE_RECONSTRUCTED=1`, successfully imported reconstructed TXT / JSON files are deleted after the durable commit succeeds.
 - If `JUSTLOG_IMPORT_DELETE_ALREADY_IMPORTED_RECONSTRUCTED=1`, reconstructed TXT / JSON files that were already consumed successfully and are still unchanged are deleted during later discovery before reparsing.
-- `POST /admin/import/raw` can bulk-import raw IRC files under `JUSTLOG_IMPORT_FOLDER`, optionally filtered by `channel_id`, limited by file count, or run as `dry_run`.
+- `POST /admin/import/raw` drives the unified importer for raw IRC, sparse TXT, and JSON files under `JUSTLOG_IMPORT_FOLDER`, optionally filtered by `channel_id`, limited by file count, or run as `dry_run`.
 - Bulk import summaries now include `files_skipped_v1_preferred`, which counts month-level numeric shards skipped by the optimization.
 
 ### Import stall troubleshooting

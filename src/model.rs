@@ -276,6 +276,50 @@ impl CanonicalEvent {
         }
         keys
     }
+
+    pub fn from_chat_message(
+        room_id: &str,
+        channel_login: &str,
+        message: &ChatMessage,
+    ) -> Self {
+        let mut tags = message.tags.clone();
+        if !room_id.is_empty() {
+            tags.entry("room-id".to_string())
+                .or_insert_with(|| room_id.to_string());
+        }
+        tags.entry("display-name".to_string())
+            .or_insert_with(|| message.display_name.clone());
+
+        let user_id = tags
+            .get("user-id")
+            .cloned()
+            .filter(|value| !value.is_empty());
+        let target_user_id = tags
+            .get("target-user-id")
+            .cloned()
+            .filter(|value| !value.is_empty());
+        let resolved_channel_login = if channel_login.is_empty() {
+            message.channel.clone()
+        } else {
+            channel_login.to_string()
+        };
+
+        Self {
+            event_uid: message.id.clone(),
+            room_id: room_id.to_string(),
+            channel_login: resolved_channel_login,
+            username: message.username.clone(),
+            display_name: message.display_name.clone(),
+            user_id,
+            target_user_id,
+            text: message.text.clone(),
+            system_text: message.system_text.clone(),
+            timestamp: message.timestamp,
+            raw: message.raw.clone(),
+            tags,
+            kind: message.message_type,
+        }
+    }
 }
 
 impl From<StoredEvent> for ChatMessage {

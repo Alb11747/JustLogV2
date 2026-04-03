@@ -1,6 +1,7 @@
 mod common;
 
 use std::fs;
+use std::io::Read as _;
 use std::io::Write;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -16,7 +17,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::{Duration, sleep, timeout};
 
-use common::{TestHarness, privmsg};
+use common::{TestHarness, TestHarnessOptions, privmsg};
 
 fn env_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -106,7 +107,24 @@ fn tiny_debug_raw_log(messages: &[(&str, i64, &str)]) -> String {
     lines.join("\n")
 }
 
-async fn import_fixture_day_and_return_body(path: &Path, content: &str) -> String {
+fn decode_brotli(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    let mut decoder = brotli::Decompressor::new(bytes, 16 * 1024);
+    decoder.read_to_string(&mut output).unwrap();
+    output
+}
+
+struct ImportedBodies {
+    live: String,
+    archived: String,
+    archived_raw_br: String,
+}
+
+async fn import_fixture_day_and_return_bodies(
+    path: &Path,
+    content: &str,
+    verify_compression: bool,
+) -> ImportedBodies {
     let _guard = env_lock().lock().await;
     let temp = TempDir::new().unwrap();
     let import_root = temp.path().join("imports");
@@ -118,8 +136,16 @@ async fn import_fixture_day_and_return_body(path: &Path, content: &str) -> Strin
         std::env::set_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST", "1");
     }
 
-    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
-    let body = harness
+    let harness = TestHarness::start_with_options(TestHarnessOptions {
+        channel_ids: vec!["1".to_string()],
+        start_ingest: false,
+        start_compactor: verify_compression,
+        compact_interval_seconds: 60,
+        compact_after_channel_days: 7,
+        ..Default::default()
+    })
+    .await;
+    let live = harness
         .response_text(
             Request::builder()
                 .uri("/channelid/1/2024/1/2")
@@ -128,12 +154,45 @@ async fn import_fixture_day_and_return_body(path: &Path, content: &str) -> Strin
         )
         .await;
 
+    let (archived, archived_raw_br) = if verify_compression {
+        harness
+            .advance_time(Duration::from_secs(8 * 24 * 60 * 60 + 60))
+            .await;
+        harness.wait_for_channel_segment("1", 2024, 1, 2).await;
+        let archived = harness
+            .response_text(
+                Request::builder()
+                    .uri("/channelid/1/2024/1/2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let archived_raw = harness
+            .request(
+                Request::builder()
+                    .uri("/channelid/1/2024/1/2?raw=1")
+                    .header("accept-encoding", "br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        let archived_raw_br =
+            decode_brotli(&to_bytes(archived_raw.into_body(), usize::MAX).await.unwrap());
+        (archived, archived_raw_br)
+    } else {
+        (live.clone(), String::new())
+    };
+
     unsafe {
         std::env::remove_var("JUSTLOG_IMPORT_FOLDER");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_MODE");
         std::env::remove_var("JUSTLOG_LEGACY_TXT_CHECK_EACH_REQUEST");
     }
-    body
+    ImportedBodies {
+        live,
+        archived,
+        archived_raw_br,
+    }
 }
 
 #[test]
@@ -336,9 +395,9 @@ async fn import_folder_raw_import_merges_into_existing_archived_day() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn json_import_file_loads_messages_for_requested_day() {
-    let body = import_fixture_day_and_return_body(
+    let bodies = import_fixture_day_and_return_bodies(
         Path::new("formats/1/2024/1/2.json"),
         &tiny_json_export(
             2,
@@ -347,16 +406,21 @@ async fn json_import_file_loads_messages_for_requested_day() {
                 ("json-small-2", "Json Small Two", "jsonsmalltwo", "json import beta"),
             ],
         ),
+        true,
     )
     .await;
 
-    assert!(body.contains("json import alpha"));
-    assert!(body.contains("json import beta"));
+    assert!(bodies.live.contains("json import alpha"));
+    assert!(bodies.live.contains("json import beta"));
+    assert!(bodies.archived.contains("json import alpha"));
+    assert!(bodies.archived.contains("json import beta"));
+    assert!(bodies.archived_raw_br.contains("json import alpha"));
+    assert!(bodies.archived_raw_br.contains("json import beta"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn json_gzip_import_file_loads_messages_for_requested_day() {
-    let body = import_fixture_day_and_return_body(
+    let bodies = import_fixture_day_and_return_bodies(
         Path::new("formats/1/2024/1/2.json.gz"),
         &tiny_json_export(
             2,
@@ -365,73 +429,100 @@ async fn json_gzip_import_file_loads_messages_for_requested_day() {
                 ("json-gz-small-2", "Json Gz Two", "jsongztwo", "json gz import beta"),
             ],
         ),
+        true,
     )
     .await;
 
-    assert!(body.contains("json gz import alpha"));
-    assert!(body.contains("json gz import beta"));
+    assert!(bodies.live.contains("json gz import alpha"));
+    assert!(bodies.live.contains("json gz import beta"));
+    assert!(bodies.archived.contains("json gz import alpha"));
+    assert!(bodies.archived.contains("json gz import beta"));
+    assert!(bodies.archived_raw_br.contains("json gz import alpha"));
+    assert!(bodies.archived_raw_br.contains("json gz import beta"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn simple_text_import_file_loads_messages_for_requested_day() {
-    let body = import_fixture_day_and_return_body(
+    let bodies = import_fixture_day_and_return_bodies(
         Path::new("[1-2-24] channelone - Tiny Chat.txt"),
         &tiny_simple_text(&[
             ("0:00:04", "Text User One: txt import alpha"),
             ("0:00:09", "Text User Two: txt import beta"),
         ]),
+        true,
     )
     .await;
 
-    assert!(body.contains("txt import alpha"));
-    assert!(body.contains("txt import beta"));
+    assert!(bodies.live.contains("txt import alpha"));
+    assert!(bodies.live.contains("txt import beta"));
+    assert!(bodies.archived.contains("txt import alpha"));
+    assert!(bodies.archived.contains("txt import beta"));
+    assert!(bodies.archived_raw_br.contains("txt import alpha"));
+    assert!(bodies.archived_raw_br.contains("txt import beta"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn simple_text_gzip_import_file_loads_messages_for_requested_day() {
-    let body = import_fixture_day_and_return_body(
+    let bodies = import_fixture_day_and_return_bodies(
         Path::new("[1-2-24] channelone - Tiny Chat.txt.gz"),
         &tiny_simple_text(&[
             ("0:00:04", "Text Gz One: txt gz import alpha"),
             ("0:00:09", "Text Gz Two: txt gz import beta"),
         ]),
+        true,
     )
     .await;
 
-    assert!(body.contains("txt gz import alpha"));
-    assert!(body.contains("txt gz import beta"));
+    assert!(bodies.live.contains("txt gz import alpha"));
+    assert!(bodies.live.contains("txt gz import beta"));
+    assert!(bodies.archived.contains("txt gz import alpha"));
+    assert!(bodies.archived.contains("txt gz import beta"));
+    assert!(bodies.archived_raw_br.contains("txt gz import alpha"));
+    assert!(bodies.archived_raw_br.contains("txt gz import beta"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn raw_log_import_file_extracts_from_server_privmsg_lines() {
-    let body = import_fixture_day_and_return_body(
+    let bodies = import_fixture_day_and_return_bodies(
         Path::new("raw/1/2024/1/2.log"),
         &tiny_debug_raw_log(&[
             ("log-small-1", 1_704_153_604_000, "log import alpha"),
             ("log-small-2", 1_704_153_609_000, "log import beta"),
         ]),
+        true,
     )
     .await;
 
-    assert!(body.contains("log import alpha"));
-    assert!(body.contains("log import beta"));
-    assert!(!body.contains("unrelated line"));
+    assert!(bodies.live.contains("log import alpha"));
+    assert!(bodies.live.contains("log import beta"));
+    assert!(!bodies.live.contains("unrelated line"));
+    assert!(bodies.archived.contains("log import alpha"));
+    assert!(bodies.archived.contains("log import beta"));
+    assert!(bodies.archived_raw_br.contains("log import alpha"));
+    assert!(bodies.archived_raw_br.contains("log import beta"));
+    assert!(!bodies.archived_raw_br.contains("unrelated line"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn raw_log_gzip_import_file_extracts_from_server_privmsg_lines() {
-    let body = import_fixture_day_and_return_body(
+    let bodies = import_fixture_day_and_return_bodies(
         Path::new("raw/1/2024/1/2.log.gz"),
         &tiny_debug_raw_log(&[
             ("log-gz-small-1", 1_704_153_604_000, "log gz import alpha"),
             ("log-gz-small-2", 1_704_153_609_000, "log gz import beta"),
         ]),
+        true,
     )
     .await;
 
-    assert!(body.contains("log gz import alpha"));
-    assert!(body.contains("log gz import beta"));
-    assert!(!body.contains("unrelated line"));
+    assert!(bodies.live.contains("log gz import alpha"));
+    assert!(bodies.live.contains("log gz import beta"));
+    assert!(!bodies.live.contains("unrelated line"));
+    assert!(bodies.archived.contains("log gz import alpha"));
+    assert!(bodies.archived.contains("log gz import beta"));
+    assert!(bodies.archived_raw_br.contains("log gz import alpha"));
+    assert!(bodies.archived_raw_br.contains("log gz import beta"));
+    assert!(!bodies.archived_raw_br.contains("unrelated line"));
 }
 
 #[tokio::test]

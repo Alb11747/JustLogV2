@@ -741,20 +741,32 @@ components:
       type: object
       required:
         - files_scanned
+        - directories_visited
+        - files_discovered
         - raw_candidates
         - files_selected
         - files_skipped_v1_preferred
         - files_current
         - files_pending
+        - files_resumed
         - files_imported
         - files_failed
         - files_deleted
+        - files_parsed_raw
+        - files_parsed_simple
+        - files_parsed_json
+        - archive_partitions_committed
+        - hot_partitions_inserted
         - affected_channel_days
         - affected_user_months
         - elapsed_ms
         - dry_run
       properties:
         files_scanned:
+          type: integer
+        directories_visited:
+          type: integer
+        files_discovered:
           type: integer
         raw_candidates:
           type: integer
@@ -766,11 +778,23 @@ components:
           type: integer
         files_pending:
           type: integer
+        files_resumed:
+          type: integer
         files_imported:
           type: integer
         files_failed:
           type: integer
         files_deleted:
+          type: integer
+        files_parsed_raw:
+          type: integer
+        files_parsed_simple:
+          type: integer
+        files_parsed_json:
+          type: integer
+        archive_partitions_committed:
+          type: integer
+        hot_partitions_inserted:
           type: integer
         affected_channel_days:
           type: integer

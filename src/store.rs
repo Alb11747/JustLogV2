@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use brotli::{CompressorWriter, Decompressor};
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
 use rusqlite::{ToSql, params_from_iter};
@@ -38,6 +38,8 @@ pub struct Store {
     import_db: Arc<Mutex<Connection>>,
     root_dir: PathBuf,
     archive_enabled: bool,
+    compact_after_channel_days: i64,
+    compact_after_user_months: i64,
     compression_executor: Arc<CompressionExecutor>,
     compression_paths: Arc<CompressionPathLocks>,
     db_priority: Arc<DbPriorityScheduler>,
@@ -403,6 +405,8 @@ impl Store {
             import_db: Arc::new(Mutex::new(import_connection)),
             root_dir: config.logs_directory.clone(),
             archive_enabled: config.archive,
+            compact_after_channel_days: config.storage.compact_after_channel_days,
+            compact_after_user_months: config.storage.compact_after_user_months,
             compression_executor: Arc::new(CompressionExecutor::new(
                 compression_threads,
                 config.compression.quality,
@@ -509,6 +513,72 @@ impl Store {
                 imported_at INTEGER NOT NULL,
                 status TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS import_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                status TEXT NOT NULL,
+                channel_filter TEXT,
+                limit_files INTEGER,
+                dry_run INTEGER NOT NULL DEFAULT 0,
+                directories_visited INTEGER NOT NULL DEFAULT 0,
+                files_discovered INTEGER NOT NULL DEFAULT 0,
+                files_completed INTEGER NOT NULL DEFAULT 0,
+                files_failed INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS import_files (
+                path TEXT PRIMARY KEY,
+                run_id INTEGER,
+                fingerprint TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                discovered_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS import_partition_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                user_id TEXT,
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL,
+                day INTEGER,
+                state TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                source_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS import_file_partitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                user_id TEXT,
+                year INTEGER NOT NULL,
+                month INTEGER NOT NULL,
+                day INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS import_checkpoints (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                run_id INTEGER,
+                updated_at INTEGER NOT NULL,
+                directories_visited INTEGER NOT NULL DEFAULT 0,
+                files_discovered INTEGER NOT NULL DEFAULT 0,
+                last_path TEXT
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS import_partition_outputs_partition_idx
+                ON import_partition_outputs(scope, channel_id, COALESCE(user_id, ''), year, month, COALESCE(day, 0));
+
+            CREATE UNIQUE INDEX IF NOT EXISTS import_file_partitions_unique_idx
+                ON import_file_partitions(path, scope, channel_id, COALESCE(user_id, ''), year, month, COALESCE(day, 0));
             "#,
         )?;
         Ok(())
@@ -1214,6 +1284,197 @@ impl Store {
         Ok(())
     }
 
+    pub fn start_import_run(
+        &self,
+        channel_filter: Option<&str>,
+        limit_files: Option<usize>,
+        dry_run: bool,
+    ) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        let db = self.lock_import_db();
+        db.execute(
+            r#"
+            INSERT INTO import_runs(
+                started_at, updated_at, completed_at, status, channel_filter, limit_files, dry_run
+            ) VALUES(?1, ?1, NULL, 'running', ?2, ?3, ?4)
+            "#,
+            params![
+                now,
+                channel_filter,
+                limit_files.map(|value| value as i64),
+                if dry_run { 1 } else { 0 }
+            ],
+        )?;
+        Ok(db.last_insert_rowid())
+    }
+
+    pub fn update_import_run_progress(
+        &self,
+        run_id: i64,
+        directories_visited: usize,
+        files_discovered: usize,
+        files_completed: usize,
+        files_failed: usize,
+        last_path: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let db = self.lock_import_db_low_priority("import run progress");
+        db.execute(
+            r#"
+            UPDATE import_runs
+            SET updated_at = ?2,
+                directories_visited = ?3,
+                files_discovered = ?4,
+                files_completed = ?5,
+                files_failed = ?6
+            WHERE id = ?1
+            "#,
+            params![
+                run_id,
+                now,
+                directories_visited as i64,
+                files_discovered as i64,
+                files_completed as i64,
+                files_failed as i64
+            ],
+        )?;
+        db.execute(
+            r#"
+            INSERT INTO import_checkpoints(id, run_id, updated_at, directories_visited, files_discovered, last_path)
+            VALUES(1, ?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+                run_id = excluded.run_id,
+                updated_at = excluded.updated_at,
+                directories_visited = excluded.directories_visited,
+                files_discovered = excluded.files_discovered,
+                last_path = excluded.last_path
+            "#,
+            params![
+                run_id,
+                now,
+                directories_visited as i64,
+                files_discovered as i64,
+                last_path
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_import_run(&self, run_id: i64, status: &str) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let db = self.lock_import_db();
+        db.execute(
+            r#"
+            UPDATE import_runs
+            SET updated_at = ?2, completed_at = ?2, status = ?3
+            WHERE id = ?1
+            "#,
+            params![run_id, now, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_file_state(&self, path: &str) -> Result<Option<(String, String)>> {
+        let db = self.lock_import_db_low_priority("import file read");
+        db.query_row(
+            "SELECT fingerprint, state FROM import_files WHERE path = ?1",
+            params![path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_import_file_state(
+        &self,
+        run_id: i64,
+        path: &str,
+        fingerprint: &str,
+        kind: &str,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let db = self.lock_import_db_low_priority("import file write");
+        db.execute(
+            r#"
+            INSERT INTO import_files(path, run_id, fingerprint, kind, state, discovered_at, updated_at, last_error)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)
+            ON CONFLICT(path) DO UPDATE SET
+                run_id = excluded.run_id,
+                fingerprint = excluded.fingerprint,
+                kind = excluded.kind,
+                state = excluded.state,
+                updated_at = excluded.updated_at,
+                last_error = excluded.last_error
+            "#,
+            params![path, run_id, fingerprint, kind, state, now, last_error],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_import_partition_state(
+        &self,
+        scope: &str,
+        channel_id: &str,
+        user_id: Option<&str>,
+        year: i32,
+        month: u32,
+        day: Option<u32>,
+        state: &str,
+        last_error: Option<&str>,
+        increment_source_count: bool,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let db = self.lock_import_db_low_priority("import partition write");
+        db.execute(
+            r#"
+            INSERT INTO import_partition_outputs(
+                scope, channel_id, user_id, year, month, day, state, updated_at, source_count, last_error
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(scope, channel_id, COALESCE(user_id, ''), year, month, COALESCE(day, 0)) DO UPDATE SET
+                state = excluded.state,
+                updated_at = excluded.updated_at,
+                source_count = import_partition_outputs.source_count + excluded.source_count,
+                last_error = excluded.last_error
+            "#,
+            params![
+                scope,
+                channel_id,
+                user_id,
+                year,
+                month,
+                day,
+                state,
+                now,
+                if increment_source_count { 1 } else { 0 },
+                last_error
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_import_file_partition(
+        &self,
+        path: &str,
+        scope: &str,
+        channel_id: &str,
+        user_id: Option<&str>,
+        year: i32,
+        month: u32,
+        day: Option<u32>,
+    ) -> Result<()> {
+        let db = self.lock_import_db_low_priority("import file partition write");
+        db.execute(
+            r#"
+            INSERT OR IGNORE INTO import_file_partitions(path, scope, channel_id, user_id, year, month, day)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![path, scope, channel_id, user_id, year, month, day],
+        )?;
+        Ok(())
+    }
+
     fn compactable_channel_days(
         &self,
         threshold: DateTime<Utc>,
@@ -1467,10 +1728,7 @@ impl Store {
             result.output_bytes,
             result.elapsed
         );
-        if prepared.final_path.exists() {
-            fs::remove_file(&prepared.final_path)?;
-        }
-        fs::rename(&result.temp_path, &prepared.final_path)?;
+        safe_replace_file(&result.temp_path, &prepared.final_path)?;
         tracing::info!(
             "Compression install completed: target={}",
             prepared.relative_path
@@ -1836,6 +2094,138 @@ impl Store {
             ],
         )?;
         Ok(relative)
+    }
+
+    pub fn import_replace_or_create_channel_segment(
+        &self,
+        channel_id: &str,
+        year: i32,
+        month: u32,
+        day: u32,
+        events: &[StoredEvent],
+    ) -> Result<String> {
+        let relative = format!(
+            "segments/channel/{}/{}/{}/{}.br",
+            channel_id, year, month, day
+        );
+        let final_path = self.root_dir.join(&relative);
+        let temp_path = self.root_dir.join(format!("{relative}.import.tmp"));
+        self.write_pending_segment(
+            "channel",
+            channel_id,
+            None,
+            year,
+            month,
+            Some(day),
+            &temp_path,
+            &final_path,
+        )?;
+        let prepared = self.prepare_segment_write(&final_path, &temp_path, events)?;
+        let line_count = prepared.line_count;
+        let start_ts = prepared.start_ts;
+        let end_ts = prepared.end_ts;
+        self.finish_segment_write(prepared)?;
+        let mut db = self.lock_db();
+        let tx = db.transaction()?;
+        tx.execute(
+            r#"
+            INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
+            VALUES('channel', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'brotli', 1)
+            "#,
+            params![channel_id, year, month, day, relative, line_count as i64, start_ts, end_ts],
+        )?;
+        tx.execute(
+            r#"
+            DELETE FROM events
+            WHERE room_id = ?1
+              AND strftime('%Y', timestamp_rfc3339) = printf('%04d', ?2)
+              AND strftime('%m', timestamp_rfc3339) = printf('%02d', ?3)
+              AND strftime('%d', timestamp_rfc3339) = printf('%02d', ?4)
+            "#,
+            params![channel_id, year, month, day],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_segments WHERE final_path = ?1",
+            params![relative],
+        )?;
+        tx.commit()?;
+        drop(db);
+        self.schedule_reconciliation(
+            channel_id,
+            year,
+            month,
+            day,
+            &relative,
+            Utc::now() + Duration::seconds(RECONCILIATION_DELAY_SECONDS),
+        )?;
+        Ok(relative)
+    }
+
+    pub fn import_replace_or_create_user_segment(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        year: i32,
+        month: u32,
+        events: &[StoredEvent],
+    ) -> Result<String> {
+        let relative = format!(
+            "segments/user/{}/{}/{}/{}.br",
+            channel_id, user_id, year, month
+        );
+        let final_path = self.root_dir.join(&relative);
+        let temp_path = self.root_dir.join(format!("{relative}.import.tmp"));
+        self.write_pending_segment(
+            "user",
+            channel_id,
+            Some(user_id),
+            year,
+            month,
+            None,
+            &temp_path,
+            &final_path,
+        )?;
+        let prepared = self.prepare_segment_write(&final_path, &temp_path, events)?;
+        let line_count = prepared.line_count;
+        let start_ts = prepared.start_ts;
+        let end_ts = prepared.end_ts;
+        self.finish_segment_write(prepared)?;
+        let mut db = self.lock_db();
+        let tx = db.transaction()?;
+        tx.execute(
+            r#"
+            INSERT OR REPLACE INTO segments(scope, channel_id, user_id, year, month, day, path, line_count, start_ts, end_ts, compression, passthrough_raw)
+            VALUES('user', ?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, 'brotli', 1)
+            "#,
+            params![channel_id, user_id, year, month, relative, line_count as i64, start_ts, end_ts],
+        )?;
+        tx.execute(
+            r#"
+            DELETE FROM events
+            WHERE room_id = ?1
+              AND (user_id = ?2 OR target_user_id = ?2)
+              AND strftime('%Y', timestamp_rfc3339) = printf('%04d', ?3)
+              AND strftime('%m', timestamp_rfc3339) = printf('%02d', ?4)
+            "#,
+            params![channel_id, user_id, year, month],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_segments WHERE final_path = ?1",
+            params![relative],
+        )?;
+        tx.commit()?;
+        Ok(relative)
+    }
+
+    pub fn should_archive_channel_day(&self, key: &ChannelDayKey, now: DateTime<Utc>) -> bool {
+        let cutoff = now - Duration::days(self.compact_after_channel_days.max(0));
+        match Utc
+            .with_ymd_and_hms(key.year, key.month, key.day, 23, 59, 59)
+            .single()
+        {
+            Some(end_of_day) => end_of_day <= cutoff,
+            None => false,
+        }
     }
 
     fn merge_imported_channel_days_into_archives_parallel(
@@ -2464,6 +2854,49 @@ fn choose_random(events: Vec<StoredEvent>) -> Result<Option<StoredEvent>> {
     Ok(events.into_iter().nth(index))
 }
 
+fn safe_replace_file(temp_path: &Path, final_path: &Path) -> Result<()> {
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, final_path)?;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        if !final_path.exists() {
+            fs::rename(temp_path, final_path)?;
+            return Ok(());
+        }
+
+        let backup_path = final_path.with_extension(format!(
+            "{}swap.bak",
+            final_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| format!("{value}."))
+                .unwrap_or_default()
+        ));
+        if backup_path.exists() {
+            let _ = fs::remove_file(&backup_path);
+        }
+        fs::rename(final_path, &backup_path)?;
+        match fs::rename(temp_path, final_path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&backup_path);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = fs::rename(&backup_path, final_path);
+                Err(error.into())
+            }
+        }
+    }
+}
+
 fn enumerate_channel_days(
     channel_id: &str,
     from: DateTime<Utc>,
@@ -2635,6 +3068,8 @@ mod tests {
             import_db: Arc::new(Mutex::new(Connection::open(&sqlite_path).unwrap())),
             root_dir,
             archive_enabled: true,
+            compact_after_channel_days: 30,
+            compact_after_user_months: 6,
             compression_executor: Arc::new(CompressionExecutor::new(1, 5, 22)),
             compression_paths: Arc::new(CompressionPathLocks::default()),
             db_priority: Arc::new(DbPriorityScheduler::default()),
