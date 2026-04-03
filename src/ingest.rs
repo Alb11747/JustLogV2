@@ -9,7 +9,8 @@ use moka::sync::Cache;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{RwLock, broadcast, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_native_tls::{TlsConnector, native_tls};
 use tracing::{error, info, warn};
@@ -45,6 +46,7 @@ pub struct IngestManager {
     rr_counter: Arc<AtomicUsize>,
     dedupe: Cache<String, ()>,
     backfill_inflight: Cache<String, ()>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,7 +86,10 @@ impl IngestManager {
             commands,
             recent_messages,
             clock,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("failed to build reqwest client"),
             outbound,
             shutdown,
             desired_channels: Arc::new(RwLock::new(HashSet::new())),
@@ -94,6 +99,7 @@ impl IngestManager {
                 .max_capacity(50_000)
                 .build(),
             backfill_inflight: Cache::builder().max_capacity(10_000).build(),
+            tasks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -108,14 +114,27 @@ impl IngestManager {
         let redundancy = self.config.read().await.ingest.redundancy_factor.max(1);
         for lane_index in 0..redundancy {
             let lane = self.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 lane.run_lane(lane_index).await;
             });
+            self.tasks.lock().await.push(handle);
         }
     }
 
-    pub fn stop(&self) {
+    pub async fn stop(&self) {
         let _ = self.shutdown.send(true);
+        let mut handles = self.tasks.lock().await;
+        let tasks = std::mem::take(&mut *handles);
+        drop(handles);
+        for mut handle in tasks {
+            if tokio::time::timeout(Duration::from_secs(2), &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
     }
 
     pub async fn join_channels(&self, channels: &[String]) {
@@ -129,7 +148,8 @@ impl IngestManager {
             let _ = self.outbound.send(OutboundCommand::Join(channel));
         }
         drop(desired);
-        self.trigger_recent_messages_fetch(new_channels, "runtime join");
+        self.trigger_recent_messages_fetch(new_channels, "runtime join")
+            .await;
     }
 
     pub async fn part_channels(&self, channels: &[String]) {
@@ -199,7 +219,8 @@ impl IngestManager {
                 .cloned()
                 .collect::<Vec<_>>(),
             "connect",
-        );
+        )
+        .await;
         if identity.anonymous {
             info!(
                 "ingest lane {lane_index} connected anonymously as {}",
@@ -269,8 +290,11 @@ impl IngestManager {
         }
     }
 
-    fn trigger_recent_messages_fetch(&self, channels: Vec<String>, reason: &'static str) {
+    async fn trigger_recent_messages_fetch(&self, channels: Vec<String>, reason: &'static str) {
         if !self.recent_messages.enabled() {
+            return;
+        }
+        if *self.shutdown.subscribe().borrow() {
             return;
         }
         for channel in channels {
@@ -280,12 +304,18 @@ impl IngestManager {
             }
             self.backfill_inflight.insert(channel.clone(), ());
             let ingest = self.clone();
-            tokio::spawn(async move {
+            let shutdown = self.shutdown.subscribe();
+            let handle = tokio::spawn(async move {
+                if *shutdown.borrow() {
+                    ingest.backfill_inflight.invalidate(&channel);
+                    return;
+                }
                 if let Err(error) = ingest.fetch_recent_messages_for_channel(&channel).await {
                     warn!("recent-message backfill failed for {channel} after {reason}: {error}");
                 }
                 ingest.backfill_inflight.invalidate(&channel);
             });
+            self.tasks.lock().await.push(handle);
         }
     }
 
@@ -422,13 +452,70 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_justinfan_username, irc_identity};
+    use super::{ChatCommandService, IngestManager, generate_justinfan_username, irc_identity};
+    use anyhow::Result;
     use crate::clock::{FakeClock, SharedClock};
     use crate::config::Config;
+    use crate::model::CanonicalEvent;
+    use crate::recent_messages::RecentMessagesRuntime;
+    use crate::store::Store;
     use chrono::{TimeZone, Utc};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    struct NoopCommands;
+
+    #[async_trait::async_trait]
+    impl ChatCommandService for NoopCommands {
+        async fn handle_privmsg_command(&self, _event: &CanonicalEvent) -> Result<()> {
+            Ok(())
+        }
+    }
 
     fn test_clock() -> SharedClock {
         FakeClock::new(Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap()).shared()
+    }
+
+    fn test_config() -> Config {
+        let temp = TempDir::new().unwrap();
+        let root = temp.keep();
+        let logs_directory = root.join("logs");
+        let config_path = root.join("config.json");
+        let mut config = Config {
+            config_path,
+            config_file_permissions: None,
+            bot_verified: false,
+            logs_directory,
+            archive: false,
+            admin_api_key: String::new(),
+            username: "justinfan0".to_string(),
+            oauth: String::new(),
+            listen_address: "127.0.0.1:0".to_string(),
+            admins: Vec::new(),
+            channels: Vec::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            log_level: "info".to_string(),
+            opt_out: HashMap::new(),
+            compression: Default::default(),
+            http: Default::default(),
+            ingest: Default::default(),
+            helix: Default::default(),
+            irc: Default::default(),
+            storage: Default::default(),
+            ops: Default::default(),
+        };
+        config.storage.sqlite_path = PathBuf::from(root.join("justlog.sqlite3"));
+        config.ingest.connect_timeout_ms = 50;
+        config.irc.server = "127.0.0.1".to_string();
+        config.irc.port = 1;
+        config.irc.tls = false;
+        config.normalize().unwrap();
+        config
     }
 
     #[test]
@@ -474,5 +561,24 @@ mod tests {
         let nick = generate_justinfan_username(&test_clock());
         assert!(nick.starts_with("justinfan"));
         assert!(nick[9..].chars().all(|ch| ch.is_ascii_digit()));
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_spawned_ingest_tasks() {
+        let config = test_config();
+        let shared_config = Arc::new(RwLock::new(config.clone()));
+        let store = Store::open(&config).unwrap();
+        let ingest = IngestManager::new(
+            shared_config,
+            store,
+            Arc::new(NoopCommands),
+            Arc::new(RecentMessagesRuntime::disabled()),
+            SharedClock::real(),
+        );
+
+        ingest.start(Vec::new()).await;
+        tokio::time::timeout(Duration::from_secs(5), ingest.stop())
+            .await
+            .expect("ingest should stop promptly");
     }
 }

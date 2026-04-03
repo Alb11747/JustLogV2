@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Instant;
@@ -143,16 +143,23 @@ const DB_RECLAIM_FREE_RATIO_DENOMINATOR: u64 = 5;
 impl CompressionExecutor {
     fn new(worker_count: usize, quality: u32, lgwin: u32) -> Self {
         let bounded = worker_count.max(1);
-        let (sender, receiver) = mpsc::sync_channel::<CompressionRequest>(bounded * 2);
+        let (sender, receiver) = mpsc::sync_channel::<CompressionMessage>(bounded * 2);
         let shared_receiver = Arc::new(Mutex::new(receiver));
+        let mut handles = Vec::with_capacity(bounded);
         for index in 0..bounded {
             let receiver = Arc::clone(&shared_receiver);
-            thread::Builder::new()
+            let handle = thread::Builder::new()
                 .name(format!("justlog-compress-{index}"))
                 .spawn(move || compression_worker_loop(receiver, quality, lgwin))
                 .expect("failed to spawn compression worker");
+            handles.push(handle);
         }
-        Self { sender }
+        Self {
+            sender: Mutex::new(Some(sender)),
+            worker_handles: Mutex::new(handles),
+            worker_count: bounded,
+            shutdown_started: AtomicBool::new(false),
+        }
     }
 
     fn submit(
@@ -161,14 +168,37 @@ impl CompressionExecutor {
         raws: Vec<String>,
     ) -> Receiver<Result<CompressionResult, String>> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        self.sender
-            .send(CompressionRequest {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("compression executor stopped unexpectedly");
+        sender
+            .send(CompressionMessage::Request(CompressionRequest {
                 temp_path,
                 raws,
                 response: response_tx,
-            })
+            }))
             .expect("compression executor stopped unexpectedly");
         response_rx
+    }
+
+    fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sender = self.sender.lock().unwrap().take();
+        if let Some(sender) = sender {
+            for _ in 0..self.worker_count {
+                let _ = sender.send(CompressionMessage::Shutdown);
+            }
+        }
+        let mut handles = self.worker_handles.lock().unwrap();
+        while let Some(handle) = handles.pop() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -202,6 +232,12 @@ struct CompressionRequest {
 }
 
 #[derive(Debug)]
+enum CompressionMessage {
+    Request(CompressionRequest),
+    Shutdown,
+}
+
+#[derive(Debug)]
 struct CompressionResult {
     temp_path: PathBuf,
     output_bytes: u64,
@@ -210,7 +246,10 @@ struct CompressionResult {
 
 #[derive(Debug)]
 struct CompressionExecutor {
-    sender: SyncSender<CompressionRequest>,
+    sender: Mutex<Option<SyncSender<CompressionMessage>>>,
+    worker_handles: Mutex<Vec<thread::JoinHandle<()>>>,
+    worker_count: usize,
+    shutdown_started: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -1105,6 +1144,11 @@ impl Store {
 
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn shutdown(&self) {
+        self.request_shutdown();
+        self.compression_executor.shutdown();
     }
 
     pub fn imported_raw_file_is_current(&self, path: &str, fingerprint: &str) -> Result<bool> {
@@ -2872,17 +2916,26 @@ fn default_max_compress_threads() -> usize {
 }
 
 fn compression_worker_loop(
-    receiver: Arc<Mutex<Receiver<CompressionRequest>>>,
+    receiver: Arc<Mutex<Receiver<CompressionMessage>>>,
     quality: u32,
     lgwin: u32,
 ) {
     loop {
         let request = {
             let guard = receiver.lock().unwrap();
-            guard.recv()
+            guard.recv_timeout(std::time::Duration::from_millis(250))
         };
-        let Ok(request) = request else {
-            return;
+        let message = match request {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        let request = match message {
+            CompressionMessage::Request(request) => request,
+            CompressionMessage::Shutdown => {
+                tracing::info!("compression worker stopping");
+                return;
+            }
         };
         let started = Instant::now();
         tracing::info!(
@@ -3393,5 +3446,12 @@ mod tests {
             after.free_bytes < before.free_bytes || after.main_bytes < before.main_bytes,
             "database maintenance should reclaim space: before={before:?} after={after:?}"
         );
+    }
+
+    #[test]
+    fn store_shutdown_stops_compression_workers() {
+        let (store, _temp) = test_store();
+        store.shutdown();
+        store.shutdown();
     }
 }

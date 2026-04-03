@@ -707,7 +707,7 @@ async fn anonymous_ingest_stop_and_optout_expiry_do_not_wait_on_wall_clock() {
     .unwrap();
 
     harness.irc.reconnect_first().await;
-    harness.state.ingest.read().await.clone().unwrap().stop();
+    harness.state.ingest.read().await.clone().unwrap().stop().await;
     harness.advance_time(Duration::from_secs(1)).await;
     assert_eq!(harness.irc.connection_count().await, 2);
 }
