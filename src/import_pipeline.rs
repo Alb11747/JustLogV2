@@ -130,6 +130,34 @@ struct ParsedImportFile {
     events: Vec<CanonicalEvent>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingFileCommit {
+    candidate: ImportCandidate,
+    had_events: bool,
+}
+
+#[derive(Debug)]
+struct PendingPartitionBatch<T> {
+    events: Vec<T>,
+    source_paths: BTreeSet<String>,
+}
+
+impl<T> Default for PendingPartitionBatch<T> {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            source_paths: BTreeSet::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingCommitBatch {
+    files: Vec<PendingFileCommit>,
+    hot_by_day: HashMap<ChannelDayKey, PendingPartitionBatch<CanonicalEvent>>,
+    archive_by_day: HashMap<ChannelDayKey, PendingPartitionBatch<StoredEvent>>,
+}
+
 #[derive(Debug)]
 enum ParseWorkerMessage {
     Parsed(ParsedImportFile),
@@ -235,6 +263,7 @@ pub fn run_import_with_hooks(
     let mut failures = 0usize;
     let mut affected_channel_days = BTreeSet::new();
     let mut affected_user_months = BTreeSet::new();
+    let mut pending_commit_batch = PendingCommitBatch::default();
     let mut discovery_done = false;
     let mut pending_candidate: Option<ImportCandidate> = None;
     while !discovery_done || in_flight > 0 || pending_candidate.is_some() {
@@ -251,6 +280,7 @@ pub fn run_import_with_hooks(
                 &mut completed,
                 &mut failures,
                 &mut in_flight,
+                &mut pending_commit_batch,
                 &mut affected_channel_days,
                 &mut affected_user_months,
             )?;
@@ -286,6 +316,7 @@ pub fn run_import_with_hooks(
                         &mut completed,
                         &mut failures,
                         &mut in_flight,
+                        &mut pending_commit_batch,
                         &mut affected_channel_days,
                         &mut affected_user_months,
                     )?;
@@ -315,6 +346,7 @@ pub fn run_import_with_hooks(
                 &mut completed,
                 &mut failures,
                 &mut in_flight,
+                &mut pending_commit_batch,
                 &mut affected_channel_days,
                 &mut affected_user_months,
             )?;
@@ -361,6 +393,7 @@ pub fn run_import_with_hooks(
                                 &mut completed,
                                 &mut failures,
                                 &mut in_flight,
+                                &mut pending_commit_batch,
                                 &mut affected_channel_days,
                                 &mut affected_user_months,
                             )?;
@@ -373,6 +406,21 @@ pub fn run_import_with_hooks(
             Err(RecvTimeoutError::Disconnected) => discovery_done = true,
         }
     }
+
+    commit_pending_batch(
+        store,
+        run_id,
+        config,
+        io.as_ref(),
+        archive.as_ref(),
+        instrumentation.as_deref(),
+        &mut pending_commit_batch,
+        &mut summary,
+        &mut completed,
+        &mut failures,
+        &mut affected_channel_days,
+        &mut affected_user_months,
+    )?;
 
     let discovery_result = discovery_handle
         .join()
@@ -406,35 +454,30 @@ fn handle_parse_result_message(
     run_id: i64,
     config: &ImportPipelineConfig,
     io: &dyn ImportIo,
-    archive: &dyn ImportArchive,
-    instrumentation: Option<&dyn ImportInstrumentation>,
+    _archive: &dyn ImportArchive,
+    _instrumentation: Option<&dyn ImportInstrumentation>,
     message: ParseWorkerMessage,
     summary: &mut BulkRawImportSummary,
     completed: &mut usize,
     failures: &mut usize,
     in_flight: &mut usize,
-    affected_channel_days: &mut BTreeSet<ChannelDayKey>,
-    affected_user_months: &mut BTreeSet<UserMonthKey>,
+    pending_commit_batch: &mut PendingCommitBatch,
+    _affected_channel_days: &mut BTreeSet<ChannelDayKey>,
+    _affected_user_months: &mut BTreeSet<UserMonthKey>,
 ) -> Result<()> {
     *in_flight = in_flight.saturating_sub(1);
     let path_key = match message {
         ParseWorkerMessage::Parsed(parsed) => {
             let path_key = parsed.candidate.path.to_string_lossy().to_string();
-            match commit_or_finalize_parsed_file(
+            match queue_or_finalize_parsed_file(
                 store,
                 run_id,
                 config,
                 io,
-                archive,
-                instrumentation,
                 parsed,
-                summary,
+                pending_commit_batch,
             ) {
-                Ok(result) => {
-                    *completed += 1;
-                    affected_channel_days.extend(result.affected_channel_days);
-                    affected_user_months.extend(result.affected_user_months);
-                }
+                Ok(()) => {}
                 Err(error) => {
                     *failures += 1;
                     summary.files_failed += 1;
@@ -545,16 +588,14 @@ fn process_discovered_candidate(
     Ok(send_result)
 }
 
-fn commit_or_finalize_parsed_file(
+fn queue_or_finalize_parsed_file(
     store: &Store,
     run_id: i64,
-    config: &ImportPipelineConfig,
-    io: &dyn ImportIo,
-    archive: &dyn ImportArchive,
-    instrumentation: Option<&dyn ImportInstrumentation>,
+    _config: &ImportPipelineConfig,
+    _io: &dyn ImportIo,
     parsed: ParsedImportFile,
-    summary: &mut BulkRawImportSummary,
-) -> Result<ChannelDayImportResult> {
+    pending_commit_batch: &mut PendingCommitBatch,
+) -> Result<()> {
     let path_key = parsed.candidate.path.to_string_lossy().to_string();
     if parsed.events.is_empty() {
         if parsed.all_matching {
@@ -567,133 +608,190 @@ fn commit_or_finalize_parsed_file(
                 None,
             )?;
         }
-        return Ok(ChannelDayImportResult::default());
+        return Ok(());
     }
 
-    let result = commit_parsed_file(
-        store,
-        run_id,
-        config,
-        io,
-        archive,
-        instrumentation,
-        &parsed,
-        summary,
-    )?;
-    summary.files_imported += 1;
-    maybe_delete_consumed_source(io, config, &parsed.candidate, summary)?;
-    Ok(result)
-}
-
-fn commit_parsed_file(
-    store: &Store,
-    run_id: i64,
-    _config: &ImportPipelineConfig,
-    _io: &dyn ImportIo,
-    archive: &dyn ImportArchive,
-    instrumentation: Option<&dyn ImportInstrumentation>,
-    parsed: &ParsedImportFile,
-    summary: &mut BulkRawImportSummary,
-) -> Result<ChannelDayImportResult> {
-    let path_key = parsed.candidate.path.to_string_lossy().to_string();
     store.upsert_import_file_state(
         run_id,
         &path_key,
         &parsed.candidate.fingerprint,
         family_name(parsed.candidate.family),
-        "committing",
+        "parsed",
         None,
     )?;
 
-    let mut archive_by_day = HashMap::<ChannelDayKey, Vec<CanonicalEvent>>::new();
-    let mut hot_events = Vec::new();
     let now = Utc::now();
-    for event in &parsed.events {
+    for event in parsed.events {
         let day_key = event.channel_day_key();
         if store.should_archive_channel_day(&day_key, now) {
-            archive_by_day.entry(day_key).or_default().push(event.clone());
+            let entry = pending_commit_batch.archive_by_day.entry(day_key).or_default();
+            entry.events.push(stored_from_canonical(event));
+            entry.source_paths.insert(path_key.clone());
         } else {
-            hot_events.push(event.clone());
+            let entry = pending_commit_batch.hot_by_day.entry(day_key).or_default();
+            entry.events.push(event);
+            entry.source_paths.insert(path_key.clone());
         }
     }
+    pending_commit_batch.files.push(PendingFileCommit {
+        candidate: parsed.candidate,
+        had_events: true,
+    });
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+fn commit_pending_batch(
+    store: &Store,
+    run_id: i64,
+    config: &ImportPipelineConfig,
+    io: &dyn ImportIo,
+    archive: &dyn ImportArchive,
+    instrumentation: Option<&dyn ImportInstrumentation>,
+    pending_commit_batch: &mut PendingCommitBatch,
+    summary: &mut BulkRawImportSummary,
+    completed: &mut usize,
+    failures: &mut usize,
+    affected_channel_days: &mut BTreeSet<ChannelDayKey>,
+    affected_user_months: &mut BTreeSet<UserMonthKey>,
+) -> Result<ChannelDayImportResult> {
     let mut result = ChannelDayImportResult::default();
-    if !hot_events.is_empty() {
-        let outcome = store.insert_events_batch_low_priority(&hot_events)?;
-        summary.hot_partitions_inserted += outcome.affected_channel_days.len();
-        result
-            .affected_channel_days
-            .extend(outcome.affected_channel_days);
-        result
-            .affected_user_months
-            .extend(outcome.affected_user_months);
-    }
 
-    if !archive_by_day.is_empty() {
-        let mut archive_user_months = BTreeSet::new();
-        for (day_key, events) in archive_by_day {
-            let commit_key = format!(
-                "{}:{}/{}/{}",
-                day_key.channel_id, day_key.year, day_key.month, day_key.day
-            );
-            if let Some(instrumentation) = instrumentation {
-                instrumentation.on_commit_start("channel", &commit_key);
+    let mut failed_files = HashMap::<String, String>::new();
+
+    let hot_batches = std::mem::take(&mut pending_commit_batch.hot_by_day);
+    for (day_key, batch) in hot_batches {
+        let commit_key = format!(
+            "{}:{}/{}/{}",
+            day_key.channel_id, day_key.year, day_key.month, day_key.day
+        );
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.on_commit_start("hot", &commit_key);
+        }
+        let batch_files = batch.source_paths.clone();
+        match store.insert_events_batch_low_priority(&batch.events) {
+            Ok(outcome) => {
+                summary.hot_partitions_inserted += outcome.affected_channel_days.len();
+                result
+                    .affected_channel_days
+                    .extend(outcome.affected_channel_days);
+                result
+                    .affected_user_months
+                    .extend(outcome.affected_user_months);
             }
-            store.record_import_partition_state(
-                "channel",
-                &day_key.channel_id,
-                None,
-                day_key.year,
-                day_key.month,
-                Some(day_key.day),
-                "committing",
-                None,
-                true,
-            )?;
-            store.record_import_file_partition(
-                &path_key,
-                "channel",
-                &day_key.channel_id,
-                None,
-                day_key.year,
-                day_key.month,
-                Some(day_key.day),
-            )?;
-            let mut merged = archive.read_channel_day(store, &day_key)?;
-            merged.extend(events.into_iter().map(stored_from_canonical));
-            dedupe_and_sort(&mut merged);
-            archive.write_channel_day(store, &day_key, &merged)?;
-            store.record_import_partition_state(
-                "channel",
-                &day_key.channel_id,
-                None,
-                day_key.year,
-                day_key.month,
-                Some(day_key.day),
-                "committed",
-                None,
-                false,
-            )?;
-            if let Some(instrumentation) = instrumentation {
-                instrumentation.on_commit_finish("channel", &commit_key);
-            }
-            summary.archive_partitions_committed += 1;
-            result.affected_channel_days.insert(day_key.clone());
-            for event in &merged {
-                for key in stored_user_month_keys(event) {
-                    archive_user_months.insert(key);
+            Err(error) => {
+                let error_text = error.to_string();
+                for path in batch_files {
+                    failed_files.entry(path).or_insert_with(|| error_text.clone());
                 }
             }
         }
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.on_commit_finish("hot", &commit_key);
+        }
+    }
 
-        for month_key in archive_user_months {
-            let commit_key = format!(
-                "{}:{}:{}/{}",
-                month_key.channel_id, month_key.user_id, month_key.year, month_key.month
-            );
-            if let Some(instrumentation) = instrumentation {
-                instrumentation.on_commit_start("user", &commit_key);
+    let mut archive_user_months =
+        HashMap::<UserMonthKey, PendingPartitionBatch<StoredEvent>>::new();
+    let archive_batches = std::mem::take(&mut pending_commit_batch.archive_by_day);
+    for (day_key, batch) in archive_batches {
+        let commit_key = format!(
+            "{}:{}/{}/{}",
+            day_key.channel_id, day_key.year, day_key.month, day_key.day
+        );
+        let batch_files = batch.source_paths.clone();
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.on_commit_start("channel", &commit_key);
+        }
+        let commit_result = (|| -> Result<Option<Vec<StoredEvent>>> {
+            store.record_import_partition_state(
+                "channel",
+                &day_key.channel_id,
+                None,
+                day_key.year,
+                day_key.month,
+                Some(day_key.day),
+                "committing",
+                None,
+                batch.source_paths.len(),
+            )?;
+            for path_key in &batch.source_paths {
+                store.record_import_file_partition(
+                    path_key,
+                    "channel",
+                    &day_key.channel_id,
+                    None,
+                    day_key.year,
+                    day_key.month,
+                    Some(day_key.day),
+                )?;
             }
+            let existing = archive.read_channel_day(store, &day_key)?;
+            let mut merged = existing.clone();
+            merged.extend(batch.events.clone());
+            dedupe_and_sort(&mut merged);
+            if !stored_events_match(&existing, &merged) {
+                archive.write_channel_day(store, &day_key, &merged)?;
+                summary.archive_partitions_committed += 1;
+            }
+            store.record_import_partition_state(
+                "channel",
+                &day_key.channel_id,
+                None,
+                day_key.year,
+                day_key.month,
+                Some(day_key.day),
+                "committed",
+                None,
+                0,
+            )?;
+            Ok(Some(merged))
+        })();
+        match commit_result {
+            Ok(Some(merged)) => {
+                result.affected_channel_days.insert(day_key.clone());
+                for event in merged {
+                    for month_key in stored_user_month_keys(&event) {
+                        let entry = archive_user_months.entry(month_key).or_default();
+                        entry.events.push(event.clone());
+                        entry.source_paths.extend(batch.source_paths.iter().cloned());
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let error_text = error.to_string();
+                let _ = store.record_import_partition_state(
+                    "channel",
+                    &day_key.channel_id,
+                    None,
+                    day_key.year,
+                    day_key.month,
+                    Some(day_key.day),
+                    "failed",
+                    Some(&error_text),
+                    0,
+                );
+                for path in batch_files {
+                    failed_files.entry(path).or_insert_with(|| error_text.clone());
+                }
+            }
+        }
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.on_commit_finish("channel", &commit_key);
+        }
+    }
+
+    for (month_key, batch) in archive_user_months {
+        let commit_key = format!(
+            "{}:{}:{}/{}",
+            month_key.channel_id, month_key.user_id, month_key.year, month_key.month
+        );
+        let batch_files = batch.source_paths.clone();
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.on_commit_start("user", &commit_key);
+        }
+        let commit_result = (|| -> Result<()> {
             store.record_import_partition_state(
                 "user",
                 &month_key.channel_id,
@@ -703,20 +801,26 @@ fn commit_parsed_file(
                 None,
                 "committing",
                 None,
-                true,
+                batch.source_paths.len(),
             )?;
-            store.record_import_file_partition(
-                &path_key,
-                "user",
-                &month_key.channel_id,
-                Some(&month_key.user_id),
-                month_key.year,
-                month_key.month,
-                None,
-            )?;
-            let mut merged = archive.read_user_month(store, &month_key)?;
+            for path_key in &batch.source_paths {
+                store.record_import_file_partition(
+                    path_key,
+                    "user",
+                    &month_key.channel_id,
+                    Some(&month_key.user_id),
+                    month_key.year,
+                    month_key.month,
+                    None,
+                )?;
+            }
+            let existing = archive.read_user_month(store, &month_key)?;
+            let mut merged = existing.clone();
+            merged.extend(batch.events.clone());
             dedupe_and_sort(&mut merged);
-            archive.write_user_month(store, &month_key, &merged)?;
+            if !stored_events_match(&existing, &merged) {
+                archive.write_user_month(store, &month_key, &merged)?;
+            }
             store.record_import_partition_state(
                 "user",
                 &month_key.channel_id,
@@ -726,28 +830,83 @@ fn commit_parsed_file(
                 None,
                 "committed",
                 None,
-                false,
+                0,
             )?;
-            if let Some(instrumentation) = instrumentation {
-                instrumentation.on_commit_finish("user", &commit_key);
+            result.affected_user_months.insert(month_key.clone());
+            Ok(())
+        })();
+        if let Err(error) = commit_result {
+            let error_text = error.to_string();
+            let _ = store.record_import_partition_state(
+                "user",
+                &month_key.channel_id,
+                Some(&month_key.user_id),
+                month_key.year,
+                month_key.month,
+                None,
+                "failed",
+                Some(&error_text),
+                0,
+            );
+            for path in batch_files {
+                failed_files.entry(path).or_insert_with(|| error_text.clone());
             }
-            result.affected_user_months.insert(month_key);
+        }
+        if let Some(instrumentation) = instrumentation {
+            instrumentation.on_commit_finish("user", &commit_key);
         }
     }
 
-    store.upsert_import_file_state(
-        run_id,
-        &path_key,
-        &parsed.candidate.fingerprint,
-        family_name(parsed.candidate.family),
-        "done",
-        None,
-    )?;
-    match parsed.candidate.family {
-        ImportFamily::Raw => summary.files_parsed_raw += 1,
-        ImportFamily::SimpleText => summary.files_parsed_simple += 1,
-        ImportFamily::JsonExport => summary.files_parsed_json += 1,
+    let pending_files = std::mem::take(&mut pending_commit_batch.files);
+    for file in pending_files {
+        let path_key = file.candidate.path.to_string_lossy().to_string();
+        if let Some(error_text) = failed_files.get(&path_key) {
+            *failures += 1;
+            summary.files_failed += 1;
+            store.upsert_import_file_state(
+                run_id,
+                &path_key,
+                &file.candidate.fingerprint,
+                family_name(file.candidate.family),
+                "failed",
+                Some(error_text),
+            )?;
+            continue;
+        }
+
+        if file.had_events {
+            summary.files_imported += 1;
+            *completed += 1;
+            match file.candidate.family {
+                ImportFamily::Raw => summary.files_parsed_raw += 1,
+                ImportFamily::SimpleText => summary.files_parsed_simple += 1,
+                ImportFamily::JsonExport => summary.files_parsed_json += 1,
+            }
+        }
+        store.upsert_import_file_state(
+            run_id,
+            &path_key,
+            &file.candidate.fingerprint,
+            family_name(file.candidate.family),
+            "done",
+            None,
+        )?;
+        if let Err(error) = maybe_delete_consumed_source(io, config, &file.candidate, summary) {
+            *failures += 1;
+            summary.files_failed += 1;
+            store.upsert_import_file_state(
+                run_id,
+                &path_key,
+                &file.candidate.fingerprint,
+                family_name(file.candidate.family),
+                "done",
+                Some(&error.to_string()),
+            )?;
+        }
     }
+
+    affected_channel_days.extend(result.affected_channel_days.iter().cloned());
+    affected_user_months.extend(result.affected_user_months.iter().cloned());
     Ok(result)
 }
 
@@ -980,6 +1139,14 @@ fn dedupe_and_sort(events: &mut Vec<StoredEvent>) {
     let mut seen = HashSet::new();
     events.retain(|event| seen.insert(event.event_uid.clone()));
     events.sort_by_key(|event| event.timestamp.timestamp_millis());
+}
+
+fn stored_events_match(left: &[StoredEvent], right: &[StoredEvent]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(lhs, rhs)| lhs.event_uid == rhs.event_uid)
 }
 
 fn classify_import_file(io: &dyn ImportIo, path: &Path) -> Result<Option<ImportFamily>> {

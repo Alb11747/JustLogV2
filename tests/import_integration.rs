@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -198,6 +198,8 @@ struct MockFs {
     fail_once: Mutex<HashSet<(String, PathBuf)>>,
     fail_read_on_attempt: Mutex<BTreeMap<PathBuf, usize>>,
     read_attempts: Mutex<BTreeMap<PathBuf, usize>>,
+    write_counts: Mutex<BTreeMap<PathBuf, usize>>,
+    replace_counts: Mutex<BTreeMap<PathBuf, usize>>,
     coordinated_reads: usize,
     started_reads: AtomicUsize,
     active_reads: AtomicUsize,
@@ -217,6 +219,8 @@ impl MockFs {
             fail_once: Mutex::new(HashSet::new()),
             fail_read_on_attempt: Mutex::new(BTreeMap::new()),
             read_attempts: Mutex::new(BTreeMap::new()),
+            write_counts: Mutex::new(BTreeMap::new()),
+            replace_counts: Mutex::new(BTreeMap::new()),
             coordinated_reads,
             started_reads: AtomicUsize::new(0),
             active_reads: AtomicUsize::new(0),
@@ -312,6 +316,12 @@ impl MockFs {
 
     fn write_bytes(&self, path: &Path, bytes: Vec<u8>) -> Result<()> {
         self.maybe_fail("write", path)?;
+        *self
+            .write_counts
+            .lock()
+            .unwrap()
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
         let mut state = self.state.lock().unwrap();
         self.ensure_parent_dirs(&mut state, path);
         state.files.insert(path.to_path_buf(), bytes);
@@ -320,6 +330,12 @@ impl MockFs {
 
     fn atomic_replace(&self, temp: &Path, final_path: &Path) -> Result<()> {
         self.maybe_fail("replace", final_path)?;
+        *self
+            .replace_counts
+            .lock()
+            .unwrap()
+            .entry(final_path.to_path_buf())
+            .or_insert(0) += 1;
         let mut state = self.state.lock().unwrap();
         let bytes = state
             .files
@@ -346,6 +362,24 @@ impl MockFs {
             .keys()
             .filter(|path| path.starts_with(&self.root))
             .count()
+    }
+
+    fn write_count(&self, path: &Path) -> usize {
+        self.write_counts
+            .lock()
+            .unwrap()
+            .get(path)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn replace_count(&self, path: &Path) -> usize {
+        self.replace_counts
+            .lock()
+            .unwrap()
+            .get(path)
+            .copied()
+            .unwrap_or_default()
     }
 }
 
@@ -473,6 +507,10 @@ impl ImportIo for MockFs {
 struct MockArchiveState {
     channel_events: BTreeMap<String, Vec<StoredEvent>>,
     user_events: BTreeMap<String, Vec<StoredEvent>>,
+    channel_write_attempts: BTreeMap<String, usize>,
+    channel_write_successes: BTreeMap<String, usize>,
+    user_write_attempts: BTreeMap<String, usize>,
+    user_write_successes: BTreeMap<String, usize>,
 }
 
 struct MockArchive {
@@ -572,6 +610,54 @@ impl MockArchive {
             .unwrap();
         output
     }
+
+    fn channel_write_attempts(&self, key: &ChannelDayKey) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .channel_write_attempts
+            .get(&self.channel_storage_key(key))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn channel_write_successes(&self, key: &ChannelDayKey) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .channel_write_successes
+            .get(&self.channel_storage_key(key))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn user_write_successes(&self, key: &UserMonthKey) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .user_write_successes
+            .get(&self.user_storage_key(key))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn total_channel_write_successes(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .channel_write_successes
+            .values()
+            .sum()
+    }
+
+    fn total_user_write_successes(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .user_write_successes
+            .values()
+            .sum()
+    }
 }
 
 impl ImportArchive for MockArchive {
@@ -596,14 +682,24 @@ impl ImportArchive for MockArchive {
         let final_path = self.channel_final_path(key);
         let temp_path = final_path.with_extension("tmp.br");
         self.begin_commit(&storage_key);
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .channel_write_attempts
+            .entry(storage_key.clone())
+            .or_insert(0) += 1;
         let result = (|| {
             self.fs.write_bytes(&temp_path, Self::encode_events(events))?;
             self.fs.atomic_replace(&temp_path, &final_path)?;
-            self.state
-                .lock()
-                .unwrap()
+            let mut state = self.state.lock().unwrap();
+            state
                 .channel_events
                 .insert(storage_key.clone(), events.to_vec());
+            *state
+                .channel_write_successes
+                .entry(storage_key.clone())
+                .or_insert(0) += 1;
             Ok(())
         })();
         self.end_commit(&storage_key);
@@ -631,14 +727,19 @@ impl ImportArchive for MockArchive {
         let final_path = self.user_final_path(key);
         let temp_path = final_path.with_extension("tmp.br");
         self.begin_commit(&storage_key);
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .user_write_attempts
+            .entry(storage_key.clone())
+            .or_insert(0) += 1;
         let result = (|| {
             self.fs.write_bytes(&temp_path, Self::encode_events(events))?;
             self.fs.atomic_replace(&temp_path, &final_path)?;
-            self.state
-                .lock()
-                .unwrap()
-                .user_events
-                .insert(storage_key.clone(), events.to_vec());
+            let mut state = self.state.lock().unwrap();
+            state.user_events.insert(storage_key.clone(), events.to_vec());
+            *state.user_write_successes.entry(storage_key.clone()).or_insert(0) += 1;
             Ok(())
         })();
         self.end_commit(&storage_key);
@@ -672,6 +773,113 @@ fn run_mock_import(
         },
     )
     .unwrap()
+}
+
+#[derive(Default)]
+struct CountingRealArchiveState {
+    channel_write_successes: HashMap<String, usize>,
+    user_write_successes: HashMap<String, usize>,
+}
+
+struct CountingRealArchive {
+    state: Mutex<CountingRealArchiveState>,
+}
+
+impl CountingRealArchive {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CountingRealArchiveState::default()),
+        }
+    }
+
+    fn channel_key(key: &ChannelDayKey) -> String {
+        format!(
+            "channel/{}/{}/{}/{}",
+            key.channel_id, key.year, key.month, key.day
+        )
+    }
+
+    fn user_key(key: &UserMonthKey) -> String {
+        format!(
+            "user/{}/{}/{}/{}",
+            key.channel_id, key.user_id, key.year, key.month
+        )
+    }
+
+    fn channel_write_successes(&self, key: &ChannelDayKey) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .channel_write_successes
+            .get(&Self::channel_key(key))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+impl ImportArchive for CountingRealArchive {
+    fn read_channel_day(&self, store: &Store, key: &ChannelDayKey) -> Result<Vec<StoredEvent>> {
+        Ok(store
+            .read_archived_channel_segment_strict(&key.channel_id, key.year, key.month, key.day)
+            .unwrap_or_default())
+    }
+
+    fn write_channel_day(
+        &self,
+        store: &Store,
+        key: &ChannelDayKey,
+        events: &[StoredEvent],
+    ) -> Result<()> {
+        store.import_replace_or_create_channel_segment(
+            &key.channel_id,
+            key.year,
+            key.month,
+            key.day,
+            events,
+        )?;
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .channel_write_successes
+            .entry(Self::channel_key(key))
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
+    fn read_user_month(&self, store: &Store, key: &UserMonthKey) -> Result<Vec<StoredEvent>> {
+        Ok(store
+            .read_archived_user_segment_strict(
+                &key.channel_id,
+                &key.user_id,
+                key.year,
+                key.month,
+            )
+            .unwrap_or_default())
+    }
+
+    fn write_user_month(
+        &self,
+        store: &Store,
+        key: &UserMonthKey,
+        events: &[StoredEvent],
+    ) -> Result<()> {
+        store.import_replace_or_create_user_segment(
+            &key.channel_id,
+            &key.user_id,
+            key.year,
+            key.month,
+            events,
+        )?;
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .user_write_successes
+            .entry(Self::user_key(key))
+            .or_insert(0) += 1;
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -801,6 +1009,85 @@ async fn real_filesystem_admin_import_end_to_end_handles_sample_data() {
     assert!(!old_debug.exists());
     assert!(!hot_raw.exists());
 
+}
+
+#[tokio::test]
+async fn real_filesystem_import_rewrites_shared_archived_day_once() {
+    let _guard = env_lock().lock().await;
+    let temp = TempDir::new().unwrap();
+    let import_root = temp.path().join("imports");
+    let archived_day = ChannelDayKey {
+        channel_id: "1".to_string(),
+        year: 2024,
+        month: 1,
+        day: 2,
+    };
+    let first = import_root.join("raw/a/1/2024/1/2/channel.txt");
+    let second = import_root.join("raw/b/1/2024/1/2/channel.txt.gz");
+
+    write_fixture(
+        &first,
+        &privmsg(
+            "real-shared-day-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "real shared raw",
+        ),
+    );
+    write_fixture(
+        &second,
+        &privmsg(
+            "real-shared-day-2",
+            "1",
+            "201",
+            "viewer2",
+            "viewer2",
+            "channelone",
+            1_704_153_605_000,
+            "real shared raw gz",
+        ),
+    );
+
+    let harness = TestHarness::start_with_options(TestHarnessOptions {
+        channel_ids: vec!["1".to_string()],
+        start_ingest: false,
+        compact_after_channel_days: 7,
+        ..Default::default()
+    })
+    .await;
+    let archive = Arc::new(CountingRealArchive::new());
+
+    let summary = run_import_with_hooks(
+        &harness.state.store,
+        &pipeline_config(&import_root),
+        ImportTarget {
+            channel_id: Some("1".to_string()),
+            day: None,
+        },
+        None,
+        false,
+        ImportHooks {
+            archive: Some(archive.clone()),
+            ..ImportHooks::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(summary.files_imported, 2);
+    assert_eq!(summary.archive_partitions_committed, 1);
+    assert_eq!(archive.channel_write_successes(&archived_day), 1);
+    let archived = harness
+        .state
+        .store
+        .read_archived_channel_segment_strict("1", 2024, 1, 2)
+        .unwrap();
+    assert_eq!(archived.len(), 2);
+    assert!(archived.iter().any(|event| event.text == "real shared raw"));
+    assert!(archived.iter().any(|event| event.text == "real shared raw gz"));
 }
 
 #[tokio::test]
@@ -1005,7 +1292,7 @@ async fn mock_fs_large_generated_import_uses_parallel_parse_and_serial_archive_w
             archive: Some(archive.clone()),
             instrumentation: Some(metrics.clone()),
             discovery_queue_capacity: Some(256),
-            parse_queue_capacity: Some(1),
+            parse_queue_capacity: Some(8),
         },
     )
     .unwrap();
@@ -1030,6 +1317,89 @@ async fn mock_fs_large_generated_import_uses_parallel_parse_and_serial_archive_w
     assert!(hot_events > 0);
     assert!(archived_events > 0);
     assert_eq!(hot_events + archived_events as i64, parse_subset as i64);
+    assert_eq!(
+        archive.total_channel_write_successes(),
+        summary.archive_partitions_committed
+    );
+    assert!(archive.total_user_write_successes() > 0);
+    assert!(archive.total_user_write_successes() <= summary.affected_user_months);
+}
+
+#[tokio::test]
+async fn mock_fs_shared_archived_day_commits_once_across_multiple_files() {
+    let harness = TestHarness::start_without_ingest(vec!["1".to_string()]).await;
+    let root = PathBuf::from(r"C:\mock\shared-day");
+    let archive_root = PathBuf::from(r"C:\mock\shared-day-archive");
+    let io = Arc::new(MockFs::new(root.clone(), 0));
+    let archive = Arc::new(MockArchive::new(io.clone(), archive_root));
+    let day_key = ChannelDayKey {
+        channel_id: "1".to_string(),
+        year: 2024,
+        month: 1,
+        day: 2,
+    };
+    let user_key = UserMonthKey {
+        channel_id: "1".to_string(),
+        user_id: "200".to_string(),
+        year: 2024,
+        month: 1,
+    };
+
+    io.add_file(
+        root.join("raw/a/1/2024/1/2/one.txt"),
+        privmsg(
+            "shared-day-raw-1",
+            "1",
+            "200",
+            "viewer",
+            "viewer",
+            "channelone",
+            1_704_153_604_000,
+            "shared archive raw",
+        )
+        .into_bytes(),
+    );
+    io.add_file(
+        root.join("simple/b/1/2024/1/2.txt"),
+        tiny_simple_text(&[("00:00:05", "Viewer: shared archive simple")]).into_bytes(),
+    );
+    io.add_file(
+        root.join("json/c/1/2024/1/2.json.gz"),
+        gzip_bytes_fast(&tiny_json_export(
+            2,
+            &[(
+                "shared-day-json-1",
+                "Viewer Json",
+                "viewerjson",
+                "shared archive json",
+            )],
+        )),
+    );
+
+    let summary = run_mock_import(
+        &harness.state.store,
+        &root,
+        io.clone(),
+        archive.clone(),
+        Arc::new(ImportMetrics::default()),
+        None,
+    );
+
+    assert_eq!(summary.files_imported, 3);
+    assert_eq!(summary.archive_partitions_committed, 1);
+    assert_eq!(archive.channel_write_successes(&day_key), 1);
+    assert_eq!(archive.channel_write_attempts(&day_key), 1);
+    assert_eq!(archive.user_write_successes(&user_key), 1);
+    assert!(!archive.same_key_overlap_detected.load(Ordering::SeqCst));
+    assert_eq!(io.replace_count(&archive.channel_final_path(&day_key)), 1);
+    assert_eq!(
+        io.write_count(&archive.channel_final_path(&day_key).with_extension("tmp.br")),
+        1
+    );
+    let contents = archive.decode_channel_segment(&day_key);
+    assert!(contents.contains("shared archive raw"));
+    assert!(contents.contains("shared archive simple"));
+    assert!(contents.contains("shared archive json"));
 }
 
 #[tokio::test]
@@ -1163,6 +1533,7 @@ async fn mock_fs_retries_source_deletion_after_successful_commit() {
     assert_eq!(second.files_failed, 0);
     assert_eq!(harness.state.store.event_count().unwrap(), 1);
     assert!(!io.file_exists(&file));
+    assert_eq!(harness.state.store.event_count().unwrap(), 1);
 }
 
 #[tokio::test]
@@ -1286,6 +1657,9 @@ async fn mock_fs_mixed_sample_data_writes_archive_segments_and_hot_storage() {
     assert!(io.file_exists(&archive.channel_final_path(&raw_day)));
     assert!(io.file_exists(&archive.channel_final_path(&simple_day)));
     assert!(io.file_exists(&archive.channel_final_path(&json_day)));
+    assert_eq!(archive.channel_write_successes(&raw_day), 1);
+    assert_eq!(archive.channel_write_successes(&simple_day), 1);
+    assert_eq!(archive.channel_write_successes(&json_day), 1);
     assert!(!io.file_exists(&old_raw));
     assert!(!io.file_exists(&old_simple));
     assert!(!io.file_exists(&old_json));
@@ -1339,6 +1713,10 @@ async fn mock_fs_retries_archive_replace_failure_without_losing_source_data() {
     assert!(io.file_exists(&temp_path));
     assert!(!io.file_exists(&final_path));
     assert_eq!(archive.channel_event_count(), 0);
+    assert_eq!(archive.channel_write_attempts(&day_key), 1);
+    assert_eq!(archive.channel_write_successes(&day_key), 0);
+    assert_eq!(io.write_count(&temp_path), 1);
+    assert_eq!(io.replace_count(&final_path), 0);
 
     let second = run_mock_import(
         &harness.state.store,
@@ -1357,4 +1735,8 @@ async fn mock_fs_retries_archive_replace_failure_without_losing_source_data() {
         .decode_channel_segment(&day_key)
         .contains("replace archive payload"));
     assert_eq!(archive.channel_event_count(), 1);
+    assert_eq!(archive.channel_write_attempts(&day_key), 2);
+    assert_eq!(archive.channel_write_successes(&day_key), 1);
+    assert_eq!(io.write_count(&temp_path), 2);
+    assert_eq!(io.replace_count(&final_path), 1);
 }

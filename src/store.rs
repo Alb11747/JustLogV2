@@ -1480,7 +1480,7 @@ impl Store {
         day: Option<u32>,
         state: &str,
         last_error: Option<&str>,
-        increment_source_count: bool,
+        source_count_increment: usize,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         let db = self.lock_import_db_low_priority("import partition write");
@@ -1504,7 +1504,7 @@ impl Store {
                 day,
                 state,
                 now,
-                if increment_source_count { 1 } else { 0 },
+                source_count_increment as i64,
                 last_error
             ],
         )?;
